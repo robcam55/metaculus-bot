@@ -45,6 +45,9 @@ Offline checks (no network, no keys): `python tests/check_rc_bot.py`.
    hasn't picked up its id yet, set the repository variable `AIB_TOURNAMENT_ID` to the
    season's numeric id or slug.
 6. **Turn it on.** Set the repository variable `BOT_ENABLED` to `true`.
+7. **Keep the schedule alive.** GitHub pauses scheduled workflows in a public repo after 60
+   days without a commit, and the Fall 2026 season runs to Jan 6. Push any commit at least
+   every 50 days: the first by Nov 12.
 
 Other optional repository variables (empty means the default):
 
