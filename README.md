@@ -1,4 +1,64 @@
-# Simple Metaculus forecasting bot
+# rc_trader's Metaculus forecasting bot
+
+A Claude-based bot for Metaculus's AI forecasting tournament (FutureEval). It is built on
+Metaculus's template bot (`Metaculus/metac-bot-template` at commit `6dab04c`); the
+template's own README follows below. This bot is the external accuracy lab for rc_trader,
+a personal forecasting and paper-trading project. The tournament scores hundreds of
+questions a season against professional forecasters, with no money at risk.
+
+## What's different from the template
+
+All the changes are in `main.py` (`RcForecastBot`):
+- **Claude models.** Sonnet 5 forecasts and Haiku 4.5 parses. Calls go through whichever
+  key is set: `ANTHROPIC_API_KEY` directly, otherwise `OPENROUTER_API_KEY` (for example
+  Metaculus's free tournament credits). Sonnet 5 rejects sampling parameters, so none are
+  sent.
+- **Two independent research sources per research report.** AskNews news summaries and a
+  search-backed model (Perplexity Sonar Pro, directly or through OpenRouter). If one source
+  fails, the other still feeds the forecast.
+- **Six predictions per question.** Two research reports, three predictions each. Binary
+  questions use a trimmed mean (dropping the highest and lowest), which beat the median in
+  Halawi et al. (2024).
+- **An outside-view-first binary prompt.** It asks for a reference class and base rate,
+  weights the status quo, and checks explicitly against language models' lean toward
+  "Yes".
+- **Operational changes.** Tournament ids can be overridden, so a new season doesn't wait
+  for a `forecasting-tools` release. The 20-minute schedule stays off until you set
+  `BOT_ENABLED`, and the Metaculus Cup workflow is manual-only to limit spend.
+
+Offline checks (no network, no keys): `python tests/check_rc_bot.py`.
+
+## Setup
+
+1. **Metaculus token.** Create a bot account at
+   https://www.metaculus.com/futureeval/participate/ and add its token as the repository
+   secret `METACULUS_TOKEN`.
+2. **Model key.** Add one of these as a secret:
+   - `OPENROUTER_API_KEY`: free tournament credits through the form linked below.
+   - `ANTHROPIC_API_KEY`.
+3. **Research.** Add the AskNews credentials Metaculus offers tournament bots
+   (`ASKNEWS_CLIENT_ID` and `ASKNEWS_SECRET`, or `ASKNEWS_API_KEY`). A
+   `PERPLEXITY_API_KEY` is optional; with OpenRouter, Sonar Pro is reached through it.
+4. **Test.** Run `Actions → Test Bot → Run workflow`. It forecasts on the bot-testing-area
+   tournament. Check that the forecasts appear on the bot's Metaculus profile.
+5. **Season id, if needed.** If the Fall 2026 season has started and `forecasting-tools`
+   hasn't picked up its id yet, set the repository variable `AIB_TOURNAMENT_ID` to the
+   season's numeric id or slug.
+6. **Turn it on.** Set the repository variable `BOT_ENABLED` to `true`.
+
+Other optional repository variables (empty means the default):
+
+| Variable | Default |
+|---|---|
+| `FORECASTER_MODEL` | `anthropic/claude-sonnet-5` or `openrouter/anthropic/claude-sonnet-5`, depending on the key |
+| `PARSER_MODEL` | Claude Haiku 4.5 through the same route |
+| `RESEARCH_REPORTS` | 2 |
+| `PREDICTIONS_PER_REPORT` | 3 |
+| `MINIBENCH_ID` | The package's current MiniBench |
+
+---
+
+# Simple Metaculus forecasting bot (template README)
 This repository contains a simple bot meant to get you started with creating your own bot for the AI Forecasting Tournament. Go to https://www.metaculus.com/futureeval/participate/ for more info and tournament rules (and then go to the  "Getting Started" section of our [resources](https://www.metaculus.com/notebooks/38928/ai-benchmark-resources/#want-to-join-the-ai-forecasting-benchmark) page).
 
 **Brand new to this?** You can get a working bot running in about 5 minutes without writing a single line of code — just fork this repo, paste two API keys into GitHub, and click "Run workflow". See **[Quick start](#quick-start--fork-and-use-github-actions)** below.

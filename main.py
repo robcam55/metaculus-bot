@@ -1,6 +1,8 @@
 import argparse
 import asyncio
 import logging
+import os
+import statistics
 from datetime import datetime, timezone
 from typing import Literal
 
@@ -44,9 +46,46 @@ from forecasting_tools import (
 dotenv.load_dotenv()
 logger = logging.getLogger(__name__)
 
+ASKNEWS_RESEARCHER = "asknews/news-summaries"
 
-class SummerTemplateBot2026(ForecastBot):
+
+def _env_int(name: str, default: int) -> int:
+    value = os.getenv(name, "").strip()
+    return int(value) if value else default
+
+
+def _env_flag(name: str, default: bool) -> bool:
+    value = os.getenv(name, "").strip().lower()
+    if not value:
+        return default
+    return value in ("1", "true", "yes", "on")
+
+
+def _has_asknews() -> bool:
+    return bool(
+        (os.getenv("ASKNEWS_CLIENT_ID") and os.getenv("ASKNEWS_SECRET"))
+        or os.getenv("ASKNEWS_API_KEY")
+    )
+
+
+class RcForecastBot(ForecastBot):
     """
+    rc_trader's entry in the Metaculus AI forecasting tournament (FutureEval), built on
+    Metaculus's template bot. Changes from the template:
+    - Claude models, routed by whichever key is present: ANTHROPIC_API_KEY directly, else
+      OPENROUTER_API_KEY (e.g. Metaculus's free tournament credits). Sonnet 5 forecasts,
+      Haiku 4.5 parses; FORECASTER_MODEL / PARSER_MODEL override either.
+    - Two independent research sources per report (AskNews news summaries and a
+      search-backed model), because a single search's luck was the largest source of
+      night-to-night noise in rc_trader's own forecasts.
+    - Binary questions: an outside-view-first prompt with an explicit check against the
+      known "Yes" lean of language models, and a trimmed mean (drop the highest and
+      lowest) over all predictions instead of the median.
+    - Tournament ids overridable by env (AIB_TOURNAMENT_ID, MINIBENCH_ID) so a new season
+      doesn't wait on a forecasting-tools release.
+
+    The template's original notes follow.
+
     This is the template bot for Summer 2026 Metaculus AI Tournament.
     This is a copy of what is used by Metaculus to run the Metac Bots in our benchmark, provided as a template for new bot makers.
     This template is given as-is, and is use-at-your-own-risk.
@@ -129,57 +168,153 @@ class SummerTemplateBot2026(ForecastBot):
     _concurrency_limiter = asyncio.Semaphore(_max_concurrent_questions)
     _structure_output_validation_samples = 2
 
+    ##################################### MODELS #####################################
+
+    @classmethod
+    def _llm_config_defaults(cls) -> dict[str, str | GeneralLlm | None]:
+        """Claude by default; falls back to forecasting-tools' own defaults when neither
+        ANTHROPIC_API_KEY nor OPENROUTER_API_KEY is set."""
+        defaults = dict(super()._llm_config_defaults())
+        if os.getenv("ANTHROPIC_API_KEY"):
+            prefix, haiku = "anthropic/", "claude-haiku-4-5"
+        elif os.getenv("OPENROUTER_API_KEY"):
+            prefix, haiku = "openrouter/anthropic/", "claude-haiku-4.5"
+        else:
+            defaults["researcher_2"] = None
+            return defaults
+
+        forecaster = os.getenv("FORECASTER_MODEL") or f"{prefix}claude-sonnet-5"
+        parser = os.getenv("PARSER_MODEL") or f"{prefix}{haiku}"
+        defaults["default"] = GeneralLlm(
+            model=forecaster,
+            # Sonnet 5, Opus 5 and newer reject sampling parameters: send none
+            temperature=None,
+            timeout=_env_int("FORECASTER_TIMEOUT_S", 300),
+            allowed_tries=2,
+        )
+        parser_llm = GeneralLlm(
+            model=parser,
+            temperature=0 if "haiku" in parser else None,
+            timeout=120,
+            allowed_tries=3,
+        )
+        defaults["parser"] = parser_llm
+        defaults["summarizer"] = parser_llm
+
+        # Two independent research sources: AskNews (free for tournament bots) and a
+        # search-backed model. Either may be missing; research then uses what exists.
+        search_llm: GeneralLlm | None = None
+        if os.getenv("PERPLEXITY_API_KEY"):
+            search_llm = GeneralLlm(model="perplexity/sonar-pro", temperature=0.1)
+        elif os.getenv("OPENROUTER_API_KEY"):
+            search_llm = GeneralLlm(
+                model="openrouter/perplexity/sonar-pro", temperature=0.1
+            )
+        if os.getenv("RESEARCHER"):
+            defaults["researcher"] = os.getenv("RESEARCHER")
+            defaults["researcher_2"] = None
+        elif _has_asknews():
+            defaults["researcher"] = ASKNEWS_RESEARCHER
+            defaults["researcher_2"] = search_llm
+        elif search_llm is not None:
+            defaults["researcher"] = search_llm
+            defaults["researcher_2"] = None
+        else:
+            # No search provider at all: research from the forecaster's own knowledge
+            # (weak for current events; set ASKNEWS_* or a search key)
+            defaults["researcher"] = defaults["default"]
+            defaults["researcher_2"] = None
+        return defaults
+
     ##################################### RESEARCH #####################################
 
     async def run_research(self, question: MetaculusQuestion) -> str:
         async with self._concurrency_limiter:
-            research = ""
-            researcher = self.get_llm("researcher")
-
-            prompt = clean_indents(
-                f"""
-                You are an assistant to a superforecaster.
-                The superforecaster will give you a question they intend to forecast on.
-                To be a great assistant, you generate a concise but detailed rundown of the most relevant news, including if the question would resolve Yes or No based on current information.
-                You do not produce forecasts yourself.
-
-                Question:
-                {question.question_text}
-
-                This question's outcome will be determined by the specific criteria below:
-                {question.resolution_criteria}
-
-                {question.fine_print}
-                """
-            )
-
-            if isinstance(researcher, GeneralLlm):
-                research = await researcher.invoke(prompt)
-            elif (
-                researcher == "asknews/news-summaries"
-                or researcher == "asknews/deep-research/low-depth"
-                or researcher == "asknews/deep-research/medium-depth"
-                or researcher == "asknews/deep-research/high-depth"
-            ):
-                research = await AskNewsSearcher().call_preconfigured_version(
-                    researcher, prompt
-                )
-            elif researcher.startswith("smart-searcher"):
-                model_name = researcher.removeprefix("smart-searcher/")
-                searcher = SmartSearcher(
-                    model=model_name,
-                    temperature=0,
-                    num_searches_to_run=2,
-                    num_sites_per_search=10,
-                    use_advanced_filters=False,
-                )
-                research = await searcher.invoke(prompt)
-            elif not researcher or researcher == "None" or researcher == "no_research":
-                research = ""
-            else:
-                research = await self.get_llm("researcher", "llm").invoke(prompt)
+            prompt = self._research_prompt(question)
+            sources = [self.get_llm("researcher")]
+            second = self._llms.get("researcher_2")
+            if second:
+                sources.append(second)
+            parts: list[str] = []
+            for source in sources:
+                try:
+                    text = await self._run_one_research_source(source, prompt)
+                except Exception as e:  # one failed source must not sink the question
+                    logger.warning(
+                        f"Research source {self._source_name(source)} failed for"
+                        f" {question.page_url}: {type(e).__name__}: {e}"
+                    )
+                    continue
+                if text and text.strip():
+                    parts.append(f"## Research from {self._source_name(source)}\n{text}")
+            research = "\n\n".join(parts)
             logger.info(f"Found Research for URL {question.page_url}:\n{research}")
             return research
+
+    @staticmethod
+    def _source_name(source: GeneralLlm | str) -> str:
+        return source.model if isinstance(source, GeneralLlm) else str(source)
+
+    def _research_prompt(self, question: MetaculusQuestion) -> str:
+        return clean_indents(
+            f"""
+            You are an assistant to a superforecaster.
+            The superforecaster will give you a question they intend to forecast on.
+            To be a great assistant, you generate a concise but detailed rundown of the most relevant news, including if the question would resolve Yes or No based on current information.
+            Include dates for every fact, relevant base rates or historical frequencies if you know them, and any scheduled events before the question resolves.
+            You do not produce forecasts yourself.
+
+            Question:
+            {question.question_text}
+
+            This question's outcome will be determined by the specific criteria below:
+            {question.resolution_criteria}
+
+            {question.fine_print}
+            """
+        )
+
+    async def _run_one_research_source(
+        self, researcher: GeneralLlm | str, prompt: str
+    ) -> str:
+        """The template's researcher dispatch, for one source."""
+        if isinstance(researcher, GeneralLlm):
+            return await researcher.invoke(prompt)
+        if researcher in (
+            "asknews/news-summaries",
+            "asknews/deep-research/low-depth",
+            "asknews/deep-research/medium-depth",
+            "asknews/deep-research/high-depth",
+        ):
+            return await AskNewsSearcher().call_preconfigured_version(researcher, prompt)
+        if researcher.startswith("smart-searcher"):
+            model_name = researcher.removeprefix("smart-searcher/")
+            searcher = SmartSearcher(
+                model=model_name,
+                temperature=0,
+                num_searches_to_run=2,
+                num_sites_per_search=10,
+                use_advanced_filters=False,
+            )
+            return await searcher.invoke(prompt)
+        if not researcher or researcher in ("None", "no_research"):
+            return ""
+        return await GeneralLlm(model=researcher).invoke(prompt)
+
+    ##################################### AGGREGATION #####################################
+
+    async def _aggregate_predictions(
+        self,
+        predictions: list[PredictionTypes],
+        question: MetaculusQuestion,
+    ) -> PredictionTypes:
+        """Binary: trimmed mean (drop the single highest and lowest) once there are at
+        least four predictions; it beat the median in Halawi et al. (2024). Other types
+        keep forecasting-tools' aggregation."""
+        if isinstance(question, BinaryQuestion) and len(predictions) >= 4:
+            values = sorted(float(p) for p in predictions)  # type: ignore[arg-type]
+            return float(statistics.mean(values[1:-1]))  # type: ignore[return-value]
+        return await super()._aggregate_predictions(predictions, question)
 
     ##################################### BINARY QUESTIONS #####################################
 
@@ -188,9 +323,9 @@ class SummerTemplateBot2026(ForecastBot):
     ) -> ReasonedPrediction[float]:
         prompt = clean_indents(
             f"""
-            You are a professional forecaster interviewing for a job.
+            You are a superforecaster with an excellent calibration record. Your forecast is scored with a log score, so confident errors are punished hard and hedging when you have real evidence also costs you.
 
-            Your interview question is:
+            Question:
             {question.question_text}
 
             Question background:
@@ -203,18 +338,18 @@ class SummerTemplateBot2026(ForecastBot):
             {question.fine_print}
 
 
-            Your research assistant says:
+            Research gathered today from independent sources (it may be incomplete, outdated or wrong; weigh each item by its source and date):
             {research}
 
             Today is {datetime.now().strftime("%Y-%m-%d")}.
 
-            Before answering you write:
-            (a) The time left until the outcome to the question is known.
-            (b) The status quo outcome if nothing changed.
-            (c) A brief description of a scenario that results in a No outcome.
-            (d) A brief description of a scenario that results in a Yes outcome.
-
-            You write your rationale remembering that good forecasters put extra weight on the status quo outcome since the world changes slowly most of the time.
+            Work through these steps briefly before answering:
+            (a) Time left: how long until the outcome is known, and how much can realistically change in that time?
+            (b) Outside view: name the most relevant reference class and its base rate. If several apply, say which you trust most and why.
+            (c) Status quo: what happens if nothing changes? The world changes slowly most of the time, so give the status quo extra weight, especially when little time is left.
+            (d) Inside view: the specific, dated evidence that should move you away from the base rate, and roughly how far. Separate facts from speculation, and note what you could not find out.
+            (e) The strongest case for the outcome you currently think less likely. Language models tend to over-predict "Yes"; check you are not doing the same.
+            (f) Reconcile these into one probability. Avoid 0% and 100%, and go below 3% or above 97% only when the outcome is effectively already determined.
             {self._get_conditional_disclaimer_if_necessary(question)}
 
             The last thing you write is your final answer as: "Probability: ZZ%", 0-100
@@ -664,38 +799,36 @@ if __name__ == "__main__":
     run_mode: Literal["tournament", "metaculus_cup", "test_questions"] = args.mode
 
     check_environment(strict=True)
-    publish_to_metaculus = True
+    # PUBLISH=false gives a dry run: full research and forecasts, nothing posted
+    publish_to_metaculus = _env_flag("PUBLISH", True)
     print_startup_banner(run_mode, will_publish=publish_to_metaculus)
 
-    # Configure the bot. The `llms=` block below is commented out to use
-    # whichever default models forecasting-tools picks based on your env vars;
-    # uncomment and edit to pin specific models.
-    template_bot = SummerTemplateBot2026(
-        research_reports_per_question=1,
-        predictions_per_research_report=5,
+    # Models come from RcForecastBot._llm_config_defaults (Claude, routed by the key
+    # that is set). Two research reports x three predictions = six predictions per
+    # question, each research report drawing on two independent sources.
+    template_bot = RcForecastBot(
+        research_reports_per_question=_env_int("RESEARCH_REPORTS", 2),
+        predictions_per_research_report=_env_int("PREDICTIONS_PER_REPORT", 3),
         use_research_summary_to_forecast=False,
         publish_reports_to_metaculus=publish_to_metaculus,
         folder_to_save_reports_to=None,
         skip_previously_forecasted_questions=True,
         extra_metadata_in_explanation=True,
-        # llms={
-        #     "default": GeneralLlm(
-        #         model="openrouter/openai/gpt-4o",
-        #         temperature=0.3,
-        #         timeout=40,
-        #         allowed_tries=2,
-        #     ),
-        #     "summarizer": "openai/gpt-4o-mini",
-        #     "researcher": "asknews/news-summaries",
-        #     "parser": "openai/gpt-4o-mini",
-        # },
     )
 
-    # Per-mode tournament URL shown in the summary banner footer. These
-    # piggyback on the forecasting_tools SDK constants and need updating
-    # whenever those rotate seasons.
+    client = MetaculusClient()
+    # A new season's tournament id reaches forecasting-tools only in a package release;
+    # AIB_TOURNAMENT_ID (numeric id or slug) bridges the gap.
+    tournament_id: int | str = (
+        os.getenv("AIB_TOURNAMENT_ID") or client.CURRENT_AI_COMPETITION_ID
+    )
+    if isinstance(tournament_id, str) and tournament_id.isdigit():
+        tournament_id = int(tournament_id)
+    minibench_id: int | str = os.getenv("MINIBENCH_ID") or client.CURRENT_MINIBENCH_ID
+
+    # Tournament URL shown in the summary banner footer.
     TOURNAMENT_URLS = {
-        "tournament": "https://www.metaculus.com/tournament/summer-futureeval-2026/",
+        "tournament": f"https://www.metaculus.com/tournament/{tournament_id}/",
         "metaculus_cup": "https://www.metaculus.com/tournament/metaculus-cup-summer-2025/",
         "test_questions": "https://www.metaculus.com/tournament/bot-testing-area/",
     }
@@ -703,17 +836,12 @@ if __name__ == "__main__":
     # Dispatch on mode. Each branch produces a list of ForecastReport (or
     # exceptions, since return_exceptions=True) which then flows into the
     # summary printers below.
-    client = MetaculusClient()
     if run_mode == "tournament":
         seasonal_tournament_reports = asyncio.run(
-            template_bot.forecast_on_tournament(
-                client.CURRENT_AI_COMPETITION_ID, return_exceptions=True
-            )
+            template_bot.forecast_on_tournament(tournament_id, return_exceptions=True)
         )
         minibench_reports = asyncio.run(
-            template_bot.forecast_on_tournament(
-                client.CURRENT_MINIBENCH_ID, return_exceptions=True
-            )
+            template_bot.forecast_on_tournament(minibench_id, return_exceptions=True)
         )
         forecast_reports = seasonal_tournament_reports + minibench_reports
     elif run_mode == "metaculus_cup":

@@ -11,10 +11,14 @@ concurrency:
   cancel-in-progress: false
 
 
-# Daily job to run the simple forecast bot
+# Scheduled runs stay off until the repository variable BOT_ENABLED is set to true
+# (Settings -> Secrets and variables -> Actions -> Variables), so the schedule can't
+# fail every 20 minutes before the secrets exist. Running it by hand always works.
 jobs:
   forecast_job:
+    if: vars.BOT_ENABLED == 'true' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest # determines the machine that will run the job - keep as is
+    timeout-minutes: 60
     steps: # sets up the steps that will be run in order
       # setup repository with all necessary dependencies - keep as is
       - name: Check out repository
@@ -51,3 +55,11 @@ jobs:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           ASKNEWS_CLIENT_ID: ${{ secrets.ASKNEWS_CLIENT_ID }}
           ASKNEWS_SECRET: ${{ secrets.ASKNEWS_SECRET }}
+          ASKNEWS_API_KEY: ${{ secrets.ASKNEWS_API_KEY }}
+          # Optional settings (repository variables, not secrets); empty = default
+          AIB_TOURNAMENT_ID: ${{ vars.AIB_TOURNAMENT_ID }}
+          MINIBENCH_ID: ${{ vars.MINIBENCH_ID }}
+          FORECASTER_MODEL: ${{ vars.FORECASTER_MODEL }}
+          PARSER_MODEL: ${{ vars.PARSER_MODEL }}
+          RESEARCH_REPORTS: ${{ vars.RESEARCH_REPORTS }}
+          PREDICTIONS_PER_REPORT: ${{ vars.PREDICTIONS_PER_REPORT }}

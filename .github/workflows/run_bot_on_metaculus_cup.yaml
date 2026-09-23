@@ -1,9 +1,9 @@
 name: Forecast on Metaculus Cup
 
 on:
+  # Manual only: the Metaculus Cup isn't part of the AI tournament, and running it on a
+  # schedule would add LLM spend. Re-add a schedule here to take part.
   workflow_dispatch:
-  schedule:
-    - cron: "0 0 */2 * *" # runs at midnight every 2 days
 
 # Add concurrency group to prevent parallel runs
 concurrency:
