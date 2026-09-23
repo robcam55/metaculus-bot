@@ -64,8 +64,10 @@ def check_routing() -> None:
         d = main.RcForecastBot._llm_config_defaults()
         assert model_of(d["default"]) == "openrouter/anthropic/claude-sonnet-5"
         assert model_of(d["parser"]) == "openrouter/anthropic/claude-haiku-4.5"
-        assert d["researcher"] == main.ASKNEWS_RESEARCHER
-        assert model_of(d["researcher_2"]) == "openrouter/perplexity/sonar-pro"
+        assert d["researcher"] == main.ASKNEWS_RESEARCHER == "asknews/latest"
+        # Metaculus's OpenRouter credits cover Anthropic but not Perplexity
+        assert model_of(d["researcher_2"]) == "openrouter/anthropic/claude-sonnet-5:online"
+        assert d["researcher_2"].litellm_kwargs["temperature"] is None
 
     with env(ANTHROPIC_API_KEY="x", PERPLEXITY_API_KEY="x", FORECASTER_MODEL="anthropic/claude-opus-5"):
         d = main.RcForecastBot._llm_config_defaults()
@@ -112,10 +114,11 @@ def check_research_survives_one_failure() -> None:
     with env(ANTHROPIC_API_KEY="x", PERPLEXITY_API_KEY="x", ASKNEWS_CLIENT_ID="x", ASKNEWS_SECRET="y"):
         bot = main.RcForecastBot(publish_reports_to_metaculus=False)
 
-    async def fake(source, prompt):
+    async def fake(source, prompt, question):
         if source == main.ASKNEWS_RESEARCHER:
             raise RuntimeError("asknews down")
         assert "Include dates for every fact" in prompt
+        assert question.question_text == "Will it happen?"
         return "Sonar says: nothing has happened yet (2026-09-20)."
 
     bot._run_one_research_source = fake  # type: ignore[method-assign]
@@ -123,7 +126,7 @@ def check_research_survives_one_failure() -> None:
     assert "Research from perplexity/sonar-pro" in research, research
     assert "asknews" not in research.lower(), research
 
-    async def both(source, prompt):
+    async def both(source, prompt, question):
         return f"notes from {bot._source_name(source)}"
 
     bot._run_one_research_source = both  # type: ignore[method-assign]
@@ -132,8 +135,49 @@ def check_research_survives_one_failure() -> None:
     print("research: ok")
 
 
+def check_asknews_uses_one_call() -> None:
+    """Latest-news only: one AskNews search per research (the free tier is 1,000 a month)."""
+    import asknews_sdk
+
+    calls: list[dict] = []
+
+    class FakeResponse:
+        as_dicts: list = []
+
+    class FakeNews:
+        async def search_news(self, **kwargs):
+            calls.append(kwargs)
+            return FakeResponse()
+
+    class FakeSDK:
+        def __init__(self, **kwargs):
+            self.news = FakeNews()
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+    real = asknews_sdk.AsyncAskNewsSDK
+    asknews_sdk.AsyncAskNewsSDK = FakeSDK  # type: ignore[misc]
+    try:
+        with env(ASKNEWS_CLIENT_ID="x", ASKNEWS_SECRET="y"):
+            text = asyncio.run(
+                main.AskNewsLatestSearcher().get_formatted_news_async("Will it happen?")
+            )
+    finally:
+        asknews_sdk.AsyncAskNewsSDK = real  # type: ignore[misc]
+    assert len(calls) == 1, calls
+    assert calls[0]["strategy"] == "latest news", calls
+    assert calls[0]["query"] == "Will it happen?"
+    assert "No articles were found" in text
+    print("asknews: ok")
+
+
 if __name__ == "__main__":
     check_routing()
     check_aggregation()
     check_research_survives_one_failure()
+    check_asknews_uses_one_call()
     print("all checks passed")

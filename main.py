@@ -46,7 +46,41 @@ from forecasting_tools import (
 dotenv.load_dotenv()
 logger = logging.getLogger(__name__)
 
-ASKNEWS_RESEARCHER = "asknews/news-summaries"
+# AskNews's free tournament tier allows 1,000 calls a month. The template's
+# "news-summaries" makes 6 per question (latest news = 1, archive = 5); a season plus
+# MiniBench is roughly 250 questions a month, so only the latest-news call is used.
+ASKNEWS_RESEARCHER = "asknews/latest"
+
+
+class AskNewsLatestSearcher(AskNewsSearcher):
+    """AskNews latest news only (past ~48 hours): one call per research instead of six."""
+
+    async def get_formatted_news_async(self, query: str) -> str:
+        cached_result = self.cache.get(query)
+        if cached_result is not None:
+            return cached_result
+        from asknews_sdk import AsyncAskNewsSDK
+
+        async with AsyncAskNewsSDK(
+            client_id=self.client_id,
+            client_secret=self.client_secret,
+            api_key=self.api_key,
+            scopes=set(["news"]),
+        ) as ask:
+            response = await ask.news.search_news(
+                query=query,
+                n_articles=8,
+                return_type="both",
+                strategy="latest news",
+                try_cache=self._default_try_cache,
+            )
+        articles = response.as_dicts
+        formatted = "Here are the relevant news articles from the past two days:\n\n"
+        formatted += (
+            self._format_articles(articles) if articles else "No articles were found.\n\n"
+        )
+        self.cache.set(query, formatted)
+        return formatted
 
 
 def _env_int(name: str, default: int) -> int:
@@ -75,9 +109,10 @@ class RcForecastBot(ForecastBot):
     - Claude models, routed by whichever key is present: ANTHROPIC_API_KEY directly, else
       OPENROUTER_API_KEY (e.g. Metaculus's free tournament credits). Sonnet 5 forecasts,
       Haiku 4.5 parses; FORECASTER_MODEL / PARSER_MODEL override either.
-    - Two independent research sources per report (AskNews news summaries and a
-      search-backed model), because a single search's luck was the largest source of
-      night-to-night noise in rc_trader's own forecasts.
+    - Two independent research sources per report: AskNews latest news (one call, to
+      stay inside the free tier) and a search-backed model (Sonnet 5 with ":online"
+      through OpenRouter, or Perplexity with its own key). A single search's luck was
+      the largest source of night-to-night noise in rc_trader's own forecasts.
     - Binary questions: an outside-view-first prompt with an explicit check against the
       known "Yes" lean of language models, and a trimmed mean (drop the highest and
       lowest) over all predictions instead of the median.
@@ -203,12 +238,18 @@ class RcForecastBot(ForecastBot):
 
         # Two independent research sources: AskNews (free for tournament bots) and a
         # search-backed model. Either may be missing; research then uses what exists.
+        # Metaculus's OpenRouter credits cover only OpenAI, Anthropic and Google models,
+        # so the searcher there is Sonnet 5 with ":online" (the provider's own web
+        # search; OpenRouter's Exa fallback is not covered).
         search_llm: GeneralLlm | None = None
         if os.getenv("PERPLEXITY_API_KEY"):
             search_llm = GeneralLlm(model="perplexity/sonar-pro", temperature=0.1)
         elif os.getenv("OPENROUTER_API_KEY"):
             search_llm = GeneralLlm(
-                model="openrouter/perplexity/sonar-pro", temperature=0.1
+                model=os.getenv("SEARCH_MODEL") or "openrouter/anthropic/claude-sonnet-5:online",
+                temperature=None,
+                timeout=300,
+                allowed_tries=2,
             )
         if os.getenv("RESEARCHER"):
             defaults["researcher"] = os.getenv("RESEARCHER")
@@ -238,7 +279,7 @@ class RcForecastBot(ForecastBot):
             parts: list[str] = []
             for source in sources:
                 try:
-                    text = await self._run_one_research_source(source, prompt)
+                    text = await self._run_one_research_source(source, prompt, question)
                 except Exception as e:  # one failed source must not sink the question
                     logger.warning(
                         f"Research source {self._source_name(source)} failed for"
@@ -275,11 +316,16 @@ class RcForecastBot(ForecastBot):
         )
 
     async def _run_one_research_source(
-        self, researcher: GeneralLlm | str, prompt: str
+        self, researcher: GeneralLlm | str, prompt: str, question: MetaculusQuestion
     ) -> str:
-        """The template's researcher dispatch, for one source."""
+        """The template's researcher dispatch for one source, plus latest-only AskNews
+        (queried with the question itself, which searches better than the prompt)."""
         if isinstance(researcher, GeneralLlm):
             return await researcher.invoke(prompt)
+        if researcher == ASKNEWS_RESEARCHER:
+            return await AskNewsLatestSearcher().get_formatted_news_async(
+                question.question_text
+            )
         if researcher in (
             "asknews/news-summaries",
             "asknews/deep-research/low-depth",
@@ -804,11 +850,12 @@ if __name__ == "__main__":
     print_startup_banner(run_mode, will_publish=publish_to_metaculus)
 
     # Models come from RcForecastBot._llm_config_defaults (Claude, routed by the key
-    # that is set). Two research reports x three predictions = six predictions per
-    # question, each research report drawing on two independent sources.
+    # that is set). One research report (two independent sources) x five predictions:
+    # about $0.35 a question at Sonnet 5 list prices, which keeps a season plus MiniBench
+    # near $85 a month. RESEARCH_REPORTS=2 buys a second independent search for ~35% more.
     template_bot = RcForecastBot(
-        research_reports_per_question=_env_int("RESEARCH_REPORTS", 2),
-        predictions_per_research_report=_env_int("PREDICTIONS_PER_REPORT", 3),
+        research_reports_per_question=_env_int("RESEARCH_REPORTS", 1),
+        predictions_per_research_report=_env_int("PREDICTIONS_PER_REPORT", 5),
         use_research_summary_to_forecast=False,
         publish_reports_to_metaculus=publish_to_metaculus,
         folder_to_save_reports_to=None,

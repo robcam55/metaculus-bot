@@ -53,5 +53,6 @@ jobs:
           # Optional settings (repository variables, not secrets); empty = default
           FORECASTER_MODEL: ${{ vars.FORECASTER_MODEL }}
           PARSER_MODEL: ${{ vars.PARSER_MODEL }}
+          SEARCH_MODEL: ${{ vars.SEARCH_MODEL }}
           RESEARCH_REPORTS: ${{ vars.RESEARCH_REPORTS }}
           PREDICTIONS_PER_REPORT: ${{ vars.PREDICTIONS_PER_REPORT }}

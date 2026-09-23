@@ -13,12 +13,16 @@ All the changes are in `main.py` (`RcForecastBot`):
   key is set: `ANTHROPIC_API_KEY` directly, otherwise `OPENROUTER_API_KEY` (for example
   Metaculus's free tournament credits). Sonnet 5 rejects sampling parameters, so none are
   sent.
-- **Two independent research sources per research report.** AskNews news summaries and a
-  search-backed model (Perplexity Sonar Pro, directly or through OpenRouter). If one source
-  fails, the other still feeds the forecast.
-- **Six predictions per question.** Two research reports, three predictions each. Binary
-  questions use a trimmed mean (dropping the highest and lowest), which beat the median in
-  Halawi et al. (2024).
+- **Two independent research sources per research report.**
+  - AskNews latest news: one call per question, to fit the free tier's 1,000 calls a month.
+    The template's version uses six.
+  - A search-backed model: Sonnet 5 with OpenRouter's `:online` (Anthropic's own web search,
+    which Metaculus's credits cover), or Perplexity with your own key.
+
+  If one source fails, the other still feeds the forecast.
+- **Five predictions per question** from one research report, costing about $0.35 per
+  question at Sonnet 5 list prices. Binary questions use a trimmed mean (dropping the highest
+  and lowest), which beat the median in Halawi et al. (2024).
 - **An outside-view-first binary prompt.** It asks for a reference class and base rate,
   weights the status quo, and checks explicitly against language models' lean toward
   "Yes".
@@ -30,22 +34,23 @@ Offline checks (no network, no keys): `python tests/check_rc_bot.py`.
 
 ## Setup
 
-1. **Metaculus token.** Create a bot account at
-   https://www.metaculus.com/futureeval/participate/ and add its token as the repository
-   secret `METACULUS_TOKEN`.
-2. **Model key.** Add one of these as a secret:
-   - `OPENROUTER_API_KEY`: free tournament credits through the form linked below.
-   - `ANTHROPIC_API_KEY`.
-3. **Research.** Add the AskNews credentials Metaculus offers tournament bots
-   (`ASKNEWS_CLIENT_ID` and `ASKNEWS_SECRET`, or `ASKNEWS_API_KEY`). A
-   `PERPLEXITY_API_KEY` is optional; with OpenRouter, Sonar Pro is reached through it.
-4. **Test.** Run `Actions → Test Bot → Run workflow`. It forecasts on the bot-testing-area
+1. **Metaculus token.** Sign up for a human account, then go to Settings → "My Forecasting
+   Bots" → "Create a Bot". Add the bot's API key as the repository secret `METACULUS_TOKEN`.
+2. **Participant form.** Fill in the Fall 2026 participant form. The first section is
+   required; its second section applies for the free LLM credits, which arrive as an
+   OpenRouter key.
+3. **Model key.** Add one of these as a secret:
+   - `OPENROUTER_API_KEY`: the key Metaculus sends.
+   - `ANTHROPIC_API_KEY`: your own, billed to you.
+4. **Research (optional but recommended).** Get free AskNews access: make an AskNews account
+   with the bot's email, then contact AskNews. Add `ASKNEWS_CLIENT_ID` and `ASKNEWS_SECRET`,
+   or `ASKNEWS_API_KEY`.
+5. **Test.** Run `Actions → Test Bot → Run workflow`. It forecasts on the bot-testing-area
    tournament. Check that the forecasts appear on the bot's Metaculus profile.
-5. **Season id, if needed.** If the Fall 2026 season has started and `forecasting-tools`
-   hasn't picked up its id yet, set the repository variable `AIB_TOURNAMENT_ID` to the
-   season's numeric id or slug.
-6. **Turn it on.** Set the repository variable `BOT_ENABLED` to `true`.
-7. **Keep the schedule alive.** GitHub pauses scheduled workflows in a public repo after 60
+6. **Season id.** Set the repository variable `AIB_TOURNAMENT_ID` to `fall-futureeval-2026`.
+   The pinned `forecasting-tools` still points at Summer.
+7. **Turn it on.** Set the repository variable `BOT_ENABLED` to `true`.
+8. **Keep the schedule alive.** GitHub pauses scheduled workflows in a public repo after 60
    days without a commit, and the Fall 2026 season runs to Jan 6. Push any commit at least
    every 50 days: the first by Nov 12.
 
@@ -55,8 +60,9 @@ Other optional repository variables (empty means the default):
 |---|---|
 | `FORECASTER_MODEL` | `anthropic/claude-sonnet-5` or `openrouter/anthropic/claude-sonnet-5`, depending on the key |
 | `PARSER_MODEL` | Claude Haiku 4.5 through the same route |
-| `RESEARCH_REPORTS` | 2 |
-| `PREDICTIONS_PER_REPORT` | 3 |
+| `SEARCH_MODEL` | `openrouter/anthropic/claude-sonnet-5:online` (OpenRouter route only) |
+| `RESEARCH_REPORTS` | 1 (2 adds a second independent search, for about 35% more cost) |
+| `PREDICTIONS_PER_REPORT` | 5 |
 | `MINIBENCH_ID` | The package's current MiniBench |
 
 ---
