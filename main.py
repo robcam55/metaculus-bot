@@ -106,9 +106,9 @@ class RcForecastBot(ForecastBot):
     """
     rc_trader's entry in the Metaculus AI forecasting tournament (FutureEval), built on
     Metaculus's template bot. Changes from the template:
-    - Claude models, routed by whichever key is present: ANTHROPIC_API_KEY directly, else
-      OPENROUTER_API_KEY (e.g. Metaculus's free tournament credits). Sonnet 5 forecasts,
-      Haiku 4.5 parses; FORECASTER_MODEL / PARSER_MODEL override either.
+    - Claude models, routed by whichever key is present: OPENROUTER_API_KEY (Metaculus's
+      donated credits) forecasts with Opus 5.5; ANTHROPIC_API_KEY (a personal key)
+      forecasts with Sonnet 5. Haiku 4.5 parses; FORECASTER_MODEL / PARSER_MODEL override.
     - Two independent research sources per report: AskNews latest news (one call, to
       stay inside the free tier) and a search-backed model (Sonnet 5 with ":online"
       through OpenRouter, or Perplexity with its own key). A single search's luck was
@@ -210,15 +210,21 @@ class RcForecastBot(ForecastBot):
         """Claude by default; falls back to forecasting-tools' own defaults when neither
         ANTHROPIC_API_KEY nor OPENROUTER_API_KEY is set."""
         defaults = dict(super()._llm_config_defaults())
+        # Metaculus's donated credits (OpenRouter) run the stronger Opus 5.5; a personal
+        # Anthropic key runs Sonnet 5 at half the price. FORECASTER_MODEL overrides both.
         if os.getenv("ANTHROPIC_API_KEY"):
-            prefix, haiku = "anthropic/", "claude-haiku-4-5"
+            prefix, haiku, forecaster_default = "anthropic/", "claude-haiku-4-5", "claude-sonnet-5"
         elif os.getenv("OPENROUTER_API_KEY"):
-            prefix, haiku = "openrouter/anthropic/", "claude-haiku-4.5"
+            prefix, haiku, forecaster_default = (
+                "openrouter/anthropic/",
+                "claude-haiku-4.5",
+                "claude-opus-5.5",
+            )
         else:
             defaults["researcher_2"] = None
             return defaults
 
-        forecaster = os.getenv("FORECASTER_MODEL") or f"{prefix}claude-sonnet-5"
+        forecaster = os.getenv("FORECASTER_MODEL") or f"{prefix}{forecaster_default}"
         parser = os.getenv("PARSER_MODEL") or f"{prefix}{haiku}"
         defaults["default"] = GeneralLlm(
             model=forecaster,
@@ -851,8 +857,10 @@ if __name__ == "__main__":
 
     # Models come from RcForecastBot._llm_config_defaults (Claude, routed by the key
     # that is set). One research report (two independent sources) x five predictions:
-    # about $0.35 a question at Sonnet 5 list prices, which keeps a season plus MiniBench
-    # near $85 a month. RESEARCH_REPORTS=2 buys a second independent search for ~35% more.
+    # about $0.65 a question with Opus 5.5 or $0.40 with Sonnet 5 at list prices; a Fall
+    # season plus MiniBench is ~800 questions. RESEARCH_REPORTS=2 with
+    # PREDICTIONS_PER_REPORT=3 (six predictions over two independent searches) costs
+    # about 35-45% more.
     template_bot = RcForecastBot(
         research_reports_per_question=_env_int("RESEARCH_REPORTS", 1),
         predictions_per_research_report=_env_int("PREDICTIONS_PER_REPORT", 5),

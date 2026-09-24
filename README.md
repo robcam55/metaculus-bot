@@ -9,10 +9,11 @@ questions a season against professional forecasters, with no money at risk.
 ## What's different from the template
 
 All the changes are in `main.py` (`RcForecastBot`):
-- **Claude models.** Sonnet 5 forecasts and Haiku 4.5 parses. Calls go through whichever
-  key is set: `ANTHROPIC_API_KEY` directly, otherwise `OPENROUTER_API_KEY` (for example
-  Metaculus's free tournament credits). Sonnet 5 rejects sampling parameters, so none are
-  sent.
+- **Claude models.** The forecaster depends on the key:
+  - `OPENROUTER_API_KEY` (Metaculus's donated credits) runs Opus 5.5.
+  - `ANTHROPIC_API_KEY` (a personal key) runs Sonnet 5, at half the price.
+
+  Haiku 4.5 parses in both cases. These models reject sampling parameters, so none are sent.
 - **Two independent research sources per research report.**
   - AskNews latest news: one call per question, to fit the free tier's 1,000 calls a month.
     The template's version uses six.
@@ -20,9 +21,11 @@ All the changes are in `main.py` (`RcForecastBot`):
     which Metaculus's credits cover), or Perplexity with your own key.
 
   If one source fails, the other still feeds the forecast.
-- **Five predictions per question** from one research report, costing about $0.35 per
-  question at Sonnet 5 list prices. Binary questions use a trimmed mean (dropping the highest
-  and lowest), which beat the median in Halawi et al. (2024).
+- **Five predictions per question** from one research report. At list prices this costs
+  about $0.65 a question with Opus 5.5, or about $0.40 with Sonnet 5. Binary questions use a
+  trimmed mean (dropping the highest and lowest), which beat the median in Halawi et al.
+  (2024). If credits run low, set `FORECASTER_MODEL` to
+  `openrouter/anthropic/claude-sonnet-5`.
 - **An outside-view-first binary prompt.** It asks for a reference class and base rate,
   weights the status quo, and checks explicitly against language models' lean toward
   "Yes".
@@ -58,10 +61,10 @@ Other optional repository variables (empty means the default):
 
 | Variable | Default |
 |---|---|
-| `FORECASTER_MODEL` | `anthropic/claude-sonnet-5` or `openrouter/anthropic/claude-sonnet-5`, depending on the key |
+| `FORECASTER_MODEL` | `openrouter/anthropic/claude-opus-5.5` on the OpenRouter key; `anthropic/claude-sonnet-5` on a personal Anthropic key |
 | `PARSER_MODEL` | Claude Haiku 4.5 through the same route |
 | `SEARCH_MODEL` | `openrouter/anthropic/claude-sonnet-5:online` (OpenRouter route only) |
-| `RESEARCH_REPORTS` | 1 (2 adds a second independent search, for about 35% more cost) |
+| `RESEARCH_REPORTS` | 1. Setting it to 2 with `PREDICTIONS_PER_REPORT=3` gives six predictions over two independent searches, for about 35–45% more cost. |
 | `PREDICTIONS_PER_REPORT` | 5 |
 | `MINIBENCH_ID` | The package's current MiniBench |
 

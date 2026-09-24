@@ -62,7 +62,9 @@ def check_routing() -> None:
 
     with env(OPENROUTER_API_KEY="x", ASKNEWS_CLIENT_ID="x", ASKNEWS_SECRET="y"):
         d = main.RcForecastBot._llm_config_defaults()
-        assert model_of(d["default"]) == "openrouter/anthropic/claude-sonnet-5"
+        # donated credits run the stronger model
+        assert model_of(d["default"]) == "openrouter/anthropic/claude-opus-5.5"
+        assert d["default"].litellm_kwargs["temperature"] is None
         assert model_of(d["parser"]) == "openrouter/anthropic/claude-haiku-4.5"
         assert d["researcher"] == main.ASKNEWS_RESEARCHER == "asknews/latest"
         # Metaculus's OpenRouter credits cover Anthropic but not Perplexity
