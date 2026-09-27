@@ -51,6 +51,8 @@ jobs:
           ASKNEWS_SECRET: ${{ secrets.ASKNEWS_SECRET }}
           ASKNEWS_API_KEY: ${{ secrets.ASKNEWS_API_KEY }}
           # Optional settings (repository variables, not secrets); empty = default
+          BUDGET_TIER: ${{ vars.BUDGET_TIER }}
+          TEST_QUESTIONS: ${{ vars.TEST_QUESTIONS }}
           FORECASTER_MODEL: ${{ vars.FORECASTER_MODEL }}
           PARSER_MODEL: ${{ vars.PARSER_MODEL }}
           SEARCH_MODEL: ${{ vars.SEARCH_MODEL }}
