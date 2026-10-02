@@ -160,7 +160,9 @@ class SpendMeter:
     OpenRouter's key figures lag the spend by minutes (the first live test re-read the
     key right after a pass: $0.32 of $0.63 showed, and usage had not moved), so the
     balance is read once, before the run, when the previous run's spend has settled.
-    Each pass's spend is the sum of the costs OpenRouter returns with every response."""
+    Each pass's spend is the sum of the costs OpenRouter returns with every response.
+    Those run slightly low: the first test's came to $0.63, but the settled balance fell
+    $0.73, probably because web searches ($0.01 each) bill separately."""
 
     def __init__(self, api_key: str) -> None:
         self.start = key_status(api_key)

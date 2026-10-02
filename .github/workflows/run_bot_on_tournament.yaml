@@ -2,6 +2,12 @@ name: Forecast on new AI tournament questions
 
 on:
   workflow_dispatch:
+    inputs:
+      source:
+        description: "Who started the run. The Cloudflare clock sends 'cloudflare'; leave this as 'manual'."
+        default: manual
+  # GitHub fires this only about five times a day, so the 20-minute clock is the
+  # Cloudflare Worker in trigger/; this schedule stays as a backup.
   schedule:
     - cron: "7,27,47 * * * *" # every 20 min, offset off the hour. Make sure to skip already-forecasted questions!
 
@@ -11,12 +17,13 @@ concurrency:
   cancel-in-progress: false
 
 
-# Scheduled runs stay off until the repository variable BOT_ENABLED is set to true
-# (Settings -> Secrets and variables -> Actions -> Variables), so the schedule can't
-# fail every 20 minutes before the secrets exist. Running it by hand always works.
+# Scheduled runs, and runs the Cloudflare clock starts, stay off until the repository
+# variable BOT_ENABLED is set to true (Settings -> Secrets and variables -> Actions ->
+# Variables), so they can't fail every 20 minutes before the secrets exist. Running it by
+# hand always works.
 jobs:
   forecast_job:
-    if: vars.BOT_ENABLED == 'true' || github.event_name == 'workflow_dispatch'
+    if: vars.BOT_ENABLED == 'true' || (github.event_name == 'workflow_dispatch' && inputs.source != 'cloudflare')
     runs-on: ubuntu-latest # determines the machine that will run the job - keep as is
     timeout-minutes: 60
     steps: # sets up the steps that will be run in order

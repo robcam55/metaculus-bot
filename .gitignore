@@ -171,3 +171,7 @@ cython_debug/
 
 # MacOS
 .DS_Store
+
+# Wrangler (the Cloudflare trigger in trigger/)
+.wrangler/
+node_modules/

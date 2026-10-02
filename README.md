@@ -44,7 +44,10 @@ The changes are in `main.py` (`RcForecastBot`) and `budget.py`:
   - **Measured spend.** Each run's page on GitHub shows the balance and what each tier
     cost per question. The costs are the ones OpenRouter returns with every response;
     its balance figure lags by minutes, so the bot reads it once, at the start of a run.
-    Recalibrate the estimates in `budget.py` from those numbers after the first week.
+    The response costs run slightly low: the first test's added up to $0.63 while the
+    balance fell $0.73, probably because web searches bill separately. Pacing works from
+    the balance, so it isn't affected. Recalibrate the estimates in `budget.py` from
+    those numbers after the first week.
 - **Two independent research sources per research report.**
   - AskNews latest news: one call per question, to fit the free tier's 1,000 calls a month.
     The template's version uses six.
@@ -63,7 +66,10 @@ The changes are in `main.py` (`RcForecastBot`) and `budget.py`:
   - The Fall 2026 tournament ids are built in, because the pinned `forecasting-tools`
     still points at Summer. `AIB_TOURNAMENT_ID`, `MINIBENCH_ID` and `METACULUS_CUP_ID`
     override them for later seasons.
-  - The 20-minute schedule stays off until you set `BOT_ENABLED`.
+  - GitHub fires the 20-minute schedule only about five times a day, and FutureEval
+    questions stay open for 1.5 hours (3 for now). So a Cloudflare Worker (`trigger/`)
+    starts the workflow every 20 minutes, with GitHub's schedule kept as a backup. Both
+    stay off until you set `BOT_ENABLED`.
   - One run forecasts at most 25 new questions, soonest-closing first, so a new MiniBench
     round can't outlast the 60-minute timeout. The rest wait 20 minutes for the next run.
   - The Metaculus Cup workflow is manual-only.
@@ -96,7 +102,31 @@ Offline checks (no network, no keys): `python tests/check_rc_bot.py`.
    - Check that the forecasts appear on the bot's Metaculus profile.
    - Read the run page's summary for the balance and the measured cost per question.
 6. **Turn it on.** Set the repository variable `BOT_ENABLED` to `true`.
-7. **Keep the schedule alive.** GitHub pauses scheduled workflows in a public repo after 60
+7. **Start the 20-minute clock.** GitHub's own schedule fires only about five times a day.
+   The Worker in `trigger/` starts the workflow every 20 minutes instead.
+   1. Create a fine-grained GitHub token: GitHub → Settings → Developer settings →
+      Personal access tokens → Fine-grained tokens → Generate new token.
+      - Name: `metaculus-bot-trigger`.
+      - Expiration: after the season, e.g. 2027-01-31.
+      - Repository access: only `robcam55/metaculus-bot`.
+      - Permissions: Repository permissions → Actions → Read and write. Nothing else.
+   2. Deploy the Worker. Wrangler must be signed in to Cloudflare (`npx wrangler login`).
+
+      ```bash
+      npx wrangler deploy --config trigger/wrangler.jsonc
+      ```
+
+   3. Store the token in the Worker. The command prompts for the value:
+
+      ```bash
+      npx wrangler secret put GITHUB_TOKEN --config trigger/wrangler.jsonc
+      ```
+
+   Within 20 minutes a "Forecast on new AI tournament questions" run appears in the
+   Actions tab, started by `workflow_dispatch`. Cloudflare's dashboard shows each tick
+   under the Worker's logs. When the token expires, the runs fall back to GitHub's
+   schedule; make a new token and repeat step 3.
+8. **Keep the schedule alive.** GitHub pauses scheduled workflows in a public repo after 60
    days without a commit, and the Fall 2026 season runs to Jan 6. Push any commit at least
    every 50 days: the next by Nov 16.
 
@@ -120,12 +150,16 @@ Other optional repository variables (empty means the default):
 The main architectural choices and the reasons behind them. Each links to where it was decided; ones marked *inferred* were never written down, so the reason given is the likely one, not a recorded one. When a new architectural decision is made, add it here. Links into rc_trader go to a private repo.
 
 - **Metaculus's template and its `forecasting-tools` package, in Python.** The package fetches questions, parses and posts forecasts, and picks up each season's fixes with a version bump. The bot's own code is then only research, prompts, aggregation and spending. — [rc_trader's 2026-09-23 audit](https://github.com/robcam55/rc_trader/blob/main/docs/audit/2026-09-23-AUDIT.md) (§8: D-14, and Rob's choice of a repo built from the template, approved 2026-09-23); the reason is *inferred*
-- **GitHub Actions every 20 minutes, from a public repo, with no storage of its own.**
-  - **Why 20 minutes.** Tournament questions stay open for only a few hours, which rc_trader's nightly job can't serve.
+- **GitHub Actions every 20 minutes, started by a Cloudflare Worker, from a public repo, with no storage of its own.**
+  - **Why 20 minutes.** FutureEval questions open at random hours, up to five at a time, and each stays open for 1.5 hours (3 for now). rc_trader's nightly job can't serve that.
+  - **Why Cloudflare starts the runs.**
+    - GitHub fired this repo's 20-minute schedule only about five times a day: 45 runs between Sep 23 and Oct 2, a median of 5 hours apart. That would miss roughly half the questions.
+    - A Worker's cron trigger is a reliable clock that needs no server, and its token can touch only this repo's Actions.
+    - Rob chose it over a workflow that re-triggers itself, which needs no token but keeps a GitHub runner busy around the clock.
   - **Why no storage.** Metaculus keeps the forecasts, and OpenRouter keeps the spend.
-  - **Why off by default.** Scheduled runs stay off until `BOT_ENABLED`, so the schedule can't fail every 20 minutes before the secrets exist.
+  - **Why off by default.** Scheduled runs, and runs the Worker starts, stay off until `BOT_ENABLED`, so they can't fail every 20 minutes before the secrets exist.
 
-  — [rc_trader's 2026-09-23 audit](https://github.com/robcam55/rc_trader/blob/main/docs/audit/2026-09-23-AUDIT.md) (§8, Rob's hosting choice, 2026-09-23); the `BOT_ENABLED` gate from [the workflow](.github/workflows/run_bot_on_tournament.yaml); no storage is *inferred*
+  — [rc_trader's 2026-09-23 audit](https://github.com/robcam55/rc_trader/blob/main/docs/audit/2026-09-23-AUDIT.md) (§8, Rob's hosting choice, 2026-09-23). The Cloudflare clock is Rob's choice of 2026-10-02, built in [#3](https://github.com/robcam55/metaculus-bot/pull/3). The question windows are from [Metaculus's resources page](https://www.metaculus.com/notebooks/38928/ai-benchmark-resources/), and the `BOT_ENABLED` gate from [the workflow](.github/workflows/run_bot_on_tournament.yaml). No storage is *inferred*.
 - **Claude models: Opus 5.5 on Metaculus's credits, Sonnet 5 on a personal key.** The bot is the external check on rc_trader's forecasting engine, which runs on Claude, and Metaculus's credits cover Anthropic models. — [rc_trader's 2026-09-23 audit](https://github.com/robcam55/rc_trader/blob/main/docs/audit/2026-09-23-AUDIT.md) (§8, D-14: "upgrade it as the §4 engine lands"). The switch to Opus 5.5 was Claude's, in [f4dfc32](https://github.com/robcam55/metaculus-bot/commit/f4dfc32), and Rob's credit application of 2026-09-24 described it.
 - **Metaculus's credits pay first, and never for the Metaculus Cup.**
   - **Cup on a personal key.** Metaculus gives the credits for FutureEval and MiniBench only, so the Cup, and any experiment run there, needs a personal key.
