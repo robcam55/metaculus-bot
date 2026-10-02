@@ -1,12 +1,17 @@
 import argparse
 import asyncio
 import logging
+import math
 import os
 import statistics
+import sys
 from datetime import datetime, timezone
 from typing import Literal
 
 import dotenv
+
+# Pacing for Metaculus's incremental OpenRouter credits.
+import budget
 
 # Runtime helpers (env validation, banners, dependency-warning suppression).
 from bot_helpers import (
@@ -33,6 +38,7 @@ from forecasting_tools import (
     Percentile,
     ConditionalQuestion,
     ConditionalPrediction,
+    ForecastReport,
     PredictionTypes,
     PredictionAffirmed,
     BinaryPrediction,
@@ -50,6 +56,17 @@ logger = logging.getLogger(__name__)
 # "news-summaries" makes 6 per question (latest news = 1, archive = 5); a season plus
 # MiniBench is roughly 250 questions a month, so only the latest-news call is used.
 ASKNEWS_RESEARCHER = "asknews/latest"
+
+# forecasting-tools 0.2.x (the template's pin) still points at the Summer 2026 season;
+# its 0.3.1 release carries these Fall 2026 ids. AIB_TOURNAMENT_ID and METACULUS_CUP_ID
+# (numeric id or slug) override them for later seasons.
+FALL_2026_FUTUREEVAL_ID = 33121  # https://www.metaculus.com/tournament/fall-futureeval-2026/
+FALL_2026_METACULUS_CUP_ID = 33108  # https://www.metaculus.com/tournament/metaculus-cup-fall-2026/
+
+# Research runs one question at a time (a minute or so each), so a burst such as a new
+# MiniBench round would outlast the workflow's 60-minute timeout. Runs come every 20
+# minutes and pick up the rest.
+MAX_QUESTIONS_PER_RUN = 25
 
 
 class AskNewsLatestSearcher(AskNewsSearcher):
@@ -102,13 +119,91 @@ def _has_asknews() -> bool:
     )
 
 
+def llm_route() -> str | None:
+    """Which key pays: Metaculus's donated OpenRouter credits before a personal
+    Anthropic key. None leaves forecasting-tools' own defaults in charge."""
+    if os.getenv("OPENROUTER_API_KEY"):
+        return "openrouter"
+    if os.getenv("ANTHROPIC_API_KEY"):
+        return "anthropic"
+    return None
+
+
+def build_llms(
+    route: str | None, tier: budget.Tier | None = None
+) -> dict[str, str | GeneralLlm | None]:
+    """The bot's models on one route. On Metaculus's OpenRouter credits the pacing tier
+    picks the forecaster (Opus 5.5 without one); a personal Anthropic key runs Sonnet 5,
+    or FORECASTER_MODEL. Haiku 4.5 parses on both; PARSER_MODEL overrides it."""
+    defaults = dict(ForecastBot._llm_config_defaults())
+    if route is None:
+        defaults["researcher_2"] = None
+        return defaults
+    if route == "openrouter":
+        prefix, haiku = "openrouter/anthropic/", "claude-haiku-4.5"
+        forecaster = tier.forecaster if tier and tier.forecaster else budget.OPUS
+    else:
+        prefix, haiku = "anthropic/", "claude-haiku-4-5"
+        forecaster = os.getenv("FORECASTER_MODEL") or f"{prefix}claude-sonnet-5"
+    parser = os.getenv("PARSER_MODEL") or f"{prefix}{haiku}"
+    defaults["default"] = GeneralLlm(
+        model=forecaster,
+        # Sonnet 5, Opus 5 and newer reject sampling parameters: send none
+        temperature=None,
+        timeout=_env_int("FORECASTER_TIMEOUT_S", 300),
+        allowed_tries=2,
+    )
+    parser_llm = GeneralLlm(
+        model=parser,
+        temperature=0 if "haiku" in parser else None,
+        timeout=120,
+        allowed_tries=3,
+    )
+    defaults["parser"] = parser_llm
+    defaults["summarizer"] = parser_llm
+
+    # Two independent research sources: AskNews (free for tournament bots) and a
+    # search-backed model. Either may be missing; research then uses what exists.
+    # Metaculus's OpenRouter credits cover only OpenAI, Anthropic and Google models,
+    # so the searcher there is Sonnet 5 with ":online" (the provider's own web
+    # search; OpenRouter's Exa fallback is not covered). A personal-key run never
+    # touches the OpenRouter key.
+    search_llm: GeneralLlm | None = None
+    if os.getenv("PERPLEXITY_API_KEY"):
+        search_llm = GeneralLlm(model="perplexity/sonar-pro", temperature=0.1)
+    elif route == "openrouter":
+        search_llm = GeneralLlm(
+            model=os.getenv("SEARCH_MODEL") or "openrouter/anthropic/claude-sonnet-5:online",
+            temperature=None,
+            timeout=300,
+            allowed_tries=2,
+        )
+    if os.getenv("RESEARCHER"):
+        defaults["researcher"] = os.getenv("RESEARCHER")
+        defaults["researcher_2"] = None
+    elif _has_asknews():
+        defaults["researcher"] = ASKNEWS_RESEARCHER
+        defaults["researcher_2"] = search_llm
+    elif search_llm is not None:
+        defaults["researcher"] = search_llm
+        defaults["researcher_2"] = None
+    else:
+        # No search provider at all: research from the forecaster's own knowledge
+        # (weak for current events; set ASKNEWS_* or a search key)
+        defaults["researcher"] = defaults["default"]
+        defaults["researcher_2"] = None
+    return defaults
+
+
 class RcForecastBot(ForecastBot):
     """
     rc_trader's entry in the Metaculus AI forecasting tournament (FutureEval), built on
     Metaculus's template bot. Changes from the template:
-    - Claude models, routed by whichever key is present: OPENROUTER_API_KEY (Metaculus's
-      donated credits) forecasts with Opus 5.5; ANTHROPIC_API_KEY (a personal key)
-      forecasts with Sonnet 5. Haiku 4.5 parses; FORECASTER_MODEL / PARSER_MODEL override.
+    - Claude models, paid by Metaculus's donated credits (OPENROUTER_API_KEY) before a
+      personal key (ANTHROPIC_API_KEY). On the donated credits, budget.py paces spending:
+      each run reads the key's balance and picks Opus 5.5 or Sonnet 5 and the number of
+      predictions per tournament, MiniBench never below FutureEval. A personal key runs
+      Sonnet 5 unpaced. Haiku 4.5 parses; PARSER_MODEL overrides it.
     - Two independent research sources per report: AskNews latest news (one call, to
       stay inside the free tier) and a search-backed model (Sonnet 5 with ":online"
       through OpenRouter, or Perplexity with its own key). A single search's luck was
@@ -207,71 +302,9 @@ class RcForecastBot(ForecastBot):
 
     @classmethod
     def _llm_config_defaults(cls) -> dict[str, str | GeneralLlm | None]:
-        """Claude by default; falls back to forecasting-tools' own defaults when neither
-        ANTHROPIC_API_KEY nor OPENROUTER_API_KEY is set."""
-        defaults = dict(super()._llm_config_defaults())
-        # Metaculus's donated credits (OpenRouter) run the stronger Opus 5.5; a personal
-        # Anthropic key runs Sonnet 5 at half the price. FORECASTER_MODEL overrides both.
-        if os.getenv("ANTHROPIC_API_KEY"):
-            prefix, haiku, forecaster_default = "anthropic/", "claude-haiku-4-5", "claude-sonnet-5"
-        elif os.getenv("OPENROUTER_API_KEY"):
-            prefix, haiku, forecaster_default = (
-                "openrouter/anthropic/",
-                "claude-haiku-4.5",
-                "claude-opus-5.5",
-            )
-        else:
-            defaults["researcher_2"] = None
-            return defaults
-
-        forecaster = os.getenv("FORECASTER_MODEL") or f"{prefix}{forecaster_default}"
-        parser = os.getenv("PARSER_MODEL") or f"{prefix}{haiku}"
-        defaults["default"] = GeneralLlm(
-            model=forecaster,
-            # Sonnet 5, Opus 5 and newer reject sampling parameters: send none
-            temperature=None,
-            timeout=_env_int("FORECASTER_TIMEOUT_S", 300),
-            allowed_tries=2,
-        )
-        parser_llm = GeneralLlm(
-            model=parser,
-            temperature=0 if "haiku" in parser else None,
-            timeout=120,
-            allowed_tries=3,
-        )
-        defaults["parser"] = parser_llm
-        defaults["summarizer"] = parser_llm
-
-        # Two independent research sources: AskNews (free for tournament bots) and a
-        # search-backed model. Either may be missing; research then uses what exists.
-        # Metaculus's OpenRouter credits cover only OpenAI, Anthropic and Google models,
-        # so the searcher there is Sonnet 5 with ":online" (the provider's own web
-        # search; OpenRouter's Exa fallback is not covered).
-        search_llm: GeneralLlm | None = None
-        if os.getenv("PERPLEXITY_API_KEY"):
-            search_llm = GeneralLlm(model="perplexity/sonar-pro", temperature=0.1)
-        elif os.getenv("OPENROUTER_API_KEY"):
-            search_llm = GeneralLlm(
-                model=os.getenv("SEARCH_MODEL") or "openrouter/anthropic/claude-sonnet-5:online",
-                temperature=None,
-                timeout=300,
-                allowed_tries=2,
-            )
-        if os.getenv("RESEARCHER"):
-            defaults["researcher"] = os.getenv("RESEARCHER")
-            defaults["researcher_2"] = None
-        elif _has_asknews():
-            defaults["researcher"] = ASKNEWS_RESEARCHER
-            defaults["researcher_2"] = search_llm
-        elif search_llm is not None:
-            defaults["researcher"] = search_llm
-            defaults["researcher_2"] = None
-        else:
-            # No search provider at all: research from the forecaster's own knowledge
-            # (weak for current events; set ASKNEWS_* or a search key)
-            defaults["researcher"] = defaults["default"]
-            defaults["researcher_2"] = None
-        return defaults
+        """Claude by default (see build_llms); forecasting-tools' own defaults when
+        neither OPENROUTER_API_KEY nor ANTHROPIC_API_KEY is set."""
+        return build_llms(llm_route())
 
     ##################################### RESEARCH #####################################
 
@@ -833,7 +866,65 @@ class RcForecastBot(ForecastBot):
         )
 
 
-if __name__ == "__main__":
+def _tournament_id(value: str | None, default: int | str) -> int | str:
+    """An env override (numeric id or slug), or the default."""
+    value = (value or "").strip()
+    if not value:
+        return default
+    return int(value) if value.isdigit() else value
+
+
+def soonest_closing(
+    questions: list[MetaculusQuestion], limit: int | None
+) -> list[MetaculusQuestion]:
+    """Up to `limit` questions (None = all), those closing soonest first."""
+    ordered = sorted(
+        questions,
+        key=lambda q: q.close_time.timestamp() if q.close_time else math.inf,
+    )
+    return ordered if limit is None else ordered[: max(limit, 0)]
+
+
+def one_of_each_type(
+    questions: list[MetaculusQuestion], limit: int
+) -> list[MetaculusQuestion]:
+    """Up to `limit` questions, covering as many question types as possible."""
+    firsts: list[MetaculusQuestion] = []
+    rest: list[MetaculusQuestion] = []
+    seen: set[type] = set()
+    for question in questions:
+        (rest if type(question) in seen else firsts).append(question)
+        seen.add(type(question))
+    return (firsts + rest)[:limit]
+
+
+def make_bot(
+    route: str | None,
+    tier: budget.Tier | None,
+    publish: bool,
+    skip_previous: bool = True,
+) -> RcForecastBot:
+    """One research report (two independent sources) per question. On Metaculus's
+    credits the pacing tier sets the forecaster and the number of predictions; on a
+    personal key RESEARCH_REPORTS and PREDICTIONS_PER_REPORT do (1 and 5 by default)."""
+    if route == "openrouter" and tier is not None:
+        reports, predictions = 1, tier.predictions
+    else:
+        reports = _env_int("RESEARCH_REPORTS", 1)
+        predictions = _env_int("PREDICTIONS_PER_REPORT", 5)
+    return RcForecastBot(
+        research_reports_per_question=reports,
+        predictions_per_research_report=predictions,
+        use_research_summary_to_forecast=False,
+        publish_reports_to_metaculus=publish,
+        folder_to_save_reports_to=None,
+        skip_previously_forecasted_questions=skip_previous,
+        extra_metadata_in_explanation=True,
+        llms=build_llms(route, tier),
+    )
+
+
+def main() -> None:
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -852,77 +943,122 @@ if __name__ == "__main__":
 
     check_environment(strict=True)
     # PUBLISH=false gives a dry run: full research and forecasts, nothing posted
-    publish_to_metaculus = _env_flag("PUBLISH", True)
-    print_startup_banner(run_mode, will_publish=publish_to_metaculus)
+    publish = _env_flag("PUBLISH", True)
+    print_startup_banner(run_mode, will_publish=publish)
 
-    # Models come from RcForecastBot._llm_config_defaults (Claude, routed by the key
-    # that is set). One research report (two independent sources) x five predictions:
-    # about $0.65 a question with Opus 5.5 or $0.40 with Sonnet 5 at list prices; a Fall
-    # season plus MiniBench is ~800 questions. RESEARCH_REPORTS=2 with
-    # PREDICTIONS_PER_REPORT=3 (six predictions over two independent searches) costs
-    # about 35-45% more.
-    template_bot = RcForecastBot(
-        research_reports_per_question=_env_int("RESEARCH_REPORTS", 1),
-        predictions_per_research_report=_env_int("PREDICTIONS_PER_REPORT", 5),
-        use_research_summary_to_forecast=False,
-        publish_reports_to_metaculus=publish_to_metaculus,
-        folder_to_save_reports_to=None,
-        skip_previously_forecasted_questions=True,
-        extra_metadata_in_explanation=True,
-    )
+    route = llm_route()
+    if run_mode == "metaculus_cup":
+        # Metaculus's credits are for FutureEval and MiniBench only
+        if not os.getenv("ANTHROPIC_API_KEY"):
+            sys.exit(
+                "The Metaculus Cup runs only on your own ANTHROPIC_API_KEY: Metaculus's"
+                " OpenRouter credits are for FutureEval and MiniBench."
+            )
+        route = "anthropic"
+
+    # Pacing applies to Metaculus's credits; a personal key runs unpaced.
+    meter: budget.SpendMeter | None = None
+    plan: budget.Plan | None = None
+    if route == "openrouter":
+        meter = budget.SpendMeter(os.environ["OPENROUTER_API_KEY"])
+        plan = budget.make_plan(meter.remaining(), budget.pinned_tier())
+        logger.info(
+            f"Credits left: {budget.dollars(meter.remaining())}. FutureEval runs"
+            f" {plan.futureeval.name}, MiniBench {plan.minibench.name} ({plan.note})."
+        )
 
     client = MetaculusClient()
-    # A new season's tournament id reaches forecasting-tools only in a package release;
-    # AIB_TOURNAMENT_ID (numeric id or slug) bridges the gap.
-    tournament_id: int | str = (
-        os.getenv("AIB_TOURNAMENT_ID") or client.CURRENT_AI_COMPETITION_ID
-    )
-    if isinstance(tournament_id, str) and tournament_id.isdigit():
-        tournament_id = int(tournament_id)
-    minibench_id: int | str = os.getenv("MINIBENCH_ID") or client.CURRENT_MINIBENCH_ID
-
+    tournament_id = _tournament_id(os.getenv("AIB_TOURNAMENT_ID"), FALL_2026_FUTUREEVAL_ID)
+    minibench_id = _tournament_id(os.getenv("MINIBENCH_ID"), client.CURRENT_MINIBENCH_ID)
+    cup_id = _tournament_id(os.getenv("METACULUS_CUP_ID"), FALL_2026_METACULUS_CUP_ID)
     # Tournament URL shown in the summary banner footer.
-    TOURNAMENT_URLS = {
+    tournament_urls = {
         "tournament": f"https://www.metaculus.com/tournament/{tournament_id}/",
-        "metaculus_cup": "https://www.metaculus.com/tournament/metaculus-cup-summer-2025/",
+        "metaculus_cup": f"https://www.metaculus.com/tournament/{cup_id}/",
         "test_questions": "https://www.metaculus.com/tournament/bot-testing-area/",
     }
 
-    # Dispatch on mode. Each branch produces a list of ForecastReport (or
-    # exceptions, since return_exceptions=True) which then flows into the
-    # summary printers below.
-    if run_mode == "tournament":
-        seasonal_tournament_reports = asyncio.run(
-            template_bot.forecast_on_tournament(tournament_id, return_exceptions=True)
-        )
-        minibench_reports = asyncio.run(
-            template_bot.forecast_on_tournament(minibench_id, return_exceptions=True)
-        )
-        forecast_reports = seasonal_tournament_reports + minibench_reports
-    elif run_mode == "metaculus_cup":
-        # The Metaculus Cup may be uninitialized near the start of a season
-        # (Jan/May/Sep). AXC_2025_TOURNAMENT_ID = 32564 and
-        # AI_2027_TOURNAMENT_ID = "ai-2027" are also valid targets here.
-        template_bot.skip_previously_forecasted_questions = False
-        forecast_reports = asyncio.run(
-            template_bot.forecast_on_tournament(
-                client.CURRENT_METACULUS_CUP_ID, return_exceptions=True
-            )
-        )
-    elif run_mode == "test_questions":
-        # The bot-testing-area tournament contains all question types and is
-        # the recommended target for smoke-testing your bot.
-        # https://www.metaculus.com/tournament/bot-testing-area/
-        template_bot.skip_previously_forecasted_questions = False
-        forecast_reports = asyncio.run(
-            template_bot.forecast_on_tournament(
-                "bot-testing-area", return_exceptions=True
-            )
-        )
+    def run_pass(
+        label: str,
+        questions: list[MetaculusQuestion],
+        tier: budget.Tier | None,
+        skip_previous: bool = True,
+    ) -> list[ForecastReport | BaseException]:
+        if not questions:
+            logger.info(f"{label}: no new questions")
+            return []
+        bot = make_bot(route, tier, publish, skip_previous)
+        results = asyncio.run(bot.forecast_questions(questions, return_exceptions=True))
+        if meter is not None and tier is not None:
+            failed = sum(isinstance(r, BaseException) for r in results)
+            meter.record(label, tier, len(results) - failed, failed)
+        return results
 
-    template_bot.log_report_summary(forecast_reports)
+    reports: list[ForecastReport | BaseException] = []
+    if run_mode == "tournament":
+        room = MAX_QUESTIONS_PER_RUN
+        passes = (
+            ("FutureEval", tournament_id, plan.futureeval if plan else None),
+            ("MiniBench", minibench_id, plan.minibench if plan else None),
+        )
+        for label, tid, tier in passes:
+            new = [
+                q
+                for q in client.get_all_open_questions_from_tournament(tid)
+                if not q.already_forecasted
+            ]
+            if tier is not None and tier.predictions == 0:
+                if new:
+                    logger.warning(f"{label}: paused; {len(new)} new question(s) skipped")
+                continue
+            limit = room
+            if meter is not None and tier is not None:
+                can_pay = budget.affordable(meter.remaining(), tier)
+                if can_pay is not None:
+                    limit = min(limit, can_pay)
+            chosen = soonest_closing(new, limit)
+            if len(chosen) < len(new):
+                logger.warning(
+                    f"{label}: forecasting {len(chosen)} of {len(new)} new questions"
+                    " (run size or credit); later runs take the rest"
+                )
+            reports += run_pass(label, chosen, tier)
+            room -= len(chosen)
+    elif run_mode == "metaculus_cup":
+        # Re-forecasts every open question. The Metaculus Cup may be uninitialized near
+        # the start of a season (Jan/May/Sep).
+        questions = client.get_all_open_questions_from_tournament(cup_id)
+        reports += run_pass("Metaculus Cup", questions, None, skip_previous=False)
+    elif run_mode == "test_questions":
+        # The bot-testing-area tournament has every question type. TEST_QUESTIONS (3 by
+        # default, one of each type where possible) keeps the smoke test cheap. It runs
+        # MiniBench's tier, the richer of the two.
+        # https://www.metaculus.com/tournament/bot-testing-area/
+        tier = plan.minibench if plan else None
+        if tier is not None and tier.predictions == 0:
+            logger.warning("bot-testing-area: paused; nothing forecast")
+        else:
+            questions = one_of_each_type(
+                client.get_all_open_questions_from_tournament("bot-testing-area"),
+                _env_int("TEST_QUESTIONS", 3),
+            )
+            reports += run_pass("bot-testing-area", questions, tier, skip_previous=False)
+
+    RcForecastBot.log_report_summary(reports, raise_errors=False)
     print_run_summary_banner(
-        forecast_reports,
-        will_publish=publish_to_metaculus,
-        tournament_url=TOURNAMENT_URLS.get(run_mode),
+        reports,
+        will_publish=publish,
+        tournament_url=tournament_urls.get(run_mode),
     )
+    if meter is not None and plan is not None:
+        lines = meter.summary(plan)
+        print("\n".join(lines) + "\n")
+        budget.write_step_summary(lines)
+    failures = sum(isinstance(r, BaseException) for r in reports)
+    if failures:
+        # a failed question turns the Actions run red
+        sys.exit(f"{failures} question(s) failed; see the log above")
+
+
+if __name__ == "__main__":
+    main()

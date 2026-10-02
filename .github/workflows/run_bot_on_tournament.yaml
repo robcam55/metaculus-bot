@@ -57,6 +57,7 @@ jobs:
           ASKNEWS_SECRET: ${{ secrets.ASKNEWS_SECRET }}
           ASKNEWS_API_KEY: ${{ secrets.ASKNEWS_API_KEY }}
           # Optional settings (repository variables, not secrets); empty = default
+          BUDGET_TIER: ${{ vars.BUDGET_TIER }}
           AIB_TOURNAMENT_ID: ${{ vars.AIB_TOURNAMENT_ID }}
           MINIBENCH_ID: ${{ vars.MINIBENCH_ID }}
           FORECASTER_MODEL: ${{ vars.FORECASTER_MODEL }}

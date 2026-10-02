@@ -8,12 +8,40 @@ questions a season against professional forecasters, with no money at risk.
 
 ## What's different from the template
 
-All the changes are in `main.py` (`RcForecastBot`):
-- **Claude models.** The forecaster depends on the key:
-  - `OPENROUTER_API_KEY` (Metaculus's donated credits) runs Opus 5.5.
-  - `ANTHROPIC_API_KEY` (a personal key) runs Sonnet 5, at half the price.
+The changes are in `main.py` (`RcForecastBot`) and `budget.py`:
+- **Claude models, on Metaculus's credits first.**
+  - Metaculus's donated OpenRouter credits (`OPENROUTER_API_KEY`) pay before a personal
+    `ANTHROPIC_API_KEY`.
+  - They never pay for the Metaculus Cup, because Metaculus gives them for FutureEval and
+    MiniBench only.
+  - On the credits, the pacing tier below picks Opus 5.5 or Sonnet 5. A personal key runs
+    Sonnet 5.
 
   Haiku 4.5 parses in both cases. These models reject sampling parameters, so none are sent.
+- **Paced spending (`budget.py`).** Metaculus funds the key in steps:
+  - about $100 to start;
+  - more automatically after above-average MiniBench results;
+  - possibly a bonus for open-source bots.
+
+  Each run reads the key's balance from OpenRouter. For each tournament it picks the
+  richest tier the balance can pay for over four weeks of expected questions (about 35
+  FutureEval and 30 MiniBench a week):
+
+  | Tier | Forecasts per question | Estimated cost per question |
+  |---|---|---|
+  | `opus-5` | 5 × Opus 5.5 | $0.65 |
+  | `opus-3` | 3 × Opus 5.5 | $0.45 |
+  | `sonnet-3` | 3 × Sonnet 5 | $0.30 |
+
+  - **MiniBench first.** MiniBench results decide further funding, so MiniBench never runs
+    below FutureEval. At $100, FutureEval runs `sonnet-3` and MiniBench `opus-3`; from about
+    $171, both run `opus-5`.
+  - **Never runs dry.** Below $2 the bot pauses, and one run never forecasts more
+    questions than the balance covers, so credit can't run out halfway through a question.
+  - **Top-ups apply at once.** When Metaculus raises the key, the next run sees it.
+  - **Measured spend.** Each run's page on GitHub shows the balance and what each tier
+    actually cost per question. Recalibrate the estimates in `budget.py` from those
+    numbers after the first week.
 - **Two independent research sources per research report.**
   - AskNews latest news: one call per question, to fit the free tier's 1,000 calls a month.
     The template's version uses six.
@@ -21,17 +49,21 @@ All the changes are in `main.py` (`RcForecastBot`):
     which Metaculus's credits cover), or Perplexity with your own key.
 
   If one source fails, the other still feeds the forecast.
-- **Five predictions per question** from one research report. At list prices this costs
-  about $0.65 a question with Opus 5.5, or about $0.40 with Sonnet 5. Binary questions use a
-  trimmed mean (dropping the highest and lowest), which beat the median in Halawi et al.
-  (2024). If credits run low, set `FORECASTER_MODEL` to
-  `openrouter/anthropic/claude-sonnet-5`.
+- **Several predictions per question** from one research report: three or five on
+  Metaculus's credits (by tier), five on a personal key. With four or more, binary questions
+  use a trimmed mean (dropping the highest and lowest), which beat the median in Halawi et
+  al. (2024). With three they use the package's median.
 - **An outside-view-first binary prompt.** It asks for a reference class and base rate,
   weights the status quo, and checks explicitly against language models' lean toward
   "Yes".
-- **Operational changes.** Tournament ids can be overridden, so a new season doesn't wait
-  for a `forecasting-tools` release. The 20-minute schedule stays off until you set
-  `BOT_ENABLED`, and the Metaculus Cup workflow is manual-only to limit spend.
+- **Operational changes.**
+  - The Fall 2026 tournament ids are built in, because the pinned `forecasting-tools`
+    still points at Summer. `AIB_TOURNAMENT_ID`, `MINIBENCH_ID` and `METACULUS_CUP_ID`
+    override them for later seasons.
+  - The 20-minute schedule stays off until you set `BOT_ENABLED`.
+  - One run forecasts at most 25 new questions, soonest-closing first, so a new MiniBench
+    round can't outlast the 60-minute timeout. The rest wait 20 minutes for the next run.
+  - The Metaculus Cup workflow is manual-only.
 
 Offline checks (no network, no keys): `python tests/check_rc_bot.py`.
 
@@ -42,31 +74,74 @@ Offline checks (no network, no keys): `python tests/check_rc_bot.py`.
 2. **Participant form.** Fill in the Fall 2026 participant form. The first section is
    required; its second section applies for the free LLM credits, which arrive as an
    OpenRouter key.
-3. **Model key.** Add one of these as a secret:
-   - `OPENROUTER_API_KEY`: the key Metaculus sends.
-   - `ANTHROPIC_API_KEY`: your own, billed to you.
+3. **Model key.** Add the key Metaculus sends as the secret `OPENROUTER_API_KEY`. The
+   safest way is below: it prompts for the value, so the key never lands in a file or your
+   shell history.
+
+   ```bash
+   gh secret set OPENROUTER_API_KEY --repo robcam55/metaculus-bot
+   ```
+
+   Without it, `ANTHROPIC_API_KEY` (your own key, billed to you) runs the bot unpaced on
+   Sonnet 5.
 4. **Research (optional but recommended).** Get free AskNews access: make an AskNews account
    with the bot's email, then contact AskNews. Add `ASKNEWS_CLIENT_ID` and `ASKNEWS_SECRET`,
    or `ASKNEWS_API_KEY`.
-5. **Test.** Run `Actions → Test Bot → Run workflow`. It forecasts on the bot-testing-area
-   tournament. Check that the forecasts appear on the bot's Metaculus profile.
-6. **Season id.** Set the repository variable `AIB_TOURNAMENT_ID` to `fall-futureeval-2026`.
-   The pinned `forecasting-tools` still points at Summer.
-7. **Turn it on.** Set the repository variable `BOT_ENABLED` to `true`.
-8. **Keep the schedule alive.** GitHub pauses scheduled workflows in a public repo after 60
+5. **Test.** Run `Actions → Test Bot → Run workflow`.
+   - It forecasts three bot-testing-area questions (one of each type) at MiniBench's tier,
+     for about $1–2 of credit.
+   - Check that the forecasts appear on the bot's Metaculus profile.
+   - Read the run page's summary for the balance and the measured cost per question.
+6. **Turn it on.** Set the repository variable `BOT_ENABLED` to `true`.
+7. **Keep the schedule alive.** GitHub pauses scheduled workflows in a public repo after 60
    days without a commit, and the Fall 2026 season runs to Jan 6. Push any commit at least
-   every 50 days: the first by Nov 12.
+   every 50 days: the next by Nov 16.
 
 Other optional repository variables (empty means the default):
 
 | Variable | Default |
 |---|---|
-| `FORECASTER_MODEL` | `openrouter/anthropic/claude-opus-5.5` on the OpenRouter key; `anthropic/claude-sonnet-5` on a personal Anthropic key |
+| `BUDGET_TIER` | Empty: paced. `opus-5`, `opus-3` or `sonnet-3` pins that tier for both tournaments. `pause` stops all spending of Metaculus's credits. The $2 floor always applies. |
+| `TEST_QUESTIONS` | 3 (Test Bot only) |
+| `AIB_TOURNAMENT_ID` | `33121`, the Fall 2026 FutureEval |
+| `MINIBENCH_ID` | The package's current MiniBench (`minibench`) |
+| `METACULUS_CUP_ID` | `33108`, the Fall 2026 Cup (personal key only) |
 | `PARSER_MODEL` | Claude Haiku 4.5 through the same route |
 | `SEARCH_MODEL` | `openrouter/anthropic/claude-sonnet-5:online` (OpenRouter route only) |
-| `RESEARCH_REPORTS` | 1. Setting it to 2 with `PREDICTIONS_PER_REPORT=3` gives six predictions over two independent searches, for about 35–45% more cost. |
-| `PREDICTIONS_PER_REPORT` | 5 |
-| `MINIBENCH_ID` | The package's current MiniBench |
+| `FORECASTER_MODEL` | `anthropic/claude-sonnet-5` (personal key only; on Metaculus's credits the tier picks) |
+| `PREDICTIONS_PER_REPORT` | 5 (personal key only) |
+| `RESEARCH_REPORTS` | 1 (personal key only). Setting it to 2 with `PREDICTIONS_PER_REPORT=3` gives six predictions over two independent searches, for about 35–45% more cost. |
+
+## Why it's built this way
+
+The main architectural choices and the reasons behind them. Each links to where it was decided; ones marked *inferred* were never written down, so the reason given is the likely one, not a recorded one. When a new architectural decision is made, add it here. Links into rc_trader go to a private repo.
+
+- **Metaculus's template and its `forecasting-tools` package, in Python.** The package fetches questions, parses and posts forecasts, and picks up each season's fixes with a version bump. The bot's own code is then only research, prompts, aggregation and spending. — [rc_trader's 2026-09-23 audit](https://github.com/robcam55/rc_trader/blob/main/docs/audit/2026-09-23-AUDIT.md) (§8: D-14, and Rob's choice of a repo built from the template, approved 2026-09-23); the reason is *inferred*
+- **GitHub Actions every 20 minutes, from a public repo, with no storage of its own.**
+  - **Why 20 minutes.** Tournament questions stay open for only a few hours, which rc_trader's nightly job can't serve.
+  - **Why no storage.** Metaculus keeps the forecasts, and OpenRouter keeps the spend.
+  - **Why off by default.** Scheduled runs stay off until `BOT_ENABLED`, so the schedule can't fail every 20 minutes before the secrets exist.
+
+  — [rc_trader's 2026-09-23 audit](https://github.com/robcam55/rc_trader/blob/main/docs/audit/2026-09-23-AUDIT.md) (§8, Rob's hosting choice, 2026-09-23); the `BOT_ENABLED` gate from [the workflow](.github/workflows/run_bot_on_tournament.yaml); no storage is *inferred*
+- **Claude models: Opus 5.5 on Metaculus's credits, Sonnet 5 on a personal key.** The bot is the external check on rc_trader's forecasting engine, which runs on Claude, and Metaculus's credits cover Anthropic models. — [rc_trader's 2026-09-23 audit](https://github.com/robcam55/rc_trader/blob/main/docs/audit/2026-09-23-AUDIT.md) (§8, D-14: "upgrade it as the §4 engine lands"). The switch to Opus 5.5 was Claude's, in [f4dfc32](https://github.com/robcam55/metaculus-bot/commit/f4dfc32), and Rob's credit application of 2026-09-24 described it.
+- **Metaculus's credits pay first, and never for the Metaculus Cup.**
+  - **Cup on a personal key.** Metaculus gives the credits for FutureEval and MiniBench only, so the Cup, and any experiment run there, needs a personal key.
+  - **Credits before a personal key.** The personal key was meant as a stopgap until the credits arrived, so when both are set the credits win.
+
+  — Metaculus's funding email to Rob (2026-09-27, not public); proposed by Claude in [#1](https://github.com/robcam55/metaculus-bot/pull/1), not yet ratified
+- **Paced spending of incremental credits (`budget.py`).**
+  - **The problem.** Metaculus seeds about $100 and adds more only after above-average MiniBench results, which take weeks to resolve. Unpaced, five Opus forecasts a question would spend the seed in two to three weeks, leaving the bot dark while its results are judged.
+  - **The rule.** Each run buys the richest tier the balance covers for four weeks of expected volume, with MiniBench (which decides the funding) never below FutureEval.
+  - **The promise it keeps.** The credit application promised a fallback to Sonnet 5 if credits ran short; pacing makes that fallback automatic.
+  - **Awaiting Rob's ratification.** The tiers, the four-week horizon and MiniBench's priority are Claude's proposal.
+
+  — Metaculus's funding email to Rob (2026-09-27, not public); proposed in [#1](https://github.com/robcam55/metaculus-bot/pull/1), not yet ratified
+- **Two independent research sources, several forecasts, a trimmed mean.**
+  - **Two sources.** Search luck drove most of the night-to-night noise in rc_trader's own forecasts. So each question gets AskNews latest news and Sonnet 5 with native web search, and if one source fails, the other still feeds the forecast.
+  - **One AskNews call.** AskNews's free tier allows 1,000 calls a month, so it gets one latest-news call per question.
+  - **A trimmed mean.** Several forecasts from one report are combined with a trimmed mean, which beat the median in Halawi et al. (2024).
+
+  — the noise finding from [rc_trader's 2026-09-23 audit](https://github.com/robcam55/rc_trader/blob/main/docs/audit/2026-09-23-AUDIT.md) (§2.4 and §4). The design was Claude's, in [de2f36f](https://github.com/robcam55/metaculus-bot/commit/de2f36f) and [e0fac54](https://github.com/robcam55/metaculus-bot/commit/e0fac54), and Rob's credit application of 2026-09-24 described it; not otherwise ratified.
 
 ---
 

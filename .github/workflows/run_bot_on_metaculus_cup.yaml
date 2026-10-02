@@ -35,12 +35,20 @@ jobs:
           poetry run python main.py --mode metaculus_cup
         # this reads the environment variables from the github repository.
         # Store under Settings --> Secrets and variables --> Actions
+        # No OPENROUTER_API_KEY here: Metaculus's credits are for FutureEval and MiniBench,
+        # so the Cup runs only on your own ANTHROPIC_API_KEY.
         env:
           METACULUS_TOKEN: ${{ secrets.METACULUS_TOKEN }} # replace this with the name of the variable under which you stored your own Metaculus token
           PERPLEXITY_API_KEY: ${{ secrets.PERPLEXITY_API_KEY }}
           EXA_API_KEY: ${{ secrets.EXA_API_KEY }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           ASKNEWS_CLIENT_ID: ${{ secrets.ASKNEWS_CLIENT_ID }}
           ASKNEWS_SECRET: ${{ secrets.ASKNEWS_SECRET }}
+          ASKNEWS_API_KEY: ${{ secrets.ASKNEWS_API_KEY }}
+          # Optional settings (repository variables, not secrets); empty = default
+          METACULUS_CUP_ID: ${{ vars.METACULUS_CUP_ID }}
+          FORECASTER_MODEL: ${{ vars.FORECASTER_MODEL }}
+          PARSER_MODEL: ${{ vars.PARSER_MODEL }}
+          RESEARCH_REPORTS: ${{ vars.RESEARCH_REPORTS }}
+          PREDICTIONS_PER_REPORT: ${{ vars.PREDICTIONS_PER_REPORT }}
