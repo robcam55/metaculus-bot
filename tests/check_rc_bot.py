@@ -133,10 +133,10 @@ def check_routing() -> None:
 def check_plan() -> None:
     tiers = budget.TIERS
     plan = budget.make_plan
-    assert (plan(100).futureeval, plan(100).minibench) == (tiers["sonnet-3"], tiers["opus-3"])
-    assert (plan(120).futureeval, plan(120).minibench) == (tiers["opus-3"], tiers["opus-3"])
-    assert (plan(150).futureeval, plan(150).minibench) == (tiers["opus-3"], tiers["opus-5"])
-    assert (plan(512).futureeval, plan(512).minibench) == (tiers["opus-5"], tiers["opus-5"])
+    assert (plan(72).futureeval, plan(72).minibench) == (tiers["sonnet-3"], tiers["opus-3"])
+    assert (plan(85).futureeval, plan(85).minibench) == (tiers["opus-3"], tiers["opus-3"])
+    assert (plan(100).futureeval, plan(100).minibench) == (tiers["opus-3"], tiers["opus-5"])
+    assert (plan(110).futureeval, plan(110).minibench) == (tiers["opus-5"], tiers["opus-5"])
     assert plan(math.inf).futureeval == tiers["opus-5"]  # a key without a limit
     # too little for the horizon: the cheapest tiers, down to the floor
     low = plan(40)
@@ -168,7 +168,7 @@ def check_plan() -> None:
         else:
             raise AssertionError("an unknown BUDGET_TIER must stop the run")
 
-    assert budget.affordable(10, tiers["sonnet-3"]) == 26  # (10 - 2) / 0.30
+    assert budget.affordable(10, tiers["sonnet-3"]) == 34  # (10 - 2) / 0.23
     assert budget.affordable(1, tiers["sonnet-3"]) == 0
     assert budget.affordable(None, tiers["opus-5"]) is None
     assert budget.affordable(math.inf, tiers["opus-5"]) is None
@@ -177,7 +177,7 @@ def check_plan() -> None:
 
 
 def check_key_status() -> None:
-    """Reads limit_remaining and usage; a failure returns None and logs no request details."""
+    """Reads limit_remaining; a failure returns None and logs no request details."""
     secret = "sk-or-v1-FAKE-never-logged"
     calls = []
 
@@ -204,7 +204,7 @@ def check_key_status() -> None:
         budget.requests.get = fake_get  # type: ignore[assignment]
         status = budget.key_status(secret)
         assert calls == [(budget.KEY_URL, {"Authorization": f"Bearer {secret}"})]
-        assert budget.remaining_of(status) == 87.5 and budget.usage_of(status) == 12.5
+        assert budget.remaining_of(status) == 87.5
         budget.requests.get = failing_get  # type: ignore[assignment]
         assert budget.key_status(secret) is None
     finally:
@@ -235,11 +235,13 @@ def open_question(n: int, hours: float, kind: str = "binary", forecasted: bool =
     return BinaryQuestion(**fields)
 
 
-def run_main(mode: str, balances: list, questions: dict, fail_urls=(), **env_values):
-    """Runs main.main() offline: fake Metaculus client, fake key balances (one per read),
-    fake forecasting. Returns (forecast calls, step summary, exit message or None)."""
+def run_main(mode: str, balance, questions: dict, fail_urls=(), cost_each=0.25, **env_values):
+    """Runs main.main() offline: fake Metaculus client, a fake key balance (None when
+    unreadable), and fake forecasting that reports `cost_each` per question the way
+    OpenRouter's responses do. Returns (forecast calls, step summary, exit message or
+    None, number of balance reads)."""
     calls: list[tuple] = []
-    reads = iter(balances)
+    reads: list[str] = []
 
     class FakeClient:
         CURRENT_MINIBENCH_ID = "minibench"
@@ -259,15 +261,18 @@ def run_main(mode: str, balances: list, questions: dict, fail_urls=(), **env_val
                 bot.skip_previously_forecasted_questions,
             )
         )
-        return [RuntimeError("boom") if q.page_url in fail_urls else "report" for q in qs]
+        results = []
+        for q in qs:  # a failed question still costs what its calls cost
+            main.MonetaryCostManager.increase_current_usage_in_parent_managers(cost_each)
+            results.append(RuntimeError("boom") if q.page_url in fail_urls else "report")
+        return results
 
     def fake_status(api_key, timeout=15):
         assert api_key == "sk-fake"
-        balance = next(reads)
+        reads.append(api_key)
         if balance is None:
             return None
-        remaining, usage = balance
-        return {"limit": 100.0, "limit_remaining": remaining, "usage": usage}
+        return {"limit": 100.0, "limit_remaining": balance, "usage": 100.0 - balance}
 
     saved = (
         main.MetaculusClient,
@@ -301,47 +306,52 @@ def run_main(mode: str, balances: list, questions: dict, fail_urls=(), **env_val
             sys.argv,
         ) = saved
     summary = summary_path.read_text(encoding="utf-8") if summary_path.exists() else ""
-    return calls, summary, exit_message
+    return calls, summary, exit_message, len(reads)
 
 
 def check_run_loop() -> None:
     opus, sonnet = budget.OPUS, budget.SONNET
     fe_id = main.FALL_2026_FUTUREEVAL_ID
 
-    # $100: FutureEval on sonnet-3, MiniBench on opus-3; soonest-closing first; the
-    # already-forecast question skipped; each pass's spend measured
+    # $100: FutureEval on opus-3, MiniBench on opus-5; soonest-closing first; the
+    # already-forecast question skipped; the balance read once; each pass's spend summed
+    # from the costs its responses report
     questions = {
         fe_id: [open_question(1, 2), open_question(2, 1), open_question(3, 0.5, forecasted=True)],
         "minibench": [open_question(4, 50), open_question(5, 40)],
     }
-    calls, summary, exited = run_main(
-        "tournament",
-        [(100.0, 0.0), (99.4, 0.6), (98.0, 2.0)],
-        questions,
-        OPENROUTER_API_KEY="sk-fake",
+    calls, summary, exited, reads = run_main(
+        "tournament", 100.0, questions, OPENROUTER_API_KEY="sk-fake"
     )
-    assert exited is None, exited
+    assert exited is None and reads == 1, (exited, reads)
     assert calls == [
-        (sonnet, 3, ["2", "1"], True),
-        (opus, 3, ["5", "4"], True),
+        (opus, 3, ["2", "1"], True),
+        (opus, 5, ["5", "4"], True),
     ], calls
-    assert "| FutureEval | sonnet-3 | 2 | 0 | $0.60 | $0.30 |" in summary, summary
-    assert "| MiniBench | opus-3 | 2 | 0 | $1.40 | $0.70 |" in summary, summary
-    assert "$100.00 of $100.00" in summary and "Now: $98.00" in summary, summary
+    assert "| FutureEval | opus-3 | 2 | 0 | $0.50 | $0.25 |" in summary, summary
+    assert "| MiniBench | opus-5 | 2 | 0 | $0.50 | $0.25 |" in summary, summary
+    assert "$100.00 of $100.00. Spent: $1.00. Left now: about $99.00." in summary, summary
 
     # $5: cheapest tiers, and only what the balance pays for above the $2 floor
     many = {"minibench": [open_question(n, 100 - n) for n in range(10, 40)]}
-    calls, _, exited = run_main(
-        "tournament", [(5.0, 95.0), (2.0, 98.0)], many, OPENROUTER_API_KEY="sk-fake"
-    )
+    calls, _, exited, _ = run_main("tournament", 5.0, many, OPENROUTER_API_KEY="sk-fake")
     assert exited is None
     assert len(calls) == 1 and calls[0][:2] == (sonnet, 3), calls
-    assert calls[0][2] == [str(n) for n in range(39, 29, -1)], calls  # the 10 closing soonest
+    assert calls[0][2] == [str(n) for n in range(39, 26, -1)], calls  # the 13 closing soonest
+
+    # spend earlier in a run shrinks the next pass's cap: $6 pays for 17 sonnet-3
+    # questions above the floor; FutureEval's 5 at $0.50 leave $3.50, room for 6 more
+    split = {
+        fe_id: [open_question(n, n) for n in range(1, 6)],
+        "minibench": [open_question(n, n) for n in range(100, 130)],
+    }
+    calls, _, _, _ = run_main(
+        "tournament", 6.0, split, cost_each=0.5, OPENROUTER_API_KEY="sk-fake"
+    )
+    assert [len(c[2]) for c in calls] == [5, 6], calls
 
     # under the floor: nothing runs
-    calls, summary, _ = run_main(
-        "tournament", [(1.5, 98.5)], questions, OPENROUTER_API_KEY="sk-fake"
-    )
+    calls, summary, _, _ = run_main("tournament", 1.5, questions, OPENROUTER_API_KEY="sk-fake")
     assert calls == [] and "pause" in summary, (calls, summary)
 
     # a big balance: top tier, but no more than MAX_QUESTIONS_PER_RUN in one run
@@ -349,32 +359,27 @@ def check_run_loop() -> None:
         fe_id: [open_question(n, n) for n in range(100, 120)],
         "minibench": [open_question(n, n) for n in range(200, 220)],
     }
-    calls, _, _ = run_main(
-        "tournament", [(900.0, 0.0), (890.0, 10.0), (880.0, 20.0)], burst,
-        OPENROUTER_API_KEY="sk-fake",
-    )
+    calls, _, _, _ = run_main("tournament", 900.0, burst, OPENROUTER_API_KEY="sk-fake")
     assert [(c[0], c[1], len(c[2])) for c in calls] == [
         (opus, 5, 20),
         (opus, 5, main.MAX_QUESTIONS_PER_RUN - 20),
     ], calls
 
-    # an unreadable balance: cheapest tiers, no credit cap, spend "unknown"
-    calls, summary, _ = run_main(
-        "tournament", [None, None, None], questions, OPENROUTER_API_KEY="sk-fake"
-    )
+    # an unreadable balance: cheapest tiers, no credit cap; the spend is still measured
+    calls, summary, _, _ = run_main("tournament", None, questions, OPENROUTER_API_KEY="sk-fake")
     assert [c[:2] for c in calls] == [(sonnet, 3), (sonnet, 3)], calls
-    assert "unknown" in summary
+    assert "start of this run: unknown. Spent: $1.00. Left now: unknown." in summary, summary
 
     # a failed question turns the run red, after the spend is reported
-    calls, summary, exited = run_main(
+    calls, summary, exited, _ = run_main(
         "tournament",
-        [(100.0, 0.0), (99.4, 0.6), (98.0, 2.0)],
+        100.0,
         questions,
         fail_urls=("https://example.invalid/q/4",),
         OPENROUTER_API_KEY="sk-fake",
     )
     assert exited and "1 question(s) failed" in exited, exited
-    assert "| MiniBench | opus-3 | 1 | 1 |" in summary, summary
+    assert "| MiniBench | opus-5 | 1 | 1 | $0.50 | $0.50 |" in summary, summary
 
     # the smoke test: one question of each type, on MiniBench's tier, re-forecast
     testing = {
@@ -385,24 +390,23 @@ def check_run_loop() -> None:
             open_question(4, 5, "numeric"),
         ]
     }
-    calls, _, _ = run_main(
-        "test_questions", [(100.0, 0.0), (98.5, 1.5)], testing, OPENROUTER_API_KEY="sk-fake"
-    )
-    assert calls == [(opus, 3, ["1", "3", "4"], False)], calls
-    calls, _, _ = run_main(
-        "test_questions", [(100.0, 0.0), (98.5, 1.5)], testing,
+    calls, _, _, _ = run_main("test_questions", 100.0, testing, OPENROUTER_API_KEY="sk-fake")
+    assert calls == [(opus, 5, ["1", "3", "4"], False)], calls
+    calls, _, _, _ = run_main(
+        "test_questions", 100.0, testing,
         OPENROUTER_API_KEY="sk-fake", BUDGET_TIER="sonnet-3", TEST_QUESTIONS="1",
     )
     assert calls == [(sonnet, 3, ["1"], False)], calls
 
-    # the Metaculus Cup: never on Metaculus's credits
+    # the Metaculus Cup: never on Metaculus's credits, and no balance read at all
     cup = {main.FALL_2026_METACULUS_CUP_ID: [open_question(7, 30, forecasted=True)]}
-    calls, _, exited = run_main("metaculus_cup", [], cup, OPENROUTER_API_KEY="sk-fake")
-    assert calls == [] and exited and "ANTHROPIC_API_KEY" in exited, (calls, exited)
-    calls, summary, exited = run_main(
-        "metaculus_cup", [], cup, OPENROUTER_API_KEY="sk-fake", ANTHROPIC_API_KEY="x"
+    calls, _, exited, reads = run_main("metaculus_cup", 100.0, cup, OPENROUTER_API_KEY="sk-fake")
+    assert calls == [] and reads == 0, (calls, reads)
+    assert exited and "ANTHROPIC_API_KEY" in exited, exited
+    calls, summary, exited, reads = run_main(
+        "metaculus_cup", 100.0, cup, OPENROUTER_API_KEY="sk-fake", ANTHROPIC_API_KEY="x"
     )
-    assert exited is None and summary == "", (exited, summary)  # no balance read at all
+    assert exited is None and summary == "" and reads == 0, (exited, summary, reads)
     assert calls == [("anthropic/claude-sonnet-5", 5, ["7"], False)], calls
     print("run loop: ok")
 

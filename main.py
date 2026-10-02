@@ -30,6 +30,7 @@ from forecasting_tools import (
     GeneralLlm,
     MetaculusClient,
     MetaculusQuestion,
+    MonetaryCostManager,
     MultipleChoiceQuestion,
     NumericDistribution,
     NumericQuestion,
@@ -988,10 +989,13 @@ def main() -> None:
             logger.info(f"{label}: no new questions")
             return []
         bot = make_bot(route, tier, publish, skip_previous)
-        results = asyncio.run(bot.forecast_questions(questions, return_exceptions=True))
+        # Collects the cost OpenRouter returns with every response in the pass, failed
+        # questions included
+        with MonetaryCostManager() as cost:
+            results = asyncio.run(bot.forecast_questions(questions, return_exceptions=True))
         if meter is not None and tier is not None:
             failed = sum(isinstance(r, BaseException) for r in results)
-            meter.record(label, tier, len(results) - failed, failed)
+            meter.record(label, tier, len(results) - failed, failed, cost.current_usage)
         return results
 
     reports: list[ForecastReport | BaseException] = []
