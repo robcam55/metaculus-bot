@@ -29,19 +29,22 @@ The changes are in `main.py` (`RcForecastBot`) and `budget.py`:
 
   | Tier | Forecasts per question | Estimated cost per question |
   |---|---|---|
-  | `opus-5` | 5 × Opus 5.5 | $0.65 |
-  | `opus-3` | 3 × Opus 5.5 | $0.45 |
-  | `sonnet-3` | 3 × Sonnet 5 | $0.30 |
+  | `opus-5` | 5 × Opus 5.5 | $0.40 |
+  | `opus-3` | 3 × Opus 5.5 | $0.30 |
+  | `sonnet-3` | 3 × Sonnet 5 | $0.23 |
 
+  The estimates are about 40% above the first live test (2026-10-02): `opus-3` cost $0.13
+  to $0.35 a question, $0.21 on average, and web-search research was most of it.
   - **MiniBench first.** MiniBench results decide further funding, so MiniBench never runs
-    below FutureEval. At $100, FutureEval runs `sonnet-3` and MiniBench `opus-3`; from about
-    $171, both run `opus-5`.
+    below FutureEval. At $100, FutureEval runs `opus-3` and MiniBench `opus-5`; from about
+    $106, both run `opus-5`.
   - **Never runs dry.** Below $2 the bot pauses, and one run never forecasts more
     questions than the balance covers, so credit can't run out halfway through a question.
   - **Top-ups apply at once.** When Metaculus raises the key, the next run sees it.
   - **Measured spend.** Each run's page on GitHub shows the balance and what each tier
-    actually cost per question. Recalibrate the estimates in `budget.py` from those
-    numbers after the first week.
+    cost per question. The costs are the ones OpenRouter returns with every response;
+    its balance figure lags by minutes, so the bot reads it once, at the start of a run.
+    Recalibrate the estimates in `budget.py` from those numbers after the first week.
 - **Two independent research sources per research report.**
   - AskNews latest news: one call per question, to fit the free tier's 1,000 calls a month.
     The template's version uses six.
@@ -89,7 +92,7 @@ Offline checks (no network, no keys): `python tests/check_rc_bot.py`.
    or `ASKNEWS_API_KEY`.
 5. **Test.** Run `Actions → Test Bot → Run workflow`.
    - It forecasts three bot-testing-area questions (one of each type) at MiniBench's tier,
-     for about $1–2 of credit.
+     for about $1 of credit.
    - Check that the forecasts appear on the bot's Metaculus profile.
    - Read the run page's summary for the balance and the measured cost per question.
 6. **Turn it on.** Set the repository variable `BOT_ENABLED` to `true`.
@@ -130,7 +133,7 @@ The main architectural choices and the reasons behind them. Each links to where 
 
   — Metaculus's funding email to Rob (2026-09-27, not public); proposed by Claude in [#1](https://github.com/robcam55/metaculus-bot/pull/1), not yet ratified
 - **Paced spending of incremental credits (`budget.py`).**
-  - **The problem.** Metaculus seeds about $100 and adds more only after above-average MiniBench results, which take weeks to resolve. Unpaced, five Opus forecasts a question would spend the seed in two to three weeks, leaving the bot dark while its results are judged.
+  - **The problem.** Metaculus seeds about $100 and adds more only after above-average MiniBench results, which take weeks to resolve. A fixed setup either runs dry before more arrives, leaving the bot dark while its results are judged, or underspends once it does. Before any measurement, five Opus forecasts a question looked like two to three weeks of credit; at the first measured costs it is closer to five.
   - **The rule.** Each run buys the richest tier the balance covers for four weeks of expected volume, with MiniBench (which decides the funding) never below FutureEval.
   - **The promise it keeps.** The credit application promised a fallback to Sonnet 5 if credits ran short; pacing makes that fallback automatic.
   - **Awaiting Rob's ratification.** The tiers, the four-week horizon and MiniBench's priority are Claude's proposal.

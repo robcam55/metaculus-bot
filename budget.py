@@ -37,14 +37,15 @@ class Tier:
     cost: float  # estimated dollars a question, research and parsing included
 
 
-# Estimates at OpenRouter's list prices (Opus 5.5 $4/$20 and Sonnet 5 $2/$10 per million
-# tokens, $0.01 a web search; both models always think, and thinking bills as output):
-# one research report at about $0.13, then about $0.10 per Opus forecast or $0.05 per
-# Sonnet forecast, parsing included. Recalibrate from the spend each run reports.
+# Measured on the first live test (2026-10-02, three bot-testing-area questions at opus-3,
+# web-search research only): $0.13, $0.15 and $0.35 a question, $0.21 on average. Research
+# with web search costs the most and varies most ($0.24 of the $0.35). These estimates
+# carry a margin of about 40% over that, for AskNews articles lengthening every prompt
+# and for harder tournament questions. Recalibrate from the spend each run reports.
 TIERS = {
-    "opus-5": Tier("opus-5", OPUS, 5, 0.65),
-    "opus-3": Tier("opus-3", OPUS, 3, 0.45),
-    "sonnet-3": Tier("sonnet-3", SONNET, 3, 0.30),
+    "opus-5": Tier("opus-5", OPUS, 5, 0.40),
+    "opus-3": Tier("opus-3", OPUS, 3, 0.30),
+    "sonnet-3": Tier("sonnet-3", SONNET, 3, 0.23),
     "pause": Tier("pause", "", 0, 0.0),
 }
 
@@ -97,12 +98,6 @@ def remaining_of(status: dict[str, Any] | None) -> float | None:
         return None
     left = status.get("limit_remaining")
     return math.inf if left is None else float(left)
-
-
-def usage_of(status: dict[str, Any] | None) -> float | None:
-    if status is None or status.get("usage") is None:
-        return None
-    return float(status["usage"])
 
 
 def pinned_tier() -> Tier | None:
@@ -160,38 +155,41 @@ def dollars(amount: float | None) -> str:
 
 
 class SpendMeter:
-    """The key's balance at the start of a run, re-read after each pass that forecast,
-    so every run reports what each tier actually cost."""
+    """The key's balance at the start of a run, and what each pass spent.
+
+    OpenRouter's key figures lag the spend by minutes (the first live test re-read the
+    key right after a pass: $0.32 of $0.63 showed, and usage had not moved), so the
+    balance is read once, before the run, when the previous run's spend has settled.
+    Each pass's spend is the sum of the costs OpenRouter returns with every response."""
 
     def __init__(self, api_key: str) -> None:
-        self._api_key = api_key
-        self.status = key_status(api_key)
-        self.start = self.status
+        self.start = key_status(api_key)
+        self.spent = 0.0
         self.rows: list[str] = []
 
     def remaining(self) -> float | None:
-        return remaining_of(self.status)
+        """The balance at the start, less what this run has spent since."""
+        left = remaining_of(self.start)
+        return None if left is None else left - self.spent
 
-    def record(self, label: str, tier: Tier, forecasts: int, failed: int) -> None:
-        before = usage_of(self.status)
-        self.status = key_status(self._api_key)
-        after = usage_of(self.status)
-        if before is None or after is None:
-            spent, each = "unknown", "-"
-        else:
-            spent = dollars(after - before)
-            each = dollars((after - before) / forecasts) if forecasts else "-"
-        self.rows.append(f"| {label} | {tier.name} | {forecasts} | {failed} | {spent} | {each} |")
+    def record(self, label: str, tier: Tier, forecasts: int, failed: int, spent: float) -> None:
+        self.spent += spent
+        each = dollars(spent / forecasts) if forecasts else "-"
+        self.rows.append(
+            f"| {label} | {tier.name} | {forecasts} | {failed} | {dollars(spent)} | {each} |"
+        )
 
     def summary(self, plan: Plan) -> list[str]:
         """Markdown for the log and the Actions run page."""
         limit = (self.start or {}).get("limit")
         of = f" of {dollars(float(limit))}" if limit is not None else ""
+        now = self.remaining()
         lines = [
             "### Metaculus's OpenRouter credits",
             "",
             f"- Left at the start of this run: {dollars(remaining_of(self.start))}{of}."
-            f" Now: {dollars(self.remaining())}.",
+            f" Spent: {dollars(self.spent)}."
+            f" Left now: {'unknown' if now is None else 'about ' + dollars(now)}.",
             f"- Tiers: FutureEval {plan.futureeval.name}, MiniBench {plan.minibench.name}"
             f" ({plan.note}).",
         ]
