@@ -1,0 +1,6 @@
+{
+  "name": "metaculus-bot-trigger",
+  "private": true,
+  "description": "Cloudflare Worker that starts the bot's tournament workflow every 20 minutes",
+  "type": "module"
+}
