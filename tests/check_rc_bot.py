@@ -287,6 +287,9 @@ def run_main(
         results = []
         for q in qs:  # a failed question still costs what its calls cost
             main.MonetaryCostManager.increase_current_usage_in_parent_managers(cost_each)
+            # one search per question, through the bot, as run_research records it
+            failed = q.page_url in deferred_urls
+            bot.research_health.record("fake-search", "RuntimeError" if failed else None)
             if q.page_url in fail_urls:
                 results.append(RuntimeError("boom"))
             elif q.page_url in deferred_urls:
@@ -363,6 +366,8 @@ def check_run_loop() -> None:
     assert "- FutureEval (`33121`): 3 open, 2 not yet forecast, 2 taken this run." in summary
     assert "- MiniBench (`minibench`): 2 open, 2 not yet forecast, 2 taken this run." in summary
     assert "- Research sources: openrouter/anthropic/claude-sonnet-5:online." in summary, summary
+    # both passes' searches reach the run page: one tally shared across the run
+    assert "| fake-search | 4 | 4 | 0 |" in summary, summary
 
     # nothing open: said apart from "nothing new", and an idle run still names the sources,
     # so newly added AskNews keys show up before any question arrives
@@ -449,6 +454,7 @@ def check_run_loop() -> None:
         " see the log above"
     ), exited
     assert "- 1 question(s) not forecast: every research source failed." in summary, summary
+    assert "| fake-search | 4 | 3 | 1 (RuntimeError) |" in summary, summary
 
     # the smoke test: one question of each type, on MiniBench's tier, re-forecast
     testing = {
@@ -516,8 +522,15 @@ def check_aggregation() -> None:
 
 
 def check_research_survives_one_failure() -> None:
+    # Source labels such as "asknews/latest" are read from the environment as research
+    # runs, so the whole check runs inside env(): an exported ASKNEWS_STRATEGY can't leak in
     with env(ANTHROPIC_API_KEY="x", PERPLEXITY_API_KEY="x", ASKNEWS_CLIENT_ID="x", ASKNEWS_SECRET="y"):
-        bot = main.RcForecastBot(publish_reports_to_metaculus=False)
+        _research_survives_one_failure()
+    print("research: ok")
+
+
+def _research_survives_one_failure() -> None:
+    bot = main.RcForecastBot(publish_reports_to_metaculus=False)
 
     async def fake(source, prompt, question):
         if source == main.ASKNEWS_RESEARCHER:
@@ -542,7 +555,6 @@ def check_research_survives_one_failure() -> None:
     bot._run_one_research_source = both  # type: ignore[method-assign]
     research = asyncio.run(bot.run_research(binary_question()))
     assert research.count("## Research from") == 2, research
-    print("research: ok")
 
 
 def timed_question(kind: str = "binary", closes_in: timedelta | None = timedelta(hours=2)):
@@ -629,8 +641,14 @@ def check_prompts() -> None:
 def check_research_policy() -> None:
     """Every source failing: a question a later run can reach waits for it; one closing
     sooner is forecast without research, and the forecaster is told so."""
-    with env(OPENROUTER_API_KEY="x", ASKNEWS_API_KEY="y"):
-        bot = main.RcForecastBot(publish_reports_to_metaculus=False)
+    with env(OPENROUTER_API_KEY="x", ASKNEWS_API_KEY="y"):  # see check_research_survives_one_failure
+        _research_policy()
+        _research_policy_with_several_reports()
+    print("research policy: ok")
+
+
+def _research_policy() -> None:
+    bot = main.RcForecastBot(publish_reports_to_metaculus=False)
 
     async def all_fail(source, prompt, question):
         if source == main.ASKNEWS_RESEARCHER:
@@ -701,7 +719,68 @@ def check_research_policy() -> None:
     )
     assert main.deferred_for_research(main.ResearchUnavailable("x"))
     assert not main.deferred_for_research("report")
-    print("research policy: ok")
+
+
+def _research_policy_with_several_reports() -> None:
+    """RESEARCH_REPORTS=2 near close: the no-research fallback is decided per question.
+    A report whose sources all fail is dropped while another report has (or may still
+    find) research; only the last report, when none found any, is forecast without it."""
+
+    def bot_whose_reports(*outcomes: bool):
+        bot = main.RcForecastBot(
+            publish_reports_to_metaculus=False,
+            research_reports_per_question=2,
+            predictions_per_research_report=1,
+        )
+        calls = iter(outcomes)
+
+        async def research(source, prompt, question):
+            ok = next(calls) if source == main.ASKNEWS_RESEARCHER else False
+            if not ok:
+                raise RuntimeError("down")
+            return "found something"
+
+        bot._run_one_research_source = research  # type: ignore[method-assign]
+        return bot
+
+    soon = timed_question(closes_in=timedelta(minutes=30))
+    for outcomes in ((True, False), (False, True)):
+        bot = bot_whose_reports(*outcomes)
+        got = []
+        for _ in outcomes:
+            try:
+                got.append(asyncio.run(bot.run_research(soon)))
+            except main.ResearchUnavailable as e:
+                assert "other reports go ahead" in str(e), e
+                got.append(None)
+        assert main.NO_RESEARCH_NOTE not in got, (outcomes, got)
+        assert sum(g is not None for g in got) == 1, (outcomes, got)
+        assert bot.research_health.without_research == [], outcomes
+    # both reports fail: the first is dropped, the last is forecast without research
+    bot = bot_whose_reports(False, False)
+    try:
+        asyncio.run(bot.run_research(soon))
+    except main.ResearchUnavailable:
+        pass
+    else:
+        raise AssertionError("a report must not go blind while another may find research")
+    assert asyncio.run(bot.run_research(soon)) == main.NO_RESEARCH_NOTE
+    assert bot.research_health.without_research == ["https://example.invalid/q/77"]
+
+    # through forecasting-tools: only researched predictions are aggregated
+    seen: list[str] = []
+
+    async def record(question, research):
+        seen.append(research)
+        return main.ReasonedPrediction(prediction_value=0.4, reasoning="r")
+
+    bot = bot_whose_reports(False, True)
+    bot._make_prediction = record  # type: ignore[method-assign]
+    bot.summarize_research = lambda question, research: asyncio.sleep(0, "summary")  # type: ignore[method-assign]
+    bot._create_unified_explanation = lambda *a, **k: "# SUMMARY\n# RESEARCH\n# FORECASTS\n"  # type: ignore[method-assign]
+    results = asyncio.run(bot.forecast_questions([soon], return_exceptions=True))
+    assert not isinstance(results[0], BaseException), results
+    assert seen == ["## Research from asknews/latest\nfound something"], seen
 
 
 def check_run_report() -> None:
@@ -712,12 +791,22 @@ def check_run_report() -> None:
     health.record("asknews/latest", "RateLimitError")
     health.record("asknews/latest", "AuthenticationError")
     health.record("openrouter/anthropic/claude-sonnet-5:online")
-    health.without_research.append("https://example.invalid/q/9")
+    # listed once each, and only when the forecast then went through (q/10 failed)
+    health.without_research += [
+        "https://example.invalid/q/9",
+        "https://example.invalid/q/9",
+        "https://example.invalid/q/10",
+    ]
+
+    class Report:  # stands in for a ForecastReport, which carries its question
+        def __init__(self, n):
+            self.question = BinaryQuestion(question_text="Q?", page_url=f"https://example.invalid/q/{n}")
+
     lines = main.run_report(
         ["- FutureEval (`33121`): no open questions."],
         ["asknews/latest", "openrouter/anthropic/claude-sonnet-5:online"],
         health,
-        ["report", research_deferral("https://example.invalid/q/8"), RuntimeError("boom")],
+        [Report(9), research_deferral("https://example.invalid/q/8"), RuntimeError("boom")],
     )
     text = "\n".join(lines)
     assert lines[0] == "### This run", lines

@@ -64,6 +64,8 @@ The changes are in `main.py` (`RcForecastBot`) and `budget.py`:
   - It waits for the next run, 20 minutes later, and turns this run red.
   - A question closing within 45 minutes gets no further try. It is forecast without
     research, and the forecasters are told so.
+  - With `RESEARCH_REPORTS` above 1, a report whose sources all fail is dropped, and the
+    question is forecast from the reports that found research.
 - **A report on each run's page.** For each tournament: how many questions were open, how
   many not yet forecast, and how many the run took. Then the research sources that are set
   up, and how many searches each returned, with the error types of any that failed.

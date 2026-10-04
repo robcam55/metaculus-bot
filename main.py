@@ -201,7 +201,8 @@ class ResearchHealth:
     source is otherwise only a warning in the log, and the run stays green."""
 
     sources: dict[str, SourceTally] = field(default_factory=dict)
-    without_research: list[str] = field(default_factory=list)  # forecast with no research
+    # Questions (by question_key) whose forecast went ahead with no research
+    without_research: list[str] = field(default_factory=list)
 
     def record(self, source: str, error: str | None = None) -> None:
         tally = self.sources.setdefault(source, SourceTally())
@@ -210,6 +211,10 @@ class ResearchHealth:
             tally.worked += 1
         else:
             tally.failures[error] += 1
+
+
+def question_key(question: MetaculusQuestion) -> str:
+    return question.page_url or question.question_text
 
 
 def source_name(source: GeneralLlm | str) -> str:
@@ -449,10 +454,18 @@ class RcForecastBot(ForecastBot):
     _concurrency_limiter = asyncio.Semaphore(_max_concurrent_questions)
     _structure_output_validation_samples = 2
 
-    def __init__(self, *args, research_health: ResearchHealth | None = None, **kwargs) -> None:
+    def __init__(
+        self, *args, research_health: ResearchHealth | None = None, **kwargs
+    ) -> None:
         super().__init__(*args, **kwargs)
         # Shared across a run's passes, so the run page counts every search
-        self.research_health = research_health if research_health is not None else ResearchHealth()
+        self.research_health = (
+            research_health if research_health is not None else ResearchHealth()
+        )
+        # Per question: research reports tried so far, and questions any report found
+        # research for (RESEARCH_REPORTS can run several reports for one question)
+        self._reports_tried: Counter[str] = Counter()
+        self._research_found: set[str] = set()
 
     ##################################### MODELS #####################################
 
@@ -466,6 +479,7 @@ class RcForecastBot(ForecastBot):
 
     async def run_research(self, question: MetaculusQuestion) -> str:
         async with self._concurrency_limiter:
+            self._reports_tried[question_key(question)] += 1
             prompt = self._research_prompt(question)
             sources = research_sources(self._llms)
             parts: list[str] = []
@@ -481,11 +495,15 @@ class RcForecastBot(ForecastBot):
                     self.research_health.record(name, type(e).__name__)
                     continue
                 if not (text and text.strip()):
-                    logger.warning(f"Research source {name} returned nothing for {question.page_url}")
+                    logger.warning(
+                        f"Research source {name} returned nothing for {question.page_url}"
+                    )
                     self.research_health.record(name, "returned nothing")
                     continue
                 self.research_health.record(name)
                 parts.append(f"## Research from {name}\n{text}")
+            if parts:
+                self._research_found.add(question_key(question))
             if sources and not parts:
                 research = self._without_research(question)
             else:
@@ -494,21 +512,30 @@ class RcForecastBot(ForecastBot):
             return research
 
     def _without_research(self, question: MetaculusQuestion) -> str:
-        """Every source failed. A question a later run can still reach waits for it (the
-        error leaves it unforecast, so the next run picks it up); one closing sooner is
-        forecast without research, and the forecaster is told so."""
+        """Every source failed for this research report. A question a later run can still
+        reach waits for it (the error leaves it unforecast, so the next run picks it up).
+        One closing sooner is forecast without research, and the forecaster is told so,
+        but only from its last report and only if no report found any: otherwise this
+        report alone is dropped and the question is forecast from the research found."""
+        key = question_key(question)
         if self._can_retry(question):
             raise ResearchUnavailable(
                 f"No research for {question.page_url}: every source failed. Not forecast"
                 " now; the next run tries again."
             )
+        if (
+            key in self._research_found
+            or self._reports_tried[key] < self.research_reports_per_question
+        ):
+            raise ResearchUnavailable(
+                f"No research for {question.page_url} in this report; its other"
+                " reports go ahead"
+            )
         logger.warning(
             f"No research for {question.page_url}, which closes before another try:"
             " forecasting without it"
         )
-        self.research_health.without_research.append(
-            question.page_url or question.question_text
-        )
+        self.research_health.without_research.append(key)
         return NO_RESEARCH_NOTE
 
     @staticmethod
@@ -1165,10 +1192,16 @@ def run_report(
             f"- {deferred} question(s) not forecast: every research source failed. The next"
             " run tries again."
         )
-    if health.without_research:
+    # Only questions whose forecast then went through, each once
+    forecast = {
+        question_key(r.question)
+        for r in results
+        if not isinstance(r, BaseException) and hasattr(r, "question")
+    }
+    blind = [key for key in dict.fromkeys(health.without_research) if key in forecast]
+    if blind:
         notes.append(
-            f"- Forecast without research, closing before another try:"
-            f" {', '.join(health.without_research)}."
+            f"- Forecast without research, closing before another try: {', '.join(blind)}."
         )
     if notes:
         lines += ["", *notes]
@@ -1292,7 +1325,9 @@ def main() -> None:
         # the start of a season (Jan/May/Sep).
         questions = client.get_all_open_questions_from_tournament(cup_id)
         passes.append(
-            describe_pass("Metaculus Cup", cup_id, len(questions), len(questions), note="re-forecast")
+            describe_pass(
+                "Metaculus Cup", cup_id, len(questions), len(questions), note="re-forecast"
+            )
         )
         reports += run_pass("Metaculus Cup", questions, None, skip_previous=False)
     elif run_mode == "test_questions":
