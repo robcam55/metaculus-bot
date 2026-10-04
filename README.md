@@ -49,12 +49,26 @@ The changes are in `main.py` (`RcForecastBot`) and `budget.py`:
     the balance, so it isn't affected. Recalibrate the estimates in `budget.py` from
     those numbers after the first week.
 - **Two independent research sources per research report.**
-  - AskNews latest news: one call per question, to fit the free tier's 1,000 calls a month.
-    The template's version uses six.
+  - AskNews news search: by default one latest-news call per question, to fit the free
+    tier's 1,000 calls a month. The template's version uses six. `ASKNEWS_STRATEGY` and
+    `ASKNEWS_ARTICLES` change this without a code change.
   - A search-backed model: Sonnet 5 with OpenRouter's `:online` (Anthropic's own web search,
-    which Metaculus's credits cover), or Perplexity with your own key.
+    which Metaculus's credits cover), or Perplexity with your own key. Its prompt carries
+    the question's background.
 
-  If one source fails, the other still feeds the forecast.
+  Every prompt, the search-backed model's and the forecasters', carries today's date and
+  the question's close and resolution times.
+
+  If one source fails, the other still feeds the forecast. If every source fails, the
+  question isn't forecast blind:
+  - It waits for the next run, 20 minutes later, and turns this run red.
+  - A question closing within 45 minutes gets no further try. It is forecast without
+    research, and the forecasters are told so.
+- **A report on each run's page.** For each tournament: how many questions were open, how
+  many not yet forecast, and how many the run took. Then the research sources that are set
+  up, and how many searches each returned, with the error types of any that failed.
+  - A failing source is otherwise only a warning in the log, and the run stays green.
+  - An idle run still lists the sources, so new AskNews keys show up within 20 minutes.
 - **Several predictions per question** from one research report: three or five on
   Metaculus's credits (by tier), five on a personal key. With four or more, binary questions
   use a trimmed mean (dropping the highest and lowest), which beat the median in Halawi et
@@ -96,6 +110,10 @@ Offline checks (no network, no keys): `python tests/check_rc_bot.py`.
 4. **Research (optional but recommended).** Get free AskNews access: make an AskNews account
    with the bot's email, then contact AskNews. Add `ASKNEWS_CLIENT_ID` and `ASKNEWS_SECRET`,
    or `ASKNEWS_API_KEY`.
+   - The next run's page lists `asknews/latest` under research sources. Its search counts
+     show whether the keys work.
+   - Ask AskNews for the monthly quota, how archive searches count against it, and the
+     rate limit. Then set `ASKNEWS_STRATEGY` and `ASKNEWS_ARTICLES` (below) to use it.
 5. **Test.** Run `Actions → Test Bot → Run workflow`.
    - It forecasts three bot-testing-area questions (one of each type) at MiniBench's tier,
      for about $1 of credit.
@@ -143,6 +161,8 @@ Other optional repository variables (empty means the default):
 | `SEARCH_MODEL` | `openrouter/anthropic/claude-sonnet-5:online` (OpenRouter route only) |
 | `FORECASTER_MODEL` | `anthropic/claude-sonnet-5` (personal key only; on Metaculus's credits the tier picks) |
 | `PREDICTIONS_PER_REPORT` | 5 (personal key only) |
+| `ASKNEWS_STRATEGY` | `latest`: one latest-news search per question, covering the past day or two. `archive` searches the AskNews archive (about two months) instead; `both` does both, 12 seconds apart. Archive searches may count as several calls against AskNews's quota: confirm with AskNews first. |
+| `ASKNEWS_ARTICLES` | 8 articles per AskNews search |
 | `RESEARCH_REPORTS` | 1 (personal key only). Setting it to 2 with `PREDICTIONS_PER_REPORT=3` gives six predictions over two independent searches, for about 35–45% more cost. |
 
 ## Why it's built this way
@@ -175,10 +195,12 @@ The main architectural choices and the reasons behind them. Each links to where 
   — Metaculus's funding email to Rob (2026-09-27, not public); proposed in [#1](https://github.com/robcam55/metaculus-bot/pull/1), not yet ratified
 - **Two independent research sources, several forecasts, a trimmed mean.**
   - **Two sources.** Search luck drove most of the night-to-night noise in rc_trader's own forecasts. So each question gets AskNews latest news and Sonnet 5 with native web search, and if one source fails, the other still feeds the forecast.
-  - **One AskNews call.** AskNews's free tier allows 1,000 calls a month, so it gets one latest-news call per question.
+  - **One AskNews call by default.** AskNews's free tier allows 1,000 calls a month, so it gets one latest-news call per question. `ASKNEWS_STRATEGY` and `ASKNEWS_ARTICLES` raise that without a code change once AskNews confirms its quota.
   - **A trimmed mean.** Several forecasts from one report are combined with a trimmed mean, which beat the median in Halawi et al. (2024).
 
-  — the noise finding from [rc_trader's 2026-09-23 audit](https://github.com/robcam55/rc_trader/blob/main/docs/audit/2026-09-23-AUDIT.md) (§2.4 and §4). The design was Claude's, in [de2f36f](https://github.com/robcam55/metaculus-bot/commit/de2f36f) and [e0fac54](https://github.com/robcam55/metaculus-bot/commit/e0fac54), and Rob's credit application of 2026-09-24 described it; not otherwise ratified.
+  - **No blind forecasts.** When every research source fails, the question waits for the next run rather than being forecast from the model's memory. A missed question adds nothing to the score, while a blind forecast on a question about current events can take points away. A question closing within 45 minutes gets no further try, so it is forecast without research and the forecasters are told so. A question that waits turns the run red, so a source that keeps failing gets noticed.
+
+  — the noise finding from [rc_trader's 2026-09-23 audit](https://github.com/robcam55/rc_trader/blob/main/docs/audit/2026-09-23-AUDIT.md) (§2.4 and §4). The design was Claude's, in [de2f36f](https://github.com/robcam55/metaculus-bot/commit/de2f36f) and [e0fac54](https://github.com/robcam55/metaculus-bot/commit/e0fac54), and Rob's credit application of 2026-09-24 described it; not otherwise ratified. No blind forecasts, the AskNews settings and the run-page report were Claude's proposals, which Rob approved on 2026-10-04.
 
 ---
 

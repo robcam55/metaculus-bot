@@ -5,7 +5,9 @@ import math
 import os
 import statistics
 import sys
-from datetime import datetime, timezone
+from collections import Counter
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
 from typing import Literal
 
 import dotenv
@@ -55,8 +57,31 @@ logger = logging.getLogger(__name__)
 
 # AskNews's free tournament tier allows 1,000 calls a month. The template's
 # "news-summaries" makes 6 per question (latest news = 1, archive = 5); a season plus
-# MiniBench is roughly 250 questions a month, so only the latest-news call is used.
-ASKNEWS_RESEARCHER = "asknews/latest"
+# MiniBench is roughly 280 questions a month, so by default only the latest-news call is
+# used. ASKNEWS_STRATEGY (latest, archive or both) and ASKNEWS_ARTICLES change that without
+# a code change once AskNews confirms the quota and how it counts archive searches.
+ASKNEWS_RESEARCHER = "asknews"
+ASKNEWS_STRATEGIES = {
+    "latest": ("latest news",),
+    "archive": ("news knowledge",),
+    "both": ("latest news", "news knowledge"),
+}
+ASKNEWS_DEFAULT_ARTICLES = 8
+
+# Research settings that mean "no research" on purpose, as opposed to research that failed
+NO_RESEARCH_SETTINGS = ("None", "no_research")
+
+# A question whose research fails waits for the next run instead of being forecast blind:
+# a missed question adds nothing to the score, while a blind forecast on a news-driven
+# question can subtract. Runs come every 20 minutes and one can wait behind a busy run (25
+# questions at about 35 seconds each), so a question closing sooner than this gets no
+# further try and is forecast without research instead, with the forecaster told so.
+RESEARCH_RETRY_MARGIN = timedelta(minutes=45)
+NO_RESEARCH_NOTE = (
+    "No research is available: every research source failed, and the question closes"
+    " before the bot can try again. Forecast from your own knowledge and base rates, say"
+    " what you could not check, and keep your uncertainty wide."
+)
 
 # forecasting-tools 0.2.x (the template's pin) still points at the Summer 2026 season;
 # its 0.3.1 release carries these Fall 2026 ids. AIB_TOURNAMENT_ID and METACULUS_CUP_ID
@@ -70,35 +95,156 @@ FALL_2026_METACULUS_CUP_ID = 33108  # https://www.metaculus.com/tournament/metac
 MAX_QUESTIONS_PER_RUN = 25
 
 
-class AskNewsLatestSearcher(AskNewsSearcher):
-    """AskNews latest news only (past ~48 hours): one call per research instead of six."""
+def asknews_strategy() -> str:
+    """ASKNEWS_STRATEGY (a repository variable): latest (the default), archive or both."""
+    name = os.getenv("ASKNEWS_STRATEGY", "").strip().lower() or "latest"
+    if name not in ASKNEWS_STRATEGIES:
+        raise SystemExit(
+            f"ASKNEWS_STRATEGY must be one of {', '.join(ASKNEWS_STRATEGIES)}; got {name!r}"
+        )
+    return name
+
+
+def asknews_articles() -> int:
+    """ASKNEWS_ARTICLES (a repository variable): articles per AskNews search, default 8."""
+    value = os.getenv("ASKNEWS_ARTICLES", "").strip()
+    if not value:
+        return ASKNEWS_DEFAULT_ARTICLES
+    if not value.isdigit() or int(value) < 1:
+        raise SystemExit(f"ASKNEWS_ARTICLES must be a whole number above 0; got {value!r}")
+    return int(value)
+
+
+def asknews_label(strategy: str | None = None) -> str:
+    """How research from AskNews is labelled in reports and on the run page."""
+    strategy = strategy or asknews_strategy()
+    return "asknews/latest+archive" if strategy == "both" else f"asknews/{strategy}"
+
+
+class ConfiguredAskNewsSearcher(AskNewsSearcher):
+    """AskNews news search as ASKNEWS_STRATEGY and ASKNEWS_ARTICLES set it: one latest-news
+    search by default, instead of the template's latest-news plus archive searches."""
+
+    HEADINGS = {
+        "latest news": "Latest news (the past day or two)",
+        "news knowledge": "Earlier news from the AskNews archive (the past two months or so)",
+    }
+
+    def __init__(
+        self, strategy: str | None = None, n_articles: int | None = None, **kwargs
+    ) -> None:
+        super().__init__(**kwargs)
+        self.strategy = strategy or asknews_strategy()
+        self.n_articles = n_articles or asknews_articles()
 
     async def get_formatted_news_async(self, query: str) -> str:
-        cached_result = self.cache.get(query)
+        cache_key = f"{self.strategy} {self.n_articles} {query}"
+        cached_result = self.cache.get(cache_key)
         if cached_result is not None:
             return cached_result
         from asknews_sdk import AsyncAskNewsSDK
 
+        sections: list[str] = []
         async with AsyncAskNewsSDK(
             client_id=self.client_id,
             client_secret=self.client_secret,
             api_key=self.api_key,
             scopes=set(["news"]),
         ) as ask:
-            response = await ask.news.search_news(
-                query=query,
-                n_articles=8,
-                return_type="both",
-                strategy="latest news",
-                try_cache=self._default_try_cache,
-            )
-        articles = response.as_dicts
-        formatted = "Here are the relevant news articles from the past two days:\n\n"
-        formatted += (
-            self._format_articles(articles) if articles else "No articles were found.\n\n"
-        )
-        self.cache.set(query, formatted)
+            for i, search in enumerate(ASKNEWS_STRATEGIES[self.strategy]):
+                if i:
+                    # The free tier allows one call every 10 seconds
+                    await asyncio.sleep(self._default_rate_limit)
+                response = await ask.news.search_news(
+                    query=query,
+                    n_articles=self.n_articles,
+                    return_type="both",
+                    strategy=search,
+                    try_cache=self._default_try_cache,
+                )
+                articles = response.as_dicts
+                found = (
+                    self._format_articles(articles)
+                    if articles
+                    else "No articles were found.\n\n"
+                )
+                sections.append(f"{self.HEADINGS[search]}:\n\n{found}")
+        formatted = "".join(sections)
+        self.cache.set(cache_key, formatted)
         return formatted
+
+
+class ResearchUnavailable(RuntimeError):
+    """Every research source failed for a question that a later run can still forecast."""
+
+
+def deferred_for_research(result: object) -> bool:
+    """Whether a question's result is a failure caused only by missing research."""
+    if isinstance(result, ResearchUnavailable):
+        return True
+    if isinstance(result, BaseExceptionGroup):
+        matched, rest = result.split(ResearchUnavailable)
+        return matched is not None and rest is None
+    return False
+
+
+@dataclass
+class SourceTally:
+    searches: int = 0
+    worked: int = 0
+    failures: Counter = field(default_factory=Counter)  # error type -> count
+
+
+@dataclass
+class ResearchHealth:
+    """What each research source returned during a run, for the Actions run page. A failed
+    source is otherwise only a warning in the log, and the run stays green."""
+
+    sources: dict[str, SourceTally] = field(default_factory=dict)
+    without_research: list[str] = field(default_factory=list)  # forecast with no research
+
+    def record(self, source: str, error: str | None = None) -> None:
+        tally = self.sources.setdefault(source, SourceTally())
+        tally.searches += 1
+        if error is None:
+            tally.worked += 1
+        else:
+            tally.failures[error] += 1
+
+
+def source_name(source: GeneralLlm | str) -> str:
+    if isinstance(source, GeneralLlm):
+        return source.model
+    if source == ASKNEWS_RESEARCHER:
+        return asknews_label()
+    return str(source)
+
+
+def research_sources(llms: dict[str, str | GeneralLlm | None]) -> list[GeneralLlm | str]:
+    """The research sources in an llms dict. A "no research" setting counts as none."""
+    return [
+        source
+        for source in (llms.get("researcher"), llms.get("researcher_2"))
+        if source and not (isinstance(source, str) and source in NO_RESEARCH_SETTINGS)
+    ]
+
+
+def _utc(moment: datetime) -> str:
+    return moment.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+
+
+def timeline(question: MetaculusQuestion, now: datetime | None = None) -> str:
+    """Today's date and the question's close and scheduled resolution, for every prompt:
+    without them a model can't tell what is still to come or how much time is left."""
+    now = now or datetime.now(timezone.utc)
+    parts = [f"Today is {now:%Y-%m-%d} ({now:%H:%M} UTC)."]
+    if question.close_time:
+        parts.append(f"Forecasting on this question closes {_utc(question.close_time)}.")
+    if question.scheduled_resolution_time:
+        parts.append(
+            f"It is scheduled to resolve {_utc(question.scheduled_resolution_time)}."
+        )
+    return " ".join(parts)
 
 
 def _env_int(name: str, default: int) -> int:
@@ -205,10 +351,14 @@ class RcForecastBot(ForecastBot):
       each run reads the key's balance and picks Opus 5.5 or Sonnet 5 and the number of
       predictions per tournament, MiniBench never below FutureEval. A personal key runs
       Sonnet 5 unpaced. Haiku 4.5 parses; PARSER_MODEL overrides it.
-    - Two independent research sources per report: AskNews latest news (one call, to
-      stay inside the free tier) and a search-backed model (Sonnet 5 with ":online"
-      through OpenRouter, or Perplexity with its own key). A single search's luck was
-      the largest source of night-to-night noise in rc_trader's own forecasts.
+    - Two independent research sources per report: AskNews news search (one latest-news
+      call by default, to stay inside the free tier; ASKNEWS_STRATEGY and ASKNEWS_ARTICLES
+      change it) and a search-backed model (Sonnet 5 with ":online" through OpenRouter, or
+      Perplexity with its own key). A single search's luck was the largest source of
+      night-to-night noise in rc_trader's own forecasts. When every source fails, the
+      question waits for the next run unless it closes first; each run's page on GitHub
+      counts what every source returned.
+    - Every prompt gets today's date and the question's close and resolution times.
     - Binary questions: an outside-view-first prompt with an explicit check against the
       known "Yes" lean of language models, and a trimmed mean (drop the highest and
       lowest) over all predictions instead of the median.
@@ -299,6 +449,11 @@ class RcForecastBot(ForecastBot):
     _concurrency_limiter = asyncio.Semaphore(_max_concurrent_questions)
     _structure_output_validation_samples = 2
 
+    def __init__(self, *args, research_health: ResearchHealth | None = None, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        # Shared across a run's passes, so the run page counts every search
+        self.research_health = research_health if research_health is not None else ResearchHealth()
+
     ##################################### MODELS #####################################
 
     @classmethod
@@ -312,29 +467,60 @@ class RcForecastBot(ForecastBot):
     async def run_research(self, question: MetaculusQuestion) -> str:
         async with self._concurrency_limiter:
             prompt = self._research_prompt(question)
-            sources = [self.get_llm("researcher")]
-            second = self._llms.get("researcher_2")
-            if second:
-                sources.append(second)
+            sources = research_sources(self._llms)
             parts: list[str] = []
             for source in sources:
+                name = self._source_name(source)
                 try:
                     text = await self._run_one_research_source(source, prompt, question)
                 except Exception as e:  # one failed source must not sink the question
                     logger.warning(
-                        f"Research source {self._source_name(source)} failed for"
-                        f" {question.page_url}: {type(e).__name__}: {e}"
+                        f"Research source {name} failed for {question.page_url}:"
+                        f" {type(e).__name__}: {e}"
                     )
+                    self.research_health.record(name, type(e).__name__)
                     continue
-                if text and text.strip():
-                    parts.append(f"## Research from {self._source_name(source)}\n{text}")
-            research = "\n\n".join(parts)
+                if not (text and text.strip()):
+                    logger.warning(f"Research source {name} returned nothing for {question.page_url}")
+                    self.research_health.record(name, "returned nothing")
+                    continue
+                self.research_health.record(name)
+                parts.append(f"## Research from {name}\n{text}")
+            if sources and not parts:
+                research = self._without_research(question)
+            else:
+                research = "\n\n".join(parts)
             logger.info(f"Found Research for URL {question.page_url}:\n{research}")
             return research
 
+    def _without_research(self, question: MetaculusQuestion) -> str:
+        """Every source failed. A question a later run can still reach waits for it (the
+        error leaves it unforecast, so the next run picks it up); one closing sooner is
+        forecast without research, and the forecaster is told so."""
+        if self._can_retry(question):
+            raise ResearchUnavailable(
+                f"No research for {question.page_url}: every source failed. Not forecast"
+                " now; the next run tries again."
+            )
+        logger.warning(
+            f"No research for {question.page_url}, which closes before another try:"
+            " forecasting without it"
+        )
+        self.research_health.without_research.append(
+            question.page_url or question.question_text
+        )
+        return NO_RESEARCH_NOTE
+
+    @staticmethod
+    def _can_retry(question: MetaculusQuestion, now: datetime | None = None) -> bool:
+        if question.close_time is None:
+            return True
+        now = now or datetime.now(timezone.utc)
+        return question.close_time - now > RESEARCH_RETRY_MARGIN
+
     @staticmethod
     def _source_name(source: GeneralLlm | str) -> str:
-        return source.model if isinstance(source, GeneralLlm) else str(source)
+        return source_name(source)
 
     def _research_prompt(self, question: MetaculusQuestion) -> str:
         return clean_indents(
@@ -345,8 +531,13 @@ class RcForecastBot(ForecastBot):
             Include dates for every fact, relevant base rates or historical frequencies if you know them, and any scheduled events before the question resolves.
             You do not produce forecasts yourself.
 
+            {timeline(question)}
+
             Question:
             {question.question_text}
+
+            Background:
+            {question.background_info or "None given."}
 
             This question's outcome will be determined by the specific criteria below:
             {question.resolution_criteria}
@@ -358,12 +549,13 @@ class RcForecastBot(ForecastBot):
     async def _run_one_research_source(
         self, researcher: GeneralLlm | str, prompt: str, question: MetaculusQuestion
     ) -> str:
-        """The template's researcher dispatch for one source, plus latest-only AskNews
-        (queried with the question itself, which searches better than the prompt)."""
+        """The template's researcher dispatch for one source, plus AskNews as
+        ASKNEWS_STRATEGY sets it (queried with the question itself, which searches better
+        than the prompt)."""
         if isinstance(researcher, GeneralLlm):
             return await researcher.invoke(prompt)
         if researcher == ASKNEWS_RESEARCHER:
-            return await AskNewsLatestSearcher().get_formatted_news_async(
+            return await ConfiguredAskNewsSearcher().get_formatted_news_async(
                 question.question_text
             )
         if researcher in (
@@ -383,7 +575,7 @@ class RcForecastBot(ForecastBot):
                 use_advanced_filters=False,
             )
             return await searcher.invoke(prompt)
-        if not researcher or researcher in ("None", "no_research"):
+        if not researcher or researcher in NO_RESEARCH_SETTINGS:
             return ""
         return await GeneralLlm(model=researcher).invoke(prompt)
 
@@ -427,7 +619,7 @@ class RcForecastBot(ForecastBot):
             Research gathered today from independent sources (it may be incomplete, outdated or wrong; weigh each item by its source and date):
             {research}
 
-            Today is {datetime.now().strftime("%Y-%m-%d")}.
+            {timeline(question)}
 
             Work through these steps briefly before answering:
             (a) Time left: how long until the outcome is known, and how much can realistically change in that time?
@@ -490,7 +682,7 @@ class RcForecastBot(ForecastBot):
             Your research assistant says:
             {research}
 
-            Today is {datetime.now().strftime("%Y-%m-%d")}.
+            {timeline(question)}
 
             Before answering you write:
             (a) The time left until the outcome to the question is known.
@@ -567,7 +759,7 @@ class RcForecastBot(ForecastBot):
             Your research assistant says:
             {research}
 
-            Today is {datetime.now().strftime("%Y-%m-%d")}.
+            {timeline(question)}
 
             {lower_bound_message}
             {upper_bound_message}
@@ -659,7 +851,7 @@ class RcForecastBot(ForecastBot):
             Your research assistant says:
             {research}
 
-            Today is {datetime.now().strftime("%Y-%m-%d")}.
+            {timeline(question)}
 
             {lower_bound_message}
             {upper_bound_message}
@@ -904,6 +1096,7 @@ def make_bot(
     tier: budget.Tier | None,
     publish: bool,
     skip_previous: bool = True,
+    research_health: ResearchHealth | None = None,
 ) -> RcForecastBot:
     """One research report (two independent sources) per question. On Metaculus's
     credits the pacing tier sets the forecaster and the number of predictions; on a
@@ -922,7 +1115,64 @@ def make_bot(
         skip_previously_forecasted_questions=skip_previous,
         extra_metadata_in_explanation=True,
         llms=build_llms(route, tier),
+        research_health=research_health,
     )
+
+
+def describe_pass(
+    label: str,
+    tournament: int | str,
+    open_count: int,
+    taken: int,
+    new_count: int | None = None,
+    note: str = "",
+) -> str:
+    """One line of the run page per tournament. "No open questions" and "nothing new"
+    read the same in the log otherwise, and only the first means the bot sees nothing."""
+    if not open_count:
+        return f"- {label} (`{tournament}`): no open questions."
+    counts = [f"{open_count} open"]
+    if new_count is not None:
+        counts.append(f"{new_count} not yet forecast")
+    counts.append(f"{taken} taken this run")
+    return f"- {label} (`{tournament}`): {', '.join(counts)}" + (f" ({note})." if note else ".")
+
+
+def run_report(
+    passes: list[str],
+    configured: list[str],
+    health: ResearchHealth,
+    results: list[ForecastReport | BaseException],
+) -> list[str]:
+    """Markdown for the log and the Actions run page: what each tournament had, which
+    research sources are set up and what each returned. An idle run still names the
+    sources, so a newly added key (AskNews's, say) shows on the next run."""
+    lines = ["### This run", "", *passes]
+    lines.append(f"- Research sources: {', '.join(configured) if configured else 'none'}.")
+    if health.sources:
+        lines += ["", "| Research source | Searches | Worked | Failed |", "|---|---|---|---|"]
+        for name, tally in health.sources.items():
+            reasons = ", ".join(
+                f"{reason} ×{count}" if count > 1 else reason
+                for reason, count in tally.failures.most_common()
+            )
+            failed = f"{tally.searches - tally.worked}" + (f" ({reasons})" if reasons else "")
+            lines.append(f"| {name} | {tally.searches} | {tally.worked} | {failed} |")
+    notes: list[str] = []
+    deferred = sum(deferred_for_research(r) for r in results)
+    if deferred:
+        notes.append(
+            f"- {deferred} question(s) not forecast: every research source failed. The next"
+            " run tries again."
+        )
+    if health.without_research:
+        notes.append(
+            f"- Forecast without research, closing before another try:"
+            f" {', '.join(health.without_research)}."
+        )
+    if notes:
+        lines += ["", *notes]
+    return lines
 
 
 def main() -> None:
@@ -943,6 +1193,9 @@ def main() -> None:
     run_mode: Literal["tournament", "metaculus_cup", "test_questions"] = args.mode
 
     check_environment(strict=True)
+    # A mistyped AskNews setting stops the run here, not quietly at every question
+    asknews_strategy()
+    asknews_articles()
     # PUBLISH=false gives a dry run: full research and forecasts, nothing posted
     publish = _env_flag("PUBLISH", True)
     print_startup_banner(run_mode, will_publish=publish)
@@ -979,6 +1232,9 @@ def main() -> None:
         "test_questions": "https://www.metaculus.com/tournament/bot-testing-area/",
     }
 
+    health = ResearchHealth()
+    passes: list[str] = []
+
     def run_pass(
         label: str,
         questions: list[MetaculusQuestion],
@@ -988,7 +1244,7 @@ def main() -> None:
         if not questions:
             logger.info(f"{label}: no new questions")
             return []
-        bot = make_bot(route, tier, publish, skip_previous)
+        bot = make_bot(route, tier, publish, skip_previous, research_health=health)
         # Collects the cost OpenRouter returns with every response in the pass, failed
         # questions included
         with MonetaryCostManager() as cost:
@@ -1001,19 +1257,17 @@ def main() -> None:
     reports: list[ForecastReport | BaseException] = []
     if run_mode == "tournament":
         room = MAX_QUESTIONS_PER_RUN
-        passes = (
+        tournaments = (
             ("FutureEval", tournament_id, plan.futureeval if plan else None),
             ("MiniBench", minibench_id, plan.minibench if plan else None),
         )
-        for label, tid, tier in passes:
-            new = [
-                q
-                for q in client.get_all_open_questions_from_tournament(tid)
-                if not q.already_forecasted
-            ]
+        for label, tid, tier in tournaments:
+            open_questions = client.get_all_open_questions_from_tournament(tid)
+            new = [q for q in open_questions if not q.already_forecasted]
             if tier is not None and tier.predictions == 0:
                 if new:
                     logger.warning(f"{label}: paused; {len(new)} new question(s) skipped")
+                passes.append(describe_pass(label, tid, len(open_questions), 0, len(new), "paused"))
                 continue
             limit = room
             if meter is not None and tier is not None:
@@ -1021,17 +1275,25 @@ def main() -> None:
                 if can_pay is not None:
                     limit = min(limit, can_pay)
             chosen = soonest_closing(new, limit)
+            note = ""
             if len(chosen) < len(new):
                 logger.warning(
                     f"{label}: forecasting {len(chosen)} of {len(new)} new questions"
                     " (run size or credit); later runs take the rest"
                 )
+                note = "run size or credit; later runs take the rest"
+            passes.append(
+                describe_pass(label, tid, len(open_questions), len(chosen), len(new), note)
+            )
             reports += run_pass(label, chosen, tier)
             room -= len(chosen)
     elif run_mode == "metaculus_cup":
         # Re-forecasts every open question. The Metaculus Cup may be uninitialized near
         # the start of a season (Jan/May/Sep).
         questions = client.get_all_open_questions_from_tournament(cup_id)
+        passes.append(
+            describe_pass("Metaculus Cup", cup_id, len(questions), len(questions), note="re-forecast")
+        )
         reports += run_pass("Metaculus Cup", questions, None, skip_previous=False)
     elif run_mode == "test_questions":
         # The bot-testing-area tournament has every question type. TEST_QUESTIONS (3 by
@@ -1041,10 +1303,12 @@ def main() -> None:
         tier = plan.minibench if plan else None
         if tier is not None and tier.predictions == 0:
             logger.warning("bot-testing-area: paused; nothing forecast")
+            passes.append("- bot-testing-area: paused; nothing forecast.")
         else:
-            questions = one_of_each_type(
-                client.get_all_open_questions_from_tournament("bot-testing-area"),
-                _env_int("TEST_QUESTIONS", 3),
+            testing = client.get_all_open_questions_from_tournament("bot-testing-area")
+            questions = one_of_each_type(testing, _env_int("TEST_QUESTIONS", 3))
+            passes.append(
+                describe_pass("bot-testing-area", "bot-testing-area", len(testing), len(questions))
             )
             reports += run_pass("bot-testing-area", questions, tier, skip_previous=False)
 
@@ -1058,10 +1322,17 @@ def main() -> None:
         lines = meter.summary(plan)
         print("\n".join(lines) + "\n")
         budget.write_step_summary(lines)
+    configured = [source_name(s) for s in research_sources(build_llms(route))]
+    lines = run_report(passes, configured, health, reports)
+    print("\n".join(lines) + "\n")
+    budget.write_step_summary(lines)
     failures = sum(isinstance(r, BaseException) for r in reports)
     if failures:
-        # a failed question turns the Actions run red
-        sys.exit(f"{failures} question(s) failed; see the log above")
+        # a failed question turns the Actions run red; one that waits for research too,
+        # so a source that keeps failing doesn't go unnoticed
+        deferred = sum(deferred_for_research(r) for r in reports)
+        why = f" ({deferred} for lack of research; the next run retries them)" if deferred else ""
+        sys.exit(f"{failures} question(s) failed{why}; see the log above")
 
 
 if __name__ == "__main__":
