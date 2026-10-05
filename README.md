@@ -71,6 +71,14 @@ The changes are in `main.py` (`RcForecastBot`) and `budget.py`:
   up, and how many searches each returned, with the error types of any that failed.
   - A failing source is otherwise only a warning in the log, and the run stays green.
   - An idle run still lists the sources, so new AskNews keys show up within 20 minutes.
+  - A red run whose job reads "cancelled" after about 15 minutes, with no steps and no log,
+    never got a GitHub runner, so the bot never started. Nothing needs fixing: the next run
+    20 minutes later takes the questions. A red run from the bot itself has a failed "Run
+    bot" step and names the questions in its log.
+- **A comment that keeps its sections.** Metaculus gets one comment per forecast, with
+  `# SUMMARY`, `# RESEARCH` and `# FORECASTS` sections that `forecasting-tools` and
+  `bot-review` find by position. Headings inside research and the research summary are kept
+  as bold lines, so they can't add or shift a section.
 - **Several predictions per question** from one research report: three or five on
   Metaculus's credits (by tier), five on a personal key. With four or more, binary questions
   use a trimmed mean (dropping the highest and lowest), which beat the median in Halawi et

@@ -4,7 +4,8 @@ Run from the repo root:  python tests/check_rc_bot.py
 Covers model routing by environment, credit pacing (budget.py and the run loop in
 main.main), the binary trimmed mean, research that survives one failing source and waits
 for the next run when every source fails, the dates in every prompt, the run page's
-report, and the AskNews settings. Fake key values only; nothing is sent anywhere.
+report, the posted comment's sections, and the AskNews settings. Fake key values only;
+nothing is sent anywhere.
 """
 
 import asyncio
@@ -819,6 +820,57 @@ def check_run_report() -> None:
     print("run report: ok")
 
 
+def check_comment_sections() -> None:
+    """The posted comment keeps exactly its three top-level sections when a research source
+    or the summary brings its own "# " headings (both happened on 2026-10-05)."""
+    # Only what forecasting-tools reads as a heading changes: "#hashtag" and a bare "#" don't
+    assert main.flatten_headings("# Key facts\ntext\n### Dates ##\n#hashtag\n# **Bold**\n#\n# \n") == (
+        "**Key facts**\ntext\n**Dates**\n#hashtag\n**Bold**\n#\n\n"
+    )
+    assert main.flatten_headings("## Tips for C#") == "**Tips for C#**"
+    with env(ANTHROPIC_API_KEY="x", PERPLEXITY_API_KEY="x"):
+        _comment_sections()
+    print("comment sections: ok")
+
+
+def _comment_sections() -> None:
+    from unittest import mock
+
+    from forecasting_tools import BinaryReport, ForecastBot, ReasonedPrediction
+    from forecasting_tools.data_models.forecast_report import ResearchWithPredictions
+
+    bot = main.RcForecastBot(publish_reports_to_metaculus=False)
+    q = binary_question()
+
+    async def source(source, prompt, question):
+        # The shape of Sonnet's research on Q45912
+        return "# Brent Crude Front-Month Futures — Briefing\n## Current price\n$71 (2026-10-04)"
+
+    async def summary(self, question, research):
+        return "# Research Summary\n\nBrent sits near $71.\n\n## Sources\n- example.invalid"
+
+    bot._run_one_research_source = source  # type: ignore[method-assign]
+    research = asyncio.run(bot.run_research(q))
+    with mock.patch.object(ForecastBot, "summarize_research", summary):
+        summarized = asyncio.run(bot.summarize_research(q, research))
+    assert "**Research Summary**" in summarized, summarized
+    reasoning = "**(a) Time left:** ten days.\n\nProbability: 55%"
+    collection = ResearchWithPredictions(
+        research_report=research,
+        summary_report=summarized,
+        errors=[],
+        predictions=[ReasonedPrediction(prediction_value=0.55, reasoning=reasoning)] * 3,
+    )
+    explanation = bot._create_unified_explanation(q, [collection], 0.55, 0.4, 1.0)
+    report = BinaryReport(question=q, prediction=0.55, explanation=explanation)
+    titles = [s.text_of_section_and_subsections.split("\n")[0] for s in report.report_sections]
+    assert titles == ["# SUMMARY", "# RESEARCH", "# FORECASTS"], titles
+    assert "Brent sits near $71." in report.summary
+    assert "**Brent Crude Front-Month Futures — Briefing**" in report.research
+    assert "[Hashtag]" not in explanation  # forecasting-tools' fallback for mixed levels
+    assert "Probability: 55%" in report.first_rationale
+
+
 def check_asknews() -> None:
     """The strategy and article count come from ASKNEWS_STRATEGY and ASKNEWS_ARTICLES;
     latest news only, one call, by default (the free tier is 1,000 calls a month)."""
@@ -910,5 +962,6 @@ if __name__ == "__main__":
     check_prompts()
     check_research_policy()
     check_run_report()
+    check_comment_sections()
     check_asknews()
     print("all checks passed")

@@ -3,6 +3,7 @@ import asyncio
 import logging
 import math
 import os
+import re
 import statistics
 import sys
 from collections import Counter
@@ -211,6 +212,29 @@ class ResearchHealth:
             tally.worked += 1
         else:
             tally.failures[error] += 1
+
+
+# forecasting-tools posts each forecast as one comment with three top-level sections,
+# "# SUMMARY", "# RESEARCH" and "# FORECASTS", and finds them again by position. A heading
+# inside text the bot embeds there (a research source's own "# Key facts", a summary that
+# opens with "# Research Summary") adds sections and shifts the rest: the log then shows
+# "Failed to get first rationale", a research section can have every "#" turned into
+# "[Hashtag]", and bot-review's --section reads the wrong part. Embedded text keeps its
+# headings as bold lines instead. The pattern matches what forecasting-tools counts as a
+# heading (MarkdownTree: one to eight "#" and a space at the start of a line).
+_EMBEDDED_HEADING = re.compile(r"^#{1,8} +(.*?)(?: +#+)? *$", re.MULTILINE)
+
+
+def flatten_headings(text: str) -> str:
+    """Markdown headings in `text` as bold lines, so it can't add comment sections."""
+
+    def bold(match: re.Match[str]) -> str:
+        title = match.group(1).strip()
+        if not title or (title.startswith("**") and title.endswith("**")):
+            return title
+        return f"**{title}**"
+
+    return _EMBEDDED_HEADING.sub(bold, text)
 
 
 def question_key(question: MetaculusQuestion) -> str:
@@ -501,7 +525,7 @@ class RcForecastBot(ForecastBot):
                     self.research_health.record(name, "returned nothing")
                     continue
                 self.research_health.record(name)
-                parts.append(f"## Research from {name}\n{text}")
+                parts.append(f"## Research from {name}\n{flatten_headings(text)}")
             if parts:
                 self._research_found.add(question_key(question))
             if sources and not parts:
@@ -537,6 +561,11 @@ class RcForecastBot(ForecastBot):
         )
         self.research_health.without_research.append(key)
         return NO_RESEARCH_NOTE
+
+    async def summarize_research(self, question: MetaculusQuestion, research: str) -> str:
+        """The template's summary for the comment, its headings kept as bold lines: on
+        2026-10-05 Haiku opened every summary with a "# " heading (see flatten_headings)."""
+        return flatten_headings(await super().summarize_research(question, research))
 
     @staticmethod
     def _can_retry(question: MetaculusQuestion, now: datetime | None = None) -> bool:
