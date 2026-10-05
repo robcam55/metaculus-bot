@@ -2,8 +2,9 @@
 
 Run from the repo root:  python tests/check_rc_bot.py
 Covers model routing by environment, credit pacing (budget.py and the run loop in
-main.main), the binary trimmed mean, and research that survives one failing source.
-Fake key values only; nothing is sent anywhere.
+main.main), the binary trimmed mean, research that survives one failing source and waits
+for the next run when every source fails, the dates in every prompt, the run page's
+report, and the AskNews settings. Fake key values only; nothing is sent anywhere.
 """
 
 import asyncio
@@ -26,6 +27,9 @@ KEYS = (
     "ASKNEWS_CLIENT_ID",
     "ASKNEWS_SECRET",
     "ASKNEWS_API_KEY",
+    "ASKNEWS_STRATEGY",
+    "ASKNEWS_ARTICLES",
+    "ASKNEWS_CACHE_MODE",
     "EXA_API_KEY",
     "RESEARCHER",
     "FORECASTER_MODEL",
@@ -88,7 +92,8 @@ def check_routing() -> None:
         assert model_of(d["default"]) == "openrouter/anthropic/claude-opus-5.5"
         assert d["default"].litellm_kwargs["temperature"] is None
         assert model_of(d["parser"]) == "openrouter/anthropic/claude-haiku-4.5"
-        assert d["researcher"] == main.ASKNEWS_RESEARCHER == "asknews/latest"
+        assert d["researcher"] == main.ASKNEWS_RESEARCHER == "asknews"
+        assert main.source_name(d["researcher"]) == "asknews/latest"  # the default strategy
         # Metaculus's OpenRouter credits cover Anthropic but not Perplexity
         assert model_of(d["researcher_2"]) == "openrouter/anthropic/claude-sonnet-5:online"
         assert d["researcher_2"].litellm_kwargs["temperature"] is None
@@ -235,11 +240,29 @@ def open_question(n: int, hours: float, kind: str = "binary", forecasted: bool =
     return BinaryQuestion(**fields)
 
 
-def run_main(mode: str, balance, questions: dict, fail_urls=(), cost_each=0.25, **env_values):
+def research_deferral(url: str) -> BaseException:
+    """What forecasting-tools hands back for a question whose research raised
+    ResearchUnavailable: the error wrapped in an ExceptionGroup."""
+    return ExceptionGroup(
+        "1 sub-exceptions -> Error while processing question url",
+        [main.ResearchUnavailable(f"No research for {url}")],
+    )
+
+
+def run_main(
+    mode: str,
+    balance,
+    questions: dict,
+    fail_urls=(),
+    cost_each=0.25,
+    deferred_urls=(),
+    **env_values,
+):
     """Runs main.main() offline: fake Metaculus client, a fake key balance (None when
     unreadable), and fake forecasting that reports `cost_each` per question the way
-    OpenRouter's responses do. Returns (forecast calls, step summary, exit message or
-    None, number of balance reads)."""
+    OpenRouter's responses do. Questions in `deferred_urls` come back as research
+    deferrals. Returns (forecast calls, step summary, exit message or None, number of
+    balance reads)."""
     calls: list[tuple] = []
     reads: list[str] = []
 
@@ -264,7 +287,15 @@ def run_main(mode: str, balance, questions: dict, fail_urls=(), cost_each=0.25, 
         results = []
         for q in qs:  # a failed question still costs what its calls cost
             main.MonetaryCostManager.increase_current_usage_in_parent_managers(cost_each)
-            results.append(RuntimeError("boom") if q.page_url in fail_urls else "report")
+            # one search per question, through the bot, as run_research records it
+            failed = q.page_url in deferred_urls
+            bot.research_health.record("fake-search", "RuntimeError" if failed else None)
+            if q.page_url in fail_urls:
+                results.append(RuntimeError("boom"))
+            elif q.page_url in deferred_urls:
+                results.append(research_deferral(q.page_url))
+            else:
+                results.append("report")
         return results
 
     def fake_status(api_key, timeout=15):
@@ -331,11 +362,36 @@ def check_run_loop() -> None:
     assert "| FutureEval | opus-3 | 2 | 0 | $0.50 | $0.25 |" in summary, summary
     assert "| MiniBench | opus-5 | 2 | 0 | $0.50 | $0.25 |" in summary, summary
     assert "$100.00 of $100.00. Spent: $1.00. Left now: about $99.00." in summary, summary
+    # the run page says what each tournament had and which research sources are set up
+    assert "- FutureEval (`33121`): 3 open, 2 not yet forecast, 2 taken this run." in summary
+    assert "- MiniBench (`minibench`): 2 open, 2 not yet forecast, 2 taken this run." in summary
+    assert "- Research sources: openrouter/anthropic/claude-sonnet-5:online." in summary, summary
+    # both passes' searches reach the run page: one tally shared across the run
+    assert "| fake-search | 4 | 4 | 0 |" in summary, summary
+
+    # nothing open: said apart from "nothing new", and an idle run still names the sources,
+    # so newly added AskNews keys show up before any question arrives
+    calls, summary, exited, _ = run_main(
+        "tournament", 100.0, {"minibench": [open_question(9, 5, forecasted=True)]},
+        OPENROUTER_API_KEY="sk-fake", ASKNEWS_API_KEY="x", ASKNEWS_STRATEGY="both",
+    )
+    assert calls == [] and exited is None, (calls, exited)
+    assert "- FutureEval (`33121`): no open questions." in summary, summary
+    assert "- MiniBench (`minibench`): 1 open, 0 not yet forecast, 0 taken this run." in summary
+    assert (
+        "- Research sources: asknews/latest+archive,"
+        " openrouter/anthropic/claude-sonnet-5:online." in summary
+    ), summary
+    assert "| Research source |" not in summary  # no searches, no table
 
     # $5: cheapest tiers, and only what the balance pays for above the $2 floor
     many = {"minibench": [open_question(n, 100 - n) for n in range(10, 40)]}
-    calls, _, exited, _ = run_main("tournament", 5.0, many, OPENROUTER_API_KEY="sk-fake")
+    calls, summary, exited, _ = run_main("tournament", 5.0, many, OPENROUTER_API_KEY="sk-fake")
     assert exited is None
+    assert (
+        "- MiniBench (`minibench`): 30 open, 30 not yet forecast, 13 taken this run"
+        " (run size or credit; later runs take the rest)." in summary
+    ), summary
     assert len(calls) == 1 and calls[0][:2] == (sonnet, 3), calls
     assert calls[0][2] == [str(n) for n in range(39, 26, -1)], calls  # the 13 closing soonest
 
@@ -353,6 +409,7 @@ def check_run_loop() -> None:
     # under the floor: nothing runs
     calls, summary, _, _ = run_main("tournament", 1.5, questions, OPENROUTER_API_KEY="sk-fake")
     assert calls == [] and "pause" in summary, (calls, summary)
+    assert "- FutureEval (`33121`): 3 open, 2 not yet forecast, 0 taken this run (paused)." in summary
 
     # a big balance: top tier, but no more than MAX_QUESTIONS_PER_RUN in one run
     burst = {
@@ -379,7 +436,25 @@ def check_run_loop() -> None:
         OPENROUTER_API_KEY="sk-fake",
     )
     assert exited and "1 question(s) failed" in exited, exited
+    assert "lack of research" not in exited, exited
     assert "| MiniBench | opus-5 | 1 | 1 | $0.50 | $0.50 |" in summary, summary
+
+    # a question left without research also turns the run red, says why, and is counted
+    # on the run page (the next run retries it)
+    calls, summary, exited, _ = run_main(
+        "tournament",
+        100.0,
+        questions,
+        fail_urls=("https://example.invalid/q/5",),
+        deferred_urls=("https://example.invalid/q/4",),
+        OPENROUTER_API_KEY="sk-fake",
+    )
+    assert exited == (
+        "2 question(s) failed (1 for lack of research; the next run retries them);"
+        " see the log above"
+    ), exited
+    assert "- 1 question(s) not forecast: every research source failed." in summary, summary
+    assert "| fake-search | 4 | 3 | 1 (RuntimeError) |" in summary, summary
 
     # the smoke test: one question of each type, on MiniBench's tier, re-forecast
     testing = {
@@ -390,8 +465,9 @@ def check_run_loop() -> None:
             open_question(4, 5, "numeric"),
         ]
     }
-    calls, _, _, _ = run_main("test_questions", 100.0, testing, OPENROUTER_API_KEY="sk-fake")
+    calls, summary, _, _ = run_main("test_questions", 100.0, testing, OPENROUTER_API_KEY="sk-fake")
     assert calls == [(opus, 5, ["1", "3", "4"], False)], calls
+    assert "- bot-testing-area (`bot-testing-area`): 4 open, 3 taken this run." in summary, summary
     calls, _, _, _ = run_main(
         "test_questions", 100.0, testing,
         OPENROUTER_API_KEY="sk-fake", BUDGET_TIER="sonnet-3", TEST_QUESTIONS="1",
@@ -406,8 +482,19 @@ def check_run_loop() -> None:
     calls, summary, exited, reads = run_main(
         "metaculus_cup", 100.0, cup, OPENROUTER_API_KEY="sk-fake", ANTHROPIC_API_KEY="x"
     )
-    assert exited is None and summary == "" and reads == 0, (exited, summary, reads)
+    # no credits section on a personal key, but the run page still reports the run
+    assert exited is None and reads == 0, (exited, reads)
+    assert "OpenRouter credits" not in summary, summary
+    assert "- Metaculus Cup (`33108`): 1 open, 1 taken this run (re-forecast)." in summary
     assert calls == [("anthropic/claude-sonnet-5", 5, ["7"], False)], calls
+
+    # a mistyped AskNews setting stops the run before anything is read or spent
+    for bad in ({"ASKNEWS_STRATEGY": "archives"}, {"ASKNEWS_ARTICLES": "eight"}):
+        calls, summary, exited, reads = run_main(
+            "tournament", 100.0, questions, OPENROUTER_API_KEY="sk-fake", **bad
+        )
+        assert calls == [] and reads == 0 and summary == "", (calls, reads, summary)
+        assert exited and next(iter(bad)) in exited, exited
     print("run loop: ok")
 
 
@@ -435,8 +522,15 @@ def check_aggregation() -> None:
 
 
 def check_research_survives_one_failure() -> None:
+    # Source labels such as "asknews/latest" are read from the environment as research
+    # runs, so the whole check runs inside env(): an exported ASKNEWS_STRATEGY can't leak in
     with env(ANTHROPIC_API_KEY="x", PERPLEXITY_API_KEY="x", ASKNEWS_CLIENT_ID="x", ASKNEWS_SECRET="y"):
-        bot = main.RcForecastBot(publish_reports_to_metaculus=False)
+        _research_survives_one_failure()
+    print("research: ok")
+
+
+def _research_survives_one_failure() -> None:
+    bot = main.RcForecastBot(publish_reports_to_metaculus=False)
 
     async def fake(source, prompt, question):
         if source == main.ASKNEWS_RESEARCHER:
@@ -449,6 +543,11 @@ def check_research_survives_one_failure() -> None:
     research = asyncio.run(bot.run_research(binary_question()))
     assert "Research from perplexity/sonar-pro" in research, research
     assert "asknews" not in research.lower(), research
+    # the failure is counted for the run page, by error type only
+    tallies = bot.research_health.sources
+    assert (tallies["asknews/latest"].searches, tallies["asknews/latest"].worked) == (1, 0)
+    assert tallies["asknews/latest"].failures == {"RuntimeError": 1}, tallies
+    assert (tallies["perplexity/sonar-pro"].searches, tallies["perplexity/sonar-pro"].worked) == (1, 1)
 
     async def both(source, prompt, question):
         return f"notes from {bot._source_name(source)}"
@@ -456,14 +555,277 @@ def check_research_survives_one_failure() -> None:
     bot._run_one_research_source = both  # type: ignore[method-assign]
     research = asyncio.run(bot.run_research(binary_question()))
     assert research.count("## Research from") == 2, research
-    print("research: ok")
 
 
-def check_asknews_uses_one_call() -> None:
-    """Latest-news only: one AskNews search per research (the free tier is 1,000 a month)."""
+def timed_question(kind: str = "binary", closes_in: timedelta | None = timedelta(hours=2)):
+    fields = dict(
+        question_text="Will it happen?",
+        page_url="https://example.invalid/q/77",
+        resolution_criteria="Resolves Yes if it happens.",
+        fine_print="",
+        background_info="The resolution source is the agency's monthly bulletin.",
+        close_time=NOW + closes_in if closes_in is not None else None,
+        scheduled_resolution_time=datetime(2026, 12, 31, 23, 59, tzinfo=timezone.utc),
+    )
+    if kind == "mc":
+        return MultipleChoiceQuestion(options=["a", "b"], **fields)
+    if kind == "numeric":
+        return NumericQuestion(
+            upper_bound=10, lower_bound=0, open_upper_bound=True, open_lower_bound=False, **fields
+        )
+    if kind == "date":
+        return main.DateQuestion(
+            upper_bound=datetime(2027, 6, 1, tzinfo=timezone.utc),
+            lower_bound=datetime(2026, 10, 1, tzinfo=timezone.utc),
+            open_upper_bound=True,
+            open_lower_bound=False,
+            **fields,
+        )
+    return BinaryQuestion(**fields)
+
+
+def check_prompts() -> None:
+    """Today's date and the question's close and resolution times reach the researcher
+    and every forecast prompt; the researcher also gets the question's background."""
+    q = timed_question()
+    now = datetime(2026, 10, 4, 13, 5, tzinfo=timezone.utc)
+    line = main.timeline(q, now)
+    assert line.startswith("Today is 2026-10-04 (13:05 UTC)."), line
+    assert f"closes {(NOW + timedelta(hours=2)).strftime('%Y-%m-%d %H:%M')} UTC." in line, line
+    assert line.endswith("It is scheduled to resolve 2026-12-31 23:59 UTC."), line
+    bare = BinaryQuestion(question_text="Q?")
+    assert main.timeline(bare, now) == "Today is 2026-10-04 (13:05 UTC).", main.timeline(bare, now)
+    # an aware time in another zone is shown in UTC
+    eastern = timezone(timedelta(hours=-4))
+    late = BinaryQuestion(question_text="Q?", close_time=datetime(2026, 10, 4, 20, 0, tzinfo=eastern))
+    assert "closes 2026-10-05 00:00 UTC." in main.timeline(late, now), main.timeline(late, now)
+
+    with env(ANTHROPIC_API_KEY="x"):
+        bot = main.RcForecastBot(publish_reports_to_metaculus=False)
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    research_prompt = bot._research_prompt(q)
+    for expected in (
+        f"Today is {today}",
+        "scheduled to resolve 2026-12-31 23:59 UTC",
+        "The resolution source is the agency's monthly bulletin.",
+        "Resolves Yes if it happens.",
+    ):
+        assert expected in research_prompt, (expected, research_prompt)
+    assert "None given." in bot._research_prompt(bare)  # no background: no "None"
+
+    prompts: dict[str, str] = {}
+
+    def capture(kind):
+        async def fake(question, prompt):
+            prompts[kind] = prompt
+            return "captured"
+
+        return fake
+
+    bot._binary_prompt_to_forecast = capture("binary")  # type: ignore[method-assign]
+    bot._multiple_choice_prompt_to_forecast = capture("mc")  # type: ignore[method-assign]
+    bot._numeric_prompt_to_forecast = capture("numeric")  # type: ignore[method-assign]
+    bot._date_prompt_to_forecast = capture("date")  # type: ignore[method-assign]
+    asyncio.run(bot._run_forecast_on_binary(timed_question("binary"), "notes"))
+    asyncio.run(bot._run_forecast_on_multiple_choice(timed_question("mc"), "notes"))
+    asyncio.run(bot._run_forecast_on_numeric(timed_question("numeric"), "notes"))
+    asyncio.run(bot._run_forecast_on_date(timed_question("date"), "notes"))
+    assert sorted(prompts) == ["binary", "date", "mc", "numeric"], prompts
+    for kind, prompt in prompts.items():
+        assert f"Today is {today}" in prompt, (kind, prompt)
+        assert "scheduled to resolve 2026-12-31 23:59 UTC" in prompt, (kind, prompt)
+        assert "Forecasting on this question closes" in prompt, (kind, prompt)
+    print("prompts: ok")
+
+
+def check_research_policy() -> None:
+    """Every source failing: a question a later run can reach waits for it; one closing
+    sooner is forecast without research, and the forecaster is told so."""
+    with env(OPENROUTER_API_KEY="x", ASKNEWS_API_KEY="y"):  # see check_research_survives_one_failure
+        _research_policy()
+        _research_policy_with_several_reports()
+    print("research policy: ok")
+
+
+def _research_policy() -> None:
+    bot = main.RcForecastBot(publish_reports_to_metaculus=False)
+
+    async def all_fail(source, prompt, question):
+        if source == main.ASKNEWS_RESEARCHER:
+            raise RuntimeError("quota exceeded")
+        return "   "  # a model that answers with nothing counts as a failure
+
+    bot._run_one_research_source = all_fail  # type: ignore[method-assign]
+
+    # closes in two hours: later runs can still reach it, so it waits for them
+    try:
+        asyncio.run(bot.run_research(timed_question(closes_in=timedelta(hours=2))))
+    except main.ResearchUnavailable as e:
+        assert "next run" in str(e), e
+    else:
+        raise AssertionError("research that failed everywhere must not feed a forecast")
+    # an unknown close time waits too
+    try:
+        asyncio.run(bot.run_research(timed_question(closes_in=None)))
+    except main.ResearchUnavailable:
+        pass
+    else:
+        raise AssertionError("a question without a close time must wait")
+
+    # closes in 30 minutes, before another run can reach it: forecast, but told why
+    research = asyncio.run(bot.run_research(timed_question(closes_in=timedelta(minutes=30))))
+    assert research == main.NO_RESEARCH_NOTE, research
+    health = bot.research_health
+    assert health.without_research == ["https://example.invalid/q/77"], health
+    asknews, online = health.sources["asknews/latest"], health.sources[
+        "openrouter/anthropic/claude-sonnet-5:online"
+    ]
+    assert (asknews.searches, asknews.worked, dict(asknews.failures)) == (
+        3, 0, {"RuntimeError": 3}
+    ), asknews
+    assert (online.searches, online.worked, dict(online.failures)) == (
+        3, 0, {"returned nothing": 3}
+    ), online
+    # the boundary: just past the margin waits, just inside it doesn't
+    margin = main.RESEARCH_RETRY_MARGIN
+    assert main.RcForecastBot._can_retry(timed_question(closes_in=margin + timedelta(minutes=1)))
+    assert not main.RcForecastBot._can_retry(timed_question(closes_in=margin - timedelta(minutes=1)))
+
+    # research turned off on purpose is not a failure: no error, no note
+    with env(OPENROUTER_API_KEY="x", RESEARCHER="no_research"):
+        quiet = main.RcForecastBot(publish_reports_to_metaculus=False)
+    assert main.research_sources(quiet._llms) == []
+    assert asyncio.run(quiet.run_research(timed_question())) == ""
+    assert quiet.research_health.sources == {} and quiet.research_health.without_research == []
+
+    # end to end through forecasting-tools: no forecast is made, nothing is posted, and
+    # the question comes back as a research deferral the run loop recognises
+    made: list[str] = []
+
+    async def no_forecast(question, research):
+        made.append(research)
+        raise AssertionError("forecast made without research")
+
+    bot._make_prediction = no_forecast  # type: ignore[method-assign]
+    results = asyncio.run(
+        bot.forecast_questions([timed_question(closes_in=timedelta(hours=3))], return_exceptions=True)
+    )
+    assert made == [] and len(results) == 1, (made, results)
+    assert isinstance(results[0], BaseException) and main.deferred_for_research(results[0]), results
+    # other failures, and a mix, are not deferrals
+    assert not main.deferred_for_research(RuntimeError("boom"))
+    assert not main.deferred_for_research(
+        ExceptionGroup("mixed", [main.ResearchUnavailable("x"), ValueError("parse")])
+    )
+    assert main.deferred_for_research(main.ResearchUnavailable("x"))
+    assert not main.deferred_for_research("report")
+
+
+def _research_policy_with_several_reports() -> None:
+    """RESEARCH_REPORTS=2 near close: the no-research fallback is decided per question.
+    A report whose sources all fail is dropped while another report has (or may still
+    find) research; only the last report, when none found any, is forecast without it."""
+
+    def bot_whose_reports(*outcomes: bool):
+        bot = main.RcForecastBot(
+            publish_reports_to_metaculus=False,
+            research_reports_per_question=2,
+            predictions_per_research_report=1,
+        )
+        calls = iter(outcomes)
+
+        async def research(source, prompt, question):
+            ok = next(calls) if source == main.ASKNEWS_RESEARCHER else False
+            if not ok:
+                raise RuntimeError("down")
+            return "found something"
+
+        bot._run_one_research_source = research  # type: ignore[method-assign]
+        return bot
+
+    soon = timed_question(closes_in=timedelta(minutes=30))
+    for outcomes in ((True, False), (False, True)):
+        bot = bot_whose_reports(*outcomes)
+        got = []
+        for _ in outcomes:
+            try:
+                got.append(asyncio.run(bot.run_research(soon)))
+            except main.ResearchUnavailable as e:
+                assert "other reports go ahead" in str(e), e
+                got.append(None)
+        assert main.NO_RESEARCH_NOTE not in got, (outcomes, got)
+        assert sum(g is not None for g in got) == 1, (outcomes, got)
+        assert bot.research_health.without_research == [], outcomes
+    # both reports fail: the first is dropped, the last is forecast without research
+    bot = bot_whose_reports(False, False)
+    try:
+        asyncio.run(bot.run_research(soon))
+    except main.ResearchUnavailable:
+        pass
+    else:
+        raise AssertionError("a report must not go blind while another may find research")
+    assert asyncio.run(bot.run_research(soon)) == main.NO_RESEARCH_NOTE
+    assert bot.research_health.without_research == ["https://example.invalid/q/77"]
+
+    # through forecasting-tools: only researched predictions are aggregated
+    seen: list[str] = []
+
+    async def record(question, research):
+        seen.append(research)
+        return main.ReasonedPrediction(prediction_value=0.4, reasoning="r")
+
+    bot = bot_whose_reports(False, True)
+    bot._make_prediction = record  # type: ignore[method-assign]
+    bot.summarize_research = lambda question, research: asyncio.sleep(0, "summary")  # type: ignore[method-assign]
+    bot._create_unified_explanation = lambda *a, **k: "# SUMMARY\n# RESEARCH\n# FORECASTS\n"  # type: ignore[method-assign]
+    results = asyncio.run(bot.forecast_questions([soon], return_exceptions=True))
+    assert not isinstance(results[0], BaseException), results
+    assert seen == ["## Research from asknews/latest\nfound something"], seen
+
+
+def check_run_report() -> None:
+    health = main.ResearchHealth()
+    for _ in range(3):
+        health.record("asknews/latest")
+    health.record("asknews/latest", "RateLimitError")
+    health.record("asknews/latest", "RateLimitError")
+    health.record("asknews/latest", "AuthenticationError")
+    health.record("openrouter/anthropic/claude-sonnet-5:online")
+    # listed once each, and only when the forecast then went through (q/10 failed)
+    health.without_research += [
+        "https://example.invalid/q/9",
+        "https://example.invalid/q/9",
+        "https://example.invalid/q/10",
+    ]
+
+    class Report:  # stands in for a ForecastReport, which carries its question
+        def __init__(self, n):
+            self.question = BinaryQuestion(question_text="Q?", page_url=f"https://example.invalid/q/{n}")
+
+    lines = main.run_report(
+        ["- FutureEval (`33121`): no open questions."],
+        ["asknews/latest", "openrouter/anthropic/claude-sonnet-5:online"],
+        health,
+        [Report(9), research_deferral("https://example.invalid/q/8"), RuntimeError("boom")],
+    )
+    text = "\n".join(lines)
+    assert lines[0] == "### This run", lines
+    assert "| asknews/latest | 6 | 3 | 3 (RateLimitError ×2, AuthenticationError) |" in text, text
+    assert "| openrouter/anthropic/claude-sonnet-5:online | 1 | 1 | 0 |" in text, text
+    assert "- 1 question(s) not forecast: every research source failed." in text, text
+    assert "closing before another try: https://example.invalid/q/9." in text, text
+    idle = "\n".join(main.run_report([], [], main.ResearchHealth(), []))
+    assert "- Research sources: none." in idle and "|" not in idle and "not forecast" not in idle
+    print("run report: ok")
+
+
+def check_asknews() -> None:
+    """The strategy and article count come from ASKNEWS_STRATEGY and ASKNEWS_ARTICLES;
+    latest news only, one call, by default (the free tier is 1,000 calls a month)."""
     import asknews_sdk
 
     calls: list[dict] = []
+    sleeps: list[float] = []
 
     class FakeResponse:
         as_dicts: list = []
@@ -483,19 +845,58 @@ def check_asknews_uses_one_call() -> None:
         async def __aexit__(self, *exc):
             return False
 
-    real = asknews_sdk.AsyncAskNewsSDK
-    asknews_sdk.AsyncAskNewsSDK = FakeSDK  # type: ignore[misc]
-    try:
-        with env(ASKNEWS_CLIENT_ID="x", ASKNEWS_SECRET="y"):
-            text = asyncio.run(
-                main.AskNewsLatestSearcher().get_formatted_news_async("Will it happen?")
+    async def fake_sleep(seconds):
+        sleeps.append(seconds)
+
+    def search(**settings) -> str:
+        calls.clear()
+        sleeps.clear()
+        with env(ASKNEWS_CLIENT_ID="x", ASKNEWS_SECRET="y", **settings):
+            return asyncio.run(
+                main.ConfiguredAskNewsSearcher().get_formatted_news_async("Will it happen?")
             )
+
+    real_sdk, real_sleep = asknews_sdk.AsyncAskNewsSDK, main.asyncio.sleep
+    asknews_sdk.AsyncAskNewsSDK = FakeSDK  # type: ignore[misc]
+    main.asyncio.sleep = fake_sleep  # type: ignore[assignment]
+    try:
+        text = search()
+        assert [(c["strategy"], c["n_articles"]) for c in calls] == [("latest news", 8)], calls
+        assert calls[0]["query"] == "Will it happen?"
+        assert sleeps == [], sleeps
+        assert text.startswith("Latest news") and "No articles were found" in text, text
+
+        text = search(ASKNEWS_STRATEGY="archive", ASKNEWS_ARTICLES="12")
+        assert [(c["strategy"], c["n_articles"]) for c in calls] == [("news knowledge", 12)], calls
+        assert text.startswith("Earlier news from the AskNews archive"), text
+
+        # both: two searches, spaced for the free tier's one call every 10 seconds
+        text = search(ASKNEWS_STRATEGY=" Both ")
+        assert [c["strategy"] for c in calls] == ["latest news", "news knowledge"], calls
+        assert len(sleeps) == 1 and sleeps[0] >= 10, sleeps
+        assert text.index("Latest news") < text.index("Earlier news"), text
     finally:
-        asknews_sdk.AsyncAskNewsSDK = real  # type: ignore[misc]
-    assert len(calls) == 1, calls
-    assert calls[0]["strategy"] == "latest news", calls
-    assert calls[0]["query"] == "Will it happen?"
-    assert "No articles were found" in text
+        asknews_sdk.AsyncAskNewsSDK = real_sdk  # type: ignore[misc]
+        main.asyncio.sleep = real_sleep  # type: ignore[assignment]
+
+    with env(ASKNEWS_STRATEGY="both"):
+        assert main.source_name(main.ASKNEWS_RESEARCHER) == "asknews/latest+archive"
+    with env(ASKNEWS_STRATEGY="archive"):
+        assert main.source_name(main.ASKNEWS_RESEARCHER) == "asknews/archive"
+    for name, value in (
+        ("ASKNEWS_STRATEGY", "historical"),
+        ("ASKNEWS_ARTICLES", "0"),
+        ("ASKNEWS_ARTICLES", "-3"),
+        ("ASKNEWS_ARTICLES", "8.5"),
+    ):
+        with env(**{name: value}):
+            try:
+                main.asknews_strategy()
+                main.asknews_articles()
+            except SystemExit as e:
+                assert name in str(e) and repr(value) in str(e), e
+            else:
+                raise AssertionError(f"{name}={value!r} must stop the run")
     print("asknews: ok")
 
 
@@ -506,5 +907,8 @@ if __name__ == "__main__":
     check_run_loop()
     check_aggregation()
     check_research_survives_one_failure()
-    check_asknews_uses_one_call()
+    check_prompts()
+    check_research_policy()
+    check_run_report()
+    check_asknews()
     print("all checks passed")

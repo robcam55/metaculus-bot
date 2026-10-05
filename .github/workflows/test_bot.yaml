@@ -55,6 +55,8 @@ jobs:
           TEST_QUESTIONS: ${{ vars.TEST_QUESTIONS }}
           FORECASTER_MODEL: ${{ vars.FORECASTER_MODEL }}
           PARSER_MODEL: ${{ vars.PARSER_MODEL }}
+          ASKNEWS_STRATEGY: ${{ vars.ASKNEWS_STRATEGY }}
+          ASKNEWS_ARTICLES: ${{ vars.ASKNEWS_ARTICLES }}
           SEARCH_MODEL: ${{ vars.SEARCH_MODEL }}
           RESEARCH_REPORTS: ${{ vars.RESEARCH_REPORTS }}
           PREDICTIONS_PER_REPORT: ${{ vars.PREDICTIONS_PER_REPORT }}
