@@ -32,12 +32,17 @@ The changes are in `main.py` (`RcForecastBot`) and `budget.py`:
   | `opus-5` | 5 × Opus 5.5 | $0.40 |
   | `opus-3` | 3 × Opus 5.5 | $0.30 |
   | `sonnet-3` | 3 × Sonnet 5 | $0.23 |
+  | `sonnet-1` | 1 × Sonnet 5, the last resort | $0.18 |
 
   The estimates are about 40% above the first live test (2026-10-02): `opus-3` cost $0.13
   to $0.35 a question, $0.21 on average, and web-search research was most of it.
   - **MiniBench first.** MiniBench results decide further funding, so MiniBench never runs
     below FutureEval. At $100, FutureEval runs `opus-3` and MiniBench `opus-5`; from about
     $106, both run `opus-5`.
+  - **The last week.** When even `sonnet-3` can't pay for a week of questions (below
+    about $17), both tournaments drop to `sonnet-1`, so the last of the credit covers more
+    questions. Research is most of a question's cost, so this stretches it by only about a
+    quarter.
   - **Never runs dry.** Below $2 the bot pauses, and one run never forecasts more
     questions than the balance covers, so credit can't run out halfway through a question.
   - **Top-ups apply at once.** When Metaculus raises the key, the next run sees it.
@@ -162,7 +167,7 @@ Other optional repository variables (empty means the default):
 
 | Variable | Default |
 |---|---|
-| `BUDGET_TIER` | Empty: paced. `opus-5`, `opus-3` or `sonnet-3` pins that tier for both tournaments. `pause` stops all spending of Metaculus's credits. The $2 floor always applies. |
+| `BUDGET_TIER` | Empty: paced. `opus-5`, `opus-3`, `sonnet-3` or `sonnet-1` pins that tier for both tournaments. `pause` stops all spending of Metaculus's credits. The $2 floor always applies. |
 | `TEST_QUESTIONS` | 3 (Test Bot only) |
 | `AIB_TOURNAMENT_ID` | `33121`, the Fall 2026 FutureEval |
 | `MINIBENCH_ID` | The package's current MiniBench (`minibench`) |
@@ -201,6 +206,7 @@ The main architectural choices and the reasons behind them. Each links to where 
   - **The rule.** Each run buys the richest tier the balance covers for four weeks of expected volume, with MiniBench (which decides the funding) never below FutureEval.
   - **The promise it keeps.** The credit application promised a fallback to Sonnet 5 if credits ran short; pacing makes that fallback automatic.
   - **Awaiting Rob's ratification.** The tiers, the four-week horizon and MiniBench's priority are Claude's proposal.
+  - **Estimates kept below measured costs.** On 2026-10-05 MiniBench questions cost $0.68 at `opus-5` and $0.45 at `opus-3` (40 questions, by the settled balance), against estimates of $0.40 and $0.30, so the pacer holds richer tiers than four weeks of credit would buy. Rob chose on 2026-10-06 to keep the estimates and tiers: he expects Metaculus to add credit after the early MiniBench results, and would fund the bot himself otherwise. In place of lowering the tiers sooner, the last week of credit runs at `sonnet-1`.
 
   — Metaculus's funding email to Rob (2026-09-27, not public); proposed in [#1](https://github.com/robcam55/metaculus-bot/pull/1), not yet ratified
 - **Two independent research sources, several forecasts, a trimmed mean.**

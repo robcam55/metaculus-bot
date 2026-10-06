@@ -149,6 +149,15 @@ def check_plan() -> None:
     assert (low.futureeval, low.minibench) == (tiers["sonnet-3"], tiers["sonnet-3"])
     assert "less than" in low.note
     assert plan(1.99).futureeval == plan(1.99).minibench == tiers["pause"]
+    # under a week of credit at the bottom of the ladder (about $17): the last resort, one
+    # Sonnet forecast a question, cheaper than sonnet-3
+    week = budget.horizon_cost(tiers["sonnet-3"], tiers["sonnet-3"], budget.LAST_RESORT_WEEKS)
+    assert plan(budget.FLOOR + week + 0.01).minibench == tiers["sonnet-3"]
+    last = plan(budget.FLOOR + week - 0.01)
+    assert last.futureeval == last.minibench == tiers["sonnet-1"], last
+    assert "last resort" in last.note, last.note
+    assert tiers["sonnet-1"].predictions == 1
+    assert tiers["sonnet-1"].cost < tiers["sonnet-3"].cost
     # an unreadable balance: cheapest tiers, uncapped
     unknown = plan(None)
     assert unknown.futureeval == tiers["sonnet-3"] and "unreadable" in unknown.note
@@ -164,6 +173,9 @@ def check_plan() -> None:
         pinned = plan(3, budget.pinned_tier())
         assert pinned.futureeval == pinned.minibench == tiers["opus-5"]
         assert plan(1, budget.pinned_tier()).futureeval == tiers["pause"]  # floor still holds
+    with env(BUDGET_TIER="sonnet-1"):  # a pin skips the ladder and the last-resort rule
+        pinned = plan(80, budget.pinned_tier())
+        assert pinned.futureeval == pinned.minibench == tiers["sonnet-1"]
     with env(BUDGET_TIER="Pause"):
         assert budget.pinned_tier() == tiers["pause"]
     with env(BUDGET_TIER="opus-9"):
@@ -385,19 +397,20 @@ def check_run_loop() -> None:
     ), summary
     assert "| Research source |" not in summary  # no searches, no table
 
-    # $5: cheapest tiers, and only what the balance pays for above the $2 floor
+    # $5, less than a week of credit: the last resort (one Sonnet forecast a question),
+    # and only what the balance pays for above the $2 floor
     many = {"minibench": [open_question(n, 100 - n) for n in range(10, 40)]}
     calls, summary, exited, _ = run_main("tournament", 5.0, many, OPENROUTER_API_KEY="sk-fake")
     assert exited is None
     assert (
-        "- MiniBench (`minibench`): 30 open, 30 not yet forecast, 13 taken this run"
+        "- MiniBench (`minibench`): 30 open, 30 not yet forecast, 16 taken this run"
         " (run size or credit; later runs take the rest)." in summary
     ), summary
-    assert len(calls) == 1 and calls[0][:2] == (sonnet, 3), calls
-    assert calls[0][2] == [str(n) for n in range(39, 26, -1)], calls  # the 13 closing soonest
+    assert len(calls) == 1 and calls[0][:2] == (sonnet, 1), calls
+    assert calls[0][2] == [str(n) for n in range(39, 23, -1)], calls  # the 16 closing soonest
 
-    # spend earlier in a run shrinks the next pass's cap: $6 pays for 17 sonnet-3
-    # questions above the floor; FutureEval's 5 at $0.50 leave $3.50, room for 6 more
+    # spend earlier in a run shrinks the next pass's cap: $6 pays for 22 sonnet-1
+    # questions above the floor; FutureEval's 5 at $0.50 leave $3.50, room for 8 more
     split = {
         fe_id: [open_question(n, n) for n in range(1, 6)],
         "minibench": [open_question(n, n) for n in range(100, 130)],
@@ -405,7 +418,7 @@ def check_run_loop() -> None:
     calls, _, _, _ = run_main(
         "tournament", 6.0, split, cost_each=0.5, OPENROUTER_API_KEY="sk-fake"
     )
-    assert [len(c[2]) for c in calls] == [5, 6], calls
+    assert [len(c[2]) for c in calls] == [5, 8], calls
 
     # under the floor: nothing runs
     calls, summary, _, _ = run_main("tournament", 1.5, questions, OPENROUTER_API_KEY="sk-fake")

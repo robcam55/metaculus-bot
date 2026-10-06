@@ -46,6 +46,10 @@ TIERS = {
     "opus-5": Tier("opus-5", OPUS, 5, 0.40),
     "opus-3": Tier("opus-3", OPUS, 3, 0.30),
     "sonnet-3": Tier("sonnet-3", SONNET, 3, 0.23),
+    # The last resort (see make_plan). By the figures above an Opus forecast costs about
+    # $0.05, research and parsing $0.15 and a Sonnet forecast under $0.03, so dropping two
+    # Sonnet forecasts saves only about a fifth: research is most of the cost.
+    "sonnet-1": Tier("sonnet-1", SONNET, 1, 0.18),
     "pause": Tier("pause", "", 0, 0.0),
 }
 
@@ -69,6 +73,11 @@ MINIBENCH_PER_WEEK = 30
 HORIZON_WEEKS = 4
 # Below this the bot stops, rather than run out of credit halfway through a question.
 FLOOR = 2.0
+# When the bottom of the ladder can't pay for this many weeks, both tournaments drop to
+# one forecast a question, so the last of the credit covers more questions before the
+# floor stops the bot. Rob's choice of 2026-10-06, in place of lowering the tiers sooner.
+LAST_RESORT = "sonnet-1"
+LAST_RESORT_WEEKS = 1
 
 
 @dataclass(frozen=True)
@@ -132,8 +141,14 @@ def make_plan(remaining: float | None, pinned: Tier | None = None) -> Plan:
             return Plan(
                 fe, mb, remaining, f"{HORIZON_WEEKS} weeks at these tiers cost about ${need:.0f}"
             )
-    # Not enough for the horizon even at the bottom: keep going there until the floor
+    # Not enough for the horizon even at the bottom: keep going there until the last week
+    # of credit, then at the last resort until the floor
     fe, mb = (TIERS[n] for n in LADDER[-1])
+    if horizon_cost(fe, mb, LAST_RESORT_WEEKS) > remaining - FLOOR:
+        last = TIERS[LAST_RESORT]
+        return Plan(
+            last, last, remaining, f"less than a week of credit left: {last.name}, the last resort"
+        )
     return Plan(fe, mb, remaining, f"less than {HORIZON_WEEKS} weeks of credit left")
 
 
