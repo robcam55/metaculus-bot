@@ -4,7 +4,8 @@ Run from the repo root:  python tests/check_rc_bot.py
 Covers model routing by environment, credit pacing (budget.py and the run loop in
 main.main), the binary trimmed mean, research that survives one failing source and waits
 for the next run when every source fails, the dates in every prompt, the run page's
-report, and the AskNews settings. Fake key values only; nothing is sent anywhere.
+report, the posted comment's sections, and the AskNews settings. Fake key values only;
+nothing is sent anywhere.
 """
 
 import asyncio
@@ -148,6 +149,15 @@ def check_plan() -> None:
     assert (low.futureeval, low.minibench) == (tiers["sonnet-3"], tiers["sonnet-3"])
     assert "less than" in low.note
     assert plan(1.99).futureeval == plan(1.99).minibench == tiers["pause"]
+    # under a week of credit at the bottom of the ladder (about $17): the last resort, one
+    # Sonnet forecast a question, cheaper than sonnet-3
+    week = budget.horizon_cost(tiers["sonnet-3"], tiers["sonnet-3"], budget.LAST_RESORT_WEEKS)
+    assert plan(budget.FLOOR + week + 0.01).minibench == tiers["sonnet-3"]
+    last = plan(budget.FLOOR + week - 0.01)
+    assert last.futureeval == last.minibench == tiers["sonnet-1"], last
+    assert "last resort" in last.note, last.note
+    assert tiers["sonnet-1"].predictions == 1
+    assert tiers["sonnet-1"].cost < tiers["sonnet-3"].cost
     # an unreadable balance: cheapest tiers, uncapped
     unknown = plan(None)
     assert unknown.futureeval == tiers["sonnet-3"] and "unreadable" in unknown.note
@@ -163,6 +173,9 @@ def check_plan() -> None:
         pinned = plan(3, budget.pinned_tier())
         assert pinned.futureeval == pinned.minibench == tiers["opus-5"]
         assert plan(1, budget.pinned_tier()).futureeval == tiers["pause"]  # floor still holds
+    with env(BUDGET_TIER="sonnet-1"):  # a pin skips the ladder and the last-resort rule
+        pinned = plan(80, budget.pinned_tier())
+        assert pinned.futureeval == pinned.minibench == tiers["sonnet-1"]
     with env(BUDGET_TIER="Pause"):
         assert budget.pinned_tier() == tiers["pause"]
     with env(BUDGET_TIER="opus-9"):
@@ -384,19 +397,20 @@ def check_run_loop() -> None:
     ), summary
     assert "| Research source |" not in summary  # no searches, no table
 
-    # $5: cheapest tiers, and only what the balance pays for above the $2 floor
+    # $5, less than a week of credit: the last resort (one Sonnet forecast a question),
+    # and only what the balance pays for above the $2 floor
     many = {"minibench": [open_question(n, 100 - n) for n in range(10, 40)]}
     calls, summary, exited, _ = run_main("tournament", 5.0, many, OPENROUTER_API_KEY="sk-fake")
     assert exited is None
     assert (
-        "- MiniBench (`minibench`): 30 open, 30 not yet forecast, 13 taken this run"
+        "- MiniBench (`minibench`): 30 open, 30 not yet forecast, 16 taken this run"
         " (run size or credit; later runs take the rest)." in summary
     ), summary
-    assert len(calls) == 1 and calls[0][:2] == (sonnet, 3), calls
-    assert calls[0][2] == [str(n) for n in range(39, 26, -1)], calls  # the 13 closing soonest
+    assert len(calls) == 1 and calls[0][:2] == (sonnet, 1), calls
+    assert calls[0][2] == [str(n) for n in range(39, 23, -1)], calls  # the 16 closing soonest
 
-    # spend earlier in a run shrinks the next pass's cap: $6 pays for 17 sonnet-3
-    # questions above the floor; FutureEval's 5 at $0.50 leave $3.50, room for 6 more
+    # spend earlier in a run shrinks the next pass's cap: $6 pays for 22 sonnet-1
+    # questions above the floor; FutureEval's 5 at $0.50 leave $3.50, room for 8 more
     split = {
         fe_id: [open_question(n, n) for n in range(1, 6)],
         "minibench": [open_question(n, n) for n in range(100, 130)],
@@ -404,7 +418,7 @@ def check_run_loop() -> None:
     calls, _, _, _ = run_main(
         "tournament", 6.0, split, cost_each=0.5, OPENROUTER_API_KEY="sk-fake"
     )
-    assert [len(c[2]) for c in calls] == [5, 6], calls
+    assert [len(c[2]) for c in calls] == [5, 8], calls
 
     # under the floor: nothing runs
     calls, summary, _, _ = run_main("tournament", 1.5, questions, OPENROUTER_API_KEY="sk-fake")
@@ -819,6 +833,57 @@ def check_run_report() -> None:
     print("run report: ok")
 
 
+def check_comment_sections() -> None:
+    """The posted comment keeps exactly its three top-level sections when a research source
+    or the summary brings its own "# " headings (both happened on 2026-10-05)."""
+    # Only what forecasting-tools reads as a heading changes: "#hashtag" and a bare "#" don't
+    assert main.flatten_headings("# Key facts\ntext\n### Dates ##\n#hashtag\n# **Bold**\n#\n# \n") == (
+        "**Key facts**\ntext\n**Dates**\n#hashtag\n**Bold**\n#\n\n"
+    )
+    assert main.flatten_headings("## Tips for C#") == "**Tips for C#**"
+    with env(ANTHROPIC_API_KEY="x", PERPLEXITY_API_KEY="x"):
+        _comment_sections()
+    print("comment sections: ok")
+
+
+def _comment_sections() -> None:
+    from unittest import mock
+
+    from forecasting_tools import BinaryReport, ForecastBot, ReasonedPrediction
+    from forecasting_tools.data_models.forecast_report import ResearchWithPredictions
+
+    bot = main.RcForecastBot(publish_reports_to_metaculus=False)
+    q = binary_question()
+
+    async def source(source, prompt, question):
+        # The shape of Sonnet's research on Q45912
+        return "# Brent Crude Front-Month Futures — Briefing\n## Current price\n$71 (2026-10-04)"
+
+    async def summary(self, question, research):
+        return "# Research Summary\n\nBrent sits near $71.\n\n## Sources\n- example.invalid"
+
+    bot._run_one_research_source = source  # type: ignore[method-assign]
+    research = asyncio.run(bot.run_research(q))
+    with mock.patch.object(ForecastBot, "summarize_research", summary):
+        summarized = asyncio.run(bot.summarize_research(q, research))
+    assert "**Research Summary**" in summarized, summarized
+    reasoning = "**(a) Time left:** ten days.\n\nProbability: 55%"
+    collection = ResearchWithPredictions(
+        research_report=research,
+        summary_report=summarized,
+        errors=[],
+        predictions=[ReasonedPrediction(prediction_value=0.55, reasoning=reasoning)] * 3,
+    )
+    explanation = bot._create_unified_explanation(q, [collection], 0.55, 0.4, 1.0)
+    report = BinaryReport(question=q, prediction=0.55, explanation=explanation)
+    titles = [s.text_of_section_and_subsections.split("\n")[0] for s in report.report_sections]
+    assert titles == ["# SUMMARY", "# RESEARCH", "# FORECASTS"], titles
+    assert "Brent sits near $71." in report.summary
+    assert "**Brent Crude Front-Month Futures — Briefing**" in report.research
+    assert "[Hashtag]" not in explanation  # forecasting-tools' fallback for mixed levels
+    assert "Probability: 55%" in report.first_rationale
+
+
 def check_asknews() -> None:
     """The strategy and article count come from ASKNEWS_STRATEGY and ASKNEWS_ARTICLES;
     latest news only, one call, by default (the free tier is 1,000 calls a month)."""
@@ -910,5 +975,6 @@ if __name__ == "__main__":
     check_prompts()
     check_research_policy()
     check_run_report()
+    check_comment_sections()
     check_asknews()
     print("all checks passed")
