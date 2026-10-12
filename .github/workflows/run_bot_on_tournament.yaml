@@ -26,6 +26,11 @@ jobs:
     if: vars.BOT_ENABLED == 'true' || (github.event_name == 'workflow_dispatch' && inputs.source != 'cloudflare')
     runs-on: ubuntu-latest # determines the machine that will run the job - keep as is
     timeout-minutes: 60
+    # The bot opens an issue (one email) when the credits run low or Rob's own key stops,
+    # rather than failing a run every 20 minutes (alerts.py)
+    permissions:
+      contents: read
+      issues: write
     steps: # sets up the steps that will be run in order
       # setup repository with all necessary dependencies - keep as is
       - name: Check out repository
@@ -59,7 +64,8 @@ jobs:
           EXA_API_KEY: ${{ secrets.EXA_API_KEY }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
-          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }} # pays once the credits are under $2
+          GITHUB_TOKEN: ${{ github.token }} # opens the alert issues; nothing else
           ASKNEWS_CLIENT_ID: ${{ secrets.ASKNEWS_CLIENT_ID }}
           ASKNEWS_SECRET: ${{ secrets.ASKNEWS_SECRET }}
           ASKNEWS_API_KEY: ${{ secrets.ASKNEWS_API_KEY }}
