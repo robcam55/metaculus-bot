@@ -1371,8 +1371,8 @@ def main() -> None:
         # failed questions, retries and questions left waiting for research included
         with spend.collecting() as ledger:
             results = asyncio.run(bot.forecast_questions(questions, return_exceptions=True))
-        if route == "openrouter":
-            ledger.look_up(os.environ["OPENROUTER_API_KEY"])
+        # OpenRouter's records only on its own route; list prices fill gaps on every route
+        ledger.look_up(os.environ["OPENROUTER_API_KEY"] if route == "openrouter" else "")
         breakdowns.extend(
             spend.breakdown(label, ledger, question_statuses(questions, results, publish))
         )
