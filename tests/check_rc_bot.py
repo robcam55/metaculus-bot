@@ -4,8 +4,8 @@ Run from the repo root:  python tests/check_rc_bot.py
 Covers model routing by environment, credit pacing (budget.py and the run loop in
 main.main), the binary trimmed mean, research that survives one failing source and waits
 for the next run when every source fails, the dates in every prompt, the run page's
-report, the posted comment's sections, and the AskNews settings. Fake key values only;
-nothing is sent anywhere.
+report, the posted comment's sections, the AskNews settings, and the spend measured per
+call (spend.py). Fake key values only; nothing is sent anywhere.
 """
 
 import asyncio
@@ -64,12 +64,38 @@ def env(**values: str):
 with env():
     import budget  # noqa: E402
     import main  # noqa: E402  (import after clearing keys: dotenv must not leak real ones)
+    import spend  # noqa: E402
     from forecasting_tools import (  # noqa: E402
         BinaryQuestion,
         GeneralLlm,
         MultipleChoiceQuestion,
         NumericQuestion,
     )
+
+# Generation look-ups the offline run loop attempted (it must attempt none: every fake
+# response carries its cost)
+LOOKUPS: list[str] = []
+
+
+class FakeUsage:
+    """The usage OpenRouter returns, as litellm keeps it on a response."""
+
+    def __init__(self, cost=None, upstream=None, byok=None, searches=0, tokens=(1000, 200)):
+        self.prompt_tokens, self.completion_tokens = tokens
+        if cost is not None:
+            self.cost = cost
+        if byok is not None:
+            self.is_byok = byok
+        if upstream is not None:
+            self.cost_details = {"upstream_inference_cost": upstream}
+        self.server_tool_use = {"web_search_requests": searches}
+
+
+class FakeResponse:
+    def __init__(self, generation="gen-fake", **usage):
+        self.id = generation
+        self.usage = FakeUsage(**usage)
+        self._hidden_params = {"response_cost": 0.0}
 
 
 def model_of(llm) -> str:
@@ -272,10 +298,10 @@ def run_main(
     **env_values,
 ):
     """Runs main.main() offline: fake Metaculus client, a fake key balance (None when
-    unreadable), and fake forecasting that reports `cost_each` per question the way
-    OpenRouter's responses do. Questions in `deferred_urls` come back as research
-    deferrals. Returns (forecast calls, step summary, exit message or None, number of
-    balance reads)."""
+    unreadable), and fake forecasting whose one model call per question OpenRouter bills
+    at `cost_each`. Questions in `deferred_urls` come back as research deferrals.
+    Returns (forecast calls, step summary, exit message or None, number of balance
+    reads)."""
     calls: list[tuple] = []
     reads: list[str] = []
 
@@ -299,7 +325,8 @@ def run_main(
         )
         results = []
         for q in qs:  # a failed question still costs what its calls cost
-            main.MonetaryCostManager.increase_current_usage_in_parent_managers(cost_each)
+            with main.spend.tagged(question=main.question_key(q), part="forecast 1"):
+                main.spend.record_response("fake-model", FakeResponse(cost=cost_each))
             # one search per question, through the bot, as run_research records it
             failed = q.page_url in deferred_urls
             bot.research_health.record("fake-search", "RuntimeError" if failed else None)
@@ -318,12 +345,17 @@ def run_main(
             return None
         return {"limit": 100.0, "limit_remaining": balance, "usage": 100.0 - balance}
 
+    def fake_generation(api_key, generation_id, timeout=10):
+        LOOKUPS.append(generation_id)
+        return None
+
     saved = (
         main.MetaculusClient,
         main.RcForecastBot.forecast_questions,
         main.RcForecastBot.log_report_summary,
         main.print_run_summary_banner,
         budget.key_status,
+        spend.generation_record,
         sys.argv,
     )
     summary_path = Path(tempfile.mkdtemp()) / "summary.md"
@@ -334,6 +366,7 @@ def run_main(
         main.RcForecastBot.log_report_summary = classmethod(lambda cls, *a, **k: None)  # type: ignore[method-assign]
         main.print_run_summary_banner = lambda *a, **k: None
         budget.key_status = fake_status
+        spend.generation_record = fake_generation
         sys.argv = ["main.py", "--mode", mode]
         with env(METACULUS_TOKEN="x", GITHUB_STEP_SUMMARY=str(summary_path), **env_values):
             try:
@@ -347,6 +380,7 @@ def run_main(
             main.RcForecastBot.log_report_summary,
             main.print_run_summary_banner,
             budget.key_status,
+            spend.generation_record,
             sys.argv,
         ) = saved
     summary = summary_path.read_text(encoding="utf-8") if summary_path.exists() else ""
@@ -381,6 +415,14 @@ def check_run_loop() -> None:
     assert "- Research sources: openrouter/anthropic/claude-sonnet-5:online." in summary, summary
     # both passes' searches reach the run page: one tally shared across the run
     assert "| fake-search | 4 | 4 | 0 |" in summary, summary
+    # and each pass's spend by question and part of the work, with where the figures came from
+    assert "### FutureEval: spend by question" in summary, summary
+    assert "| Question | Status | Forecast 1 | Total |" in summary, summary
+    assert "| [2](https://example.invalid/q/2) | posted | $0.250 | $0.250 |" in summary, summary
+    assert "| All 2 | | $0.500 | $0.500 |" in summary, summary
+    assert "| Share | | 100% | 100% |" in summary, summary
+    assert "- 2 model calls, 0 web searches. Cost figures: 2 billed by OpenRouter." in summary
+    assert summary.index("Metaculus's OpenRouter credits") < summary.index("spend by question")
 
     # nothing open: said apart from "nothing new", and an idle run still names the sources,
     # so newly added AskNews keys show up before any question arrives
@@ -469,6 +511,9 @@ def check_run_loop() -> None:
     ), exited
     assert "- 1 question(s) not forecast: every research source failed." in summary, summary
     assert "| fake-search | 4 | 3 | 1 (RuntimeError) |" in summary, summary
+    # what a question that waits or fails spent still shows, against its status
+    assert "| [4](https://example.invalid/q/4) | waits for research | $0.250 |" in summary, summary
+    assert "| [5](https://example.invalid/q/5) | failed | $0.250 |" in summary, summary
 
     # the smoke test: one question of each type, on MiniBench's tier, re-forecast
     testing = {
@@ -509,6 +554,7 @@ def check_run_loop() -> None:
         )
         assert calls == [] and reads == 0 and summary == "", (calls, reads, summary)
         assert exited and next(iter(bad)) in exited, exited
+    assert LOOKUPS == [], LOOKUPS  # every response carried its cost: nothing looked up
     print("run loop: ok")
 
 
@@ -965,6 +1011,270 @@ def check_asknews() -> None:
     print("asknews: ok")
 
 
+def close(a, b) -> bool:
+    return a is not None and abs(a - b) < 1e-9
+
+
+def check_spend() -> None:
+    """What every model call cost, by OpenRouter's own figures, tagged with its question
+    and the part of the work it was for. litellm's price list stopped pricing OpenRouter's
+    responses on 2026-10-09, and OpenRouter's billed `cost` read $0.00 on every logged call
+    (bring-your-own-key: the provider's bill is a separate figure)."""
+    figure = spend.openrouter_figure
+    assert figure(0.12, None, False) == (0.12, "billed")
+    # BYOK: the provider's bill plus OpenRouter's fee, which is $0 on these keys so far
+    assert figure(0.0, 0.40, True) == (0.40, "byok")
+    got = figure(0.02, 0.40, True)
+    assert close(got[0], 0.42) and got[1] == "byok", got
+    assert figure(0.0, 0.30, None) == (0.30, "upstream")  # no BYOK flag, but a provider bill
+    # a call that reads $0, or a BYOK call without the provider's figure, has no figure:
+    # no model call on these keys is free, so $0 would be the old undercount again
+    for args in ((0.0, None, None), (None, None, None), (0.0, None, True), (0.0, 0.0, False)):
+        assert figure(*args) is None, args
+
+    call = spend.call_from_response(
+        "openrouter/anthropic/claude-sonnet-5:online",
+        FakeResponse(generation="gen-1", cost=0.0, upstream=0.4, byok=True, searches=5),
+        "https://example.invalid/q/1",
+        "research: x",
+    )
+    assert (call.cost, call.basis, call.searches, call.generation) == (0.4, "byok", 5, "gen-1"), call
+    assert (call.prompt_tokens, call.completion_tokens) == (1000, 200), call
+    # OpenRouter gave no figure: kept for a look-up by its generation id
+    call = spend.call_from_response("m", FakeResponse(generation="gen-2", cost=0.0))
+    assert (call.cost, call.basis, call.generation) == (None, None, "gen-2"), call
+    # not an OpenRouter response (Anthropic's API on a personal key): litellm's estimate
+    other = FakeResponse(generation="msg_01", cost=None)
+    other._hidden_params = {"response_cost": 0.03}
+    call = spend.call_from_response("anthropic/claude-sonnet-5", other)
+    assert (call.cost, call.basis, call.generation) == (0.03, "litellm", None), call
+    assert spend.label("https://www.metaculus.com/questions/45958/") == "45958"
+    assert spend.label(None) == "outside any question"
+
+    _spend_look_up()
+    _spend_metering()
+    with env(OPENROUTER_API_KEY="x"):  # one search-backed source; no AskNews keys, no network
+        _spend_through_the_bot()
+    print("spend: ok")
+
+
+def _spend_look_up() -> None:
+    """A call without a figure is looked up from OpenRouter's record of the generation,
+    which can take a few seconds to appear; the key never reaches the log."""
+    secret = "sk-or-v1-FAKE-never-logged"
+    answers = iter([404, 200])
+    seen: list[tuple] = []
+    record = {"data": {"total_cost": 0.0, "upstream_inference_cost": 0.31, "is_byok": True}}
+    prices = {
+        "data": [
+            {
+                "id": "anthropic/claude-sonnet-5",
+                "pricing": {"prompt": "0.000002", "completion": "0.00001", "web_search": "0.01"},
+            }
+        ]
+    }
+
+    class Answer:
+        def __init__(self, status, body):
+            self.status_code, self.body = status, body
+
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return self.body
+
+    def fake_get(url, params=None, headers=None, timeout=None):
+        seen.append((url, params, headers))
+        if url == spend.MODELS_URL:
+            return Answer(200, prices)
+        return Answer(next(answers), record)
+
+    def failing_get(url, params=None, headers=None, timeout=None):
+        raise RuntimeError(f"connection refused while sending {headers}")
+
+    ledger = spend.Ledger()
+    ledger.calls.append(spend.call_from_response("m", FakeResponse(generation="gen-late", cost=0.0)))
+    sleeps: list[float] = []
+    real = spend.requests.get
+    records: list[logging.LogRecord] = []
+    handler = logging.Handler()
+    handler.emit = records.append  # type: ignore[method-assign]
+    spend.logger.addHandler(handler)
+    try:
+        spend.requests.get = fake_get  # type: ignore[assignment]
+        ledger.look_up(secret, sleep=sleeps.append)
+        assert seen == [(spend.GENERATION_URL, {"id": "gen-late"}, {"Authorization": f"Bearer {secret}"})] * 2
+        assert sleeps == [5.0], sleeps  # one wait, before the second try
+        assert (ledger.calls[0].cost, ledger.calls[0].basis) == (0.31, "lookup"), ledger.calls
+        # unreadable, the record and the price list both: the call stays without a figure
+        online = "openrouter/anthropic/claude-sonnet-5:online"
+        ledger.calls.append(
+            spend.call_from_response(online, FakeResponse(generation="gen-x", cost=0.0, searches=2))
+        )
+        spend.requests.get = failing_get  # type: ignore[assignment]
+        ledger.look_up(secret, tries=2, sleep=sleeps.append)
+        assert [c.cost for c in ledger.calls] == [0.31, None], ledger.calls
+        # out of time for records: no more look-ups, and the list price stands in (1,000
+        # prompt and 200 completion tokens, two web searches)
+        seen.clear()
+        spend.requests.get = fake_get  # type: ignore[assignment]
+        ticks = iter([0.0, 500.0, 500.0, 500.0])
+        ledger.look_up(secret, sleep=sleeps.append, clock=lambda: next(ticks, 500.0))
+        assert seen == [(spend.MODELS_URL, None, None)], seen
+        assert close(ledger.calls[1].cost, 0.002 + 0.002 + 0.02), ledger.calls
+        assert ledger.calls[1].basis == "list price"
+        # not OpenRouter's, and no price anywhere: counted as without a figure, not as $0
+        ledger.calls.append(spend.call_from_response("m", FakeResponse(generation="msg_1", cost=0.0)))
+        ledger.look_up(secret, sleep=sleeps.append)
+        assert ledger.calls[2].cost is None, ledger.calls
+    finally:
+        spend.requests.get = real  # type: ignore[assignment]
+        spend.logger.removeHandler(handler)
+    assert records and all(secret not in r.getMessage() for r in records)
+    text = "\n".join(spend.breakdown("FutureEval", ledger))
+    assert "| outside any question | | $0.334+? | $0.334+? |" in text, text
+    assert (
+        "- 3 model calls, 2 web searches. Cost figures: 1 looked up from OpenRouter"
+        " afterwards, 1 estimated at OpenRouter's list prices; 1 without any figure"
+        " (not in the totals)." in text
+    ), text
+
+
+def _spend_metering() -> None:
+    """The wrapper records each response and each call that raised, only inside a pass,
+    never changes what the call returns, and never breaks a call by failing to measure."""
+
+    async def fine(**kwargs):
+        return FakeResponse(cost=0.01)
+
+    async def times_out(**kwargs):
+        raise TimeoutError("slow")
+
+    class Broken:
+        @property
+        def usage(self):
+            raise RuntimeError("odd response")
+
+    async def odd(**kwargs):
+        return Broken()
+
+    metered = spend.metered(fine)
+    assert spend.metered(metered) is metered  # wrapping twice is wrapping once
+    response = asyncio.run(metered(model="m", messages=[]))  # outside a pass: not recorded
+    assert response.usage.cost == 0.01
+    with spend.collecting() as ledger:
+        with spend.tagged(question="https://example.invalid/q/3", part="forecast 2"):
+            asyncio.run(metered(model="m", messages=[]))
+            try:
+                asyncio.run(spend.metered(times_out)(model="m", messages=[]))
+            except TimeoutError:
+                pass
+            else:
+                raise AssertionError("the call's own error must reach the caller")
+            assert isinstance(asyncio.run(spend.metered(odd)(model="m")), Broken)
+        asyncio.run(metered(model="m", messages=[]))  # untagged: "other"
+    assert [(c.question, c.part, c.cost) for c in ledger.calls] == [
+        ("https://example.invalid/q/3", "forecast 2", 0.01),
+        (None, "other", 0.01),
+    ], ledger.calls
+    assert ledger.raised == {"TimeoutError": 1}, ledger.raised
+    assert "Calls that raised: TimeoutError ×1." in "\n".join(spend.breakdown("X", ledger))
+    # main meters forecasting-tools' one gateway to litellm when it is imported
+    from forecasting_tools.ai_models import general_llm
+
+    assert getattr(general_llm.acompletion, "_spend_metered", False)
+
+
+def _spend_through_the_bot() -> None:
+    """One opus-3 question through forecasting-tools' real flow, with a fake litellm:
+    each call lands in the right column, and the numbers add up."""
+    import litellm
+    from litellm.types.utils import ServerToolUse
+    from forecasting_tools.ai_models import general_llm
+
+    def reply(text, **usage):
+        return litellm.ModelResponse(
+            id="gen-fake",
+            usage=litellm.Usage(prompt_tokens=1000, completion_tokens=200, total_tokens=1200, **usage),
+            choices=[{"message": {"role": "assistant", "content": text}, "finish_reason": "stop", "index": 0}],
+        )
+
+    models: dict[str, set] = {}
+
+    async def fake_acompletion(**kwargs):
+        prompt = str(kwargs["messages"])
+        if "convert text into structured data" in prompt:
+            kind, response = "parsing", reply('{"prediction_in_decimal": 0.4}', cost=0.002)
+        elif "summarize the following research" in prompt:
+            kind, response = "summary", reply("The research finds nothing yet.", cost=0.004)
+        elif "assistant to a superforecaster" in prompt:
+            kind, response = "research", reply(
+                "Nothing has happened yet (2026-10-10).",
+                cost=0.0,
+                is_byok=True,
+                cost_details={"upstream_inference_cost": 0.40},
+                server_tool_use=ServerToolUse(web_search_requests=5),
+            )
+        elif "superforecaster with an excellent calibration record" in prompt:
+            kind, response = "forecast", reply(
+                "The base rate is low.\n\nProbability: 40%",
+                cost=0.0,
+                is_byok=True,
+                cost_details={"upstream_inference_cost": 0.05},
+            )
+        else:
+            raise AssertionError(f"unexpected prompt: {prompt[:300]}")
+        models.setdefault(kind, set()).add(kwargs["model"])
+        return response
+
+    q = timed_question()
+    bot = main.make_bot("openrouter", budget.TIERS["opus-3"], publish=False)
+    real = general_llm.acompletion
+    general_llm.acompletion = spend.metered(fake_acompletion)
+    try:
+        with spend.collecting() as ledger:
+            results = asyncio.run(bot.forecast_questions([q], return_exceptions=True))
+    finally:
+        general_llm.acompletion = real
+    assert not isinstance(results[0], BaseException), results
+    assert results[0].prediction == 0.4, results[0].prediction
+    # the calls the template and the bot make, each where it belongs (two parsing calls a
+    # forecast: forecasting-tools checks the parse against a second sample)
+    from collections import Counter
+
+    assert Counter(c.part for c in ledger.calls) == {
+        "research: openrouter/anthropic/claude-sonnet-5:online": 1,
+        "summary": 1,
+        "forecast 1": 1,
+        "forecast 2": 1,
+        "forecast 3": 1,
+        "parsing": 6,
+    }, [c.part for c in ledger.calls]
+    assert {c.question for c in ledger.calls} == {"https://example.invalid/q/77"}
+    assert models == {
+        "research": {"openrouter/anthropic/claude-sonnet-5:online"},
+        "forecast": {budget.OPUS},
+        "parsing": {"openrouter/anthropic/claude-haiku-4.5"},
+        "summary": {"openrouter/anthropic/claude-haiku-4.5"},
+    }, models
+    assert close(ledger.total(), 0.40 + 3 * 0.05 + 6 * 0.002 + 0.004), ledger.total()
+
+    text = "\n".join(
+        spend.breakdown("FutureEval", ledger, main.question_statuses([q], results, publish=False))
+    )
+    for expected in (
+        "| Question | Status | Research: openrouter/anthropic/claude-sonnet-5:online"
+        " | Forecast 1 | Forecast 2 | Forecast 3 | Parsing and summary | Total |",
+        "| [77](https://example.invalid/q/77) | dry run | $0.400 | $0.050 | $0.050 | $0.050"
+        " | $0.016 | $0.566 |",
+        "| Share | | 71% | 9% | 9% | 9% | 3% | 100% |",
+        "- 11 model calls, 5 web searches. Cost figures: 7 billed by OpenRouter,"
+        " 4 provider's bill plus OpenRouter's fee (BYOK).",
+    ):
+        assert expected in text, (expected, text)
+
+
 if __name__ == "__main__":
     check_routing()
     check_plan()
@@ -977,4 +1287,5 @@ if __name__ == "__main__":
     check_run_report()
     check_comment_sections()
     check_asknews()
+    check_spend()
     print("all checks passed")

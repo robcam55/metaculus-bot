@@ -16,6 +16,9 @@ import dotenv
 # Pacing for Metaculus's incremental OpenRouter credits.
 import budget
 
+# What each run spends, call by call, by question and part of the work.
+import spend
+
 # Runtime helpers (env validation, banners, dependency-warning suppression).
 from bot_helpers import (
     check_environment,
@@ -33,7 +36,6 @@ from forecasting_tools import (
     GeneralLlm,
     MetaculusClient,
     MetaculusQuestion,
-    MonetaryCostManager,
     MultipleChoiceQuestion,
     NumericDistribution,
     NumericQuestion,
@@ -52,9 +54,14 @@ from forecasting_tools import (
     clean_indents,
     structure_output,
 )
+from forecasting_tools.ai_models import general_llm
 
 dotenv.load_dotenv()
 logger = logging.getLogger(__name__)
+
+# Every model call, forecasting-tools' own included, goes through general_llm's acompletion:
+# metering it records what each call cost (see spend.py). It changes no request.
+spend.install(general_llm)
 
 # AskNews's free tournament tier allows 1,000 calls a month. The template's
 # "news-summaries" makes 6 per question (latest news = 1, archive = 5); a season plus
@@ -241,6 +248,13 @@ def question_key(question: MetaculusQuestion) -> str:
     return question.page_url or question.question_text
 
 
+async def parse(*args, **kwargs):
+    """forecasting-tools' structure_output, unchanged, with its model calls counted as
+    parsing in the run page's spend breakdown."""
+    with spend.tagged(part="parsing"):
+        return await structure_output(*args, **kwargs)
+
+
 def source_name(source: GeneralLlm | str) -> str:
     if isinstance(source, GeneralLlm):
         return source.model
@@ -388,6 +402,9 @@ class RcForecastBot(ForecastBot):
       question waits for the next run unless it closes first; each run's page on GitHub
       counts what every source returned.
     - Every prompt gets today's date and the question's close and resolution times.
+    - Each run's page shows what every model call cost, by OpenRouter's own figures, per
+      question and per part of the work: each research source, each forecast, and parsing
+      with the research summary (spend.py). Measuring changes no request.
     - Binary questions: an outside-view-first prompt with an explicit check against the
       known "Yes" lean of language models, and a trimmed mean (drop the highest and
       lowest) over all predictions instead of the median.
@@ -490,6 +507,8 @@ class RcForecastBot(ForecastBot):
         # research for (RESEARCH_REPORTS can run several reports for one question)
         self._reports_tried: Counter[str] = Counter()
         self._research_found: set[str] = set()
+        # Per question: forecasts started, to number them in the spend breakdown
+        self._forecasts_started: Counter[str] = Counter()
 
     ##################################### MODELS #####################################
 
@@ -510,7 +529,8 @@ class RcForecastBot(ForecastBot):
             for source in sources:
                 name = self._source_name(source)
                 try:
-                    text = await self._run_one_research_source(source, prompt, question)
+                    with spend.tagged(part=f"research: {name}"):
+                        text = await self._run_one_research_source(source, prompt, question)
                 except Exception as e:  # one failed source must not sink the question
                     logger.warning(
                         f"Research source {name} failed for {question.page_url}:"
@@ -565,7 +585,27 @@ class RcForecastBot(ForecastBot):
     async def summarize_research(self, question: MetaculusQuestion, research: str) -> str:
         """The template's summary for the comment, its headings kept as bold lines: on
         2026-10-05 Haiku opened every summary with a "# " heading (see flatten_headings)."""
-        return flatten_headings(await super().summarize_research(question, research))
+        with spend.tagged(part="summary"):
+            summary = await super().summarize_research(question, research)
+        return flatten_headings(summary)
+
+    ##################################### SPEND #####################################
+
+    async def _run_individual_question(self, question: MetaculusQuestion) -> ForecastReport:
+        """The template's, unchanged; every model call it makes counts toward this
+        question in the run page's spend breakdown."""
+        with spend.tagged(question=question_key(question)):
+            return await super()._run_individual_question(question)
+
+    async def _make_prediction(
+        self, question: MetaculusQuestion, research: str
+    ) -> ReasonedPrediction[PredictionTypes]:
+        """The template's, unchanged; its calls count as forecast 1, 2, 3... of the
+        question in the spend breakdown (its parsing calls as parsing, see parse)."""
+        key = question_key(question)
+        self._forecasts_started[key] += 1
+        with spend.tagged(part=f"forecast {self._forecasts_started[key]}"):
+            return await super()._make_prediction(question, research)
 
     @staticmethod
     def _can_retry(question: MetaculusQuestion, now: datetime | None = None) -> bool:
@@ -699,7 +739,7 @@ class RcForecastBot(ForecastBot):
     ) -> ReasonedPrediction[float]:
         reasoning = await self.get_llm("default", "llm").invoke(prompt)
         logger.info(f"Reasoning for URL {question.page_url}: {reasoning}")
-        binary_prediction: BinaryPrediction = await structure_output(
+        binary_prediction: BinaryPrediction = await parse(
             reasoning,
             BinaryPrediction,
             model=self.get_llm("parser", "llm"),
@@ -773,7 +813,7 @@ class RcForecastBot(ForecastBot):
         )
         reasoning = await self.get_llm("default", "llm").invoke(prompt)
         logger.info(f"Reasoning for URL {question.page_url}: {reasoning}")
-        predicted_option_list: PredictedOptionList = await structure_output(
+        predicted_option_list: PredictedOptionList = await parse(
             text_to_structure=reasoning,
             output_type=PredictedOptionList,
             model=self.get_llm("parser", "llm"),
@@ -869,7 +909,7 @@ class RcForecastBot(ForecastBot):
             - Turn any values that are in scientific notation into regular numbers.
             """
         )
-        percentile_list: list[Percentile] = await structure_output(
+        percentile_list: list[Percentile] = await parse(
             reasoning,
             list[Percentile],
             model=self.get_llm("parser", "llm"),
@@ -959,7 +999,7 @@ class RcForecastBot(ForecastBot):
             - If percentiles are not explicitly given (e.g. only a single value is given) please don't return a parsed output, but rather indicate that the answer is not explicitly given in the text.
             """
         )
-        date_percentile_list: list[DatePercentile] = await structure_output(
+        date_percentile_list: list[DatePercentile] = await parse(
             reasoning,
             list[DatePercentile],
             model=self.get_llm("parser", "llm"),
@@ -1237,6 +1277,25 @@ def run_report(
     return lines
 
 
+def question_statuses(
+    questions: list[MetaculusQuestion],
+    results: list[ForecastReport | BaseException],
+    publish: bool,
+) -> dict[str, str]:
+    """What became of each question, for the spend breakdown: research a question paid
+    for still shows when it waits for the next run or fails."""
+    statuses: dict[str, str] = {}
+    for question, result in zip(questions, results):
+        if deferred_for_research(result):
+            status = "waits for research"
+        elif isinstance(result, BaseException):
+            status = "failed"
+        else:
+            status = "posted" if publish else "dry run"
+        statuses[question_key(question)] = status
+    return statuses
+
+
 def main() -> None:
     logging.basicConfig(
         level=logging.INFO,
@@ -1296,6 +1355,7 @@ def main() -> None:
 
     health = ResearchHealth()
     passes: list[str] = []
+    breakdowns: list[str] = []
 
     def run_pass(
         label: str,
@@ -1307,13 +1367,18 @@ def main() -> None:
             logger.info(f"{label}: no new questions")
             return []
         bot = make_bot(route, tier, publish, skip_previous, research_health=health)
-        # Collects the cost OpenRouter returns with every response in the pass, failed
-        # questions included
-        with MonetaryCostManager() as cost:
+        # Records what every model call in the pass cost, by OpenRouter's own figures:
+        # failed questions, retries and questions left waiting for research included
+        with spend.collecting() as ledger:
             results = asyncio.run(bot.forecast_questions(questions, return_exceptions=True))
+        if route == "openrouter":
+            ledger.look_up(os.environ["OPENROUTER_API_KEY"])
+        breakdowns.extend(
+            spend.breakdown(label, ledger, question_statuses(questions, results, publish))
+        )
         if meter is not None and tier is not None:
             failed = sum(isinstance(r, BaseException) for r in results)
-            meter.record(label, tier, len(results) - failed, failed, cost.current_usage)
+            meter.record(label, tier, len(results) - failed, failed, ledger.total())
         return results
 
     reports: list[ForecastReport | BaseException] = []
@@ -1386,6 +1451,9 @@ def main() -> None:
         lines = meter.summary(plan)
         print("\n".join(lines) + "\n")
         budget.write_step_summary(lines)
+    if breakdowns:
+        print("\n".join(breakdowns) + "\n")
+        budget.write_step_summary(breakdowns)
     configured = [source_name(s) for s in research_sources(build_llms(route))]
     lines = run_report(passes, configured, health, reports)
     print("\n".join(lines) + "\n")
