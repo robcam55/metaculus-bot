@@ -1050,6 +1050,14 @@ def check_spend() -> None:
     assert (call.cost, call.basis, call.generation) == (0.03, "litellm", None), call
     assert spend.label("https://www.metaculus.com/questions/45958/") == "45958"
     assert spend.label(None) == "outside any question"
+    # list prices are OpenRouter's, by its ids, for Anthropic's own API names too
+    oid = spend.openrouter_id
+    assert oid("openrouter/anthropic/claude-sonnet-5:online") == "anthropic/claude-sonnet-5"
+    assert oid("openrouter/anthropic/claude-opus-5.5") == "anthropic/claude-opus-5.5"
+    assert oid("anthropic/claude-opus-5-5") == "anthropic/claude-opus-5.5"
+    assert oid("anthropic/claude-haiku-4-5") == "anthropic/claude-haiku-4.5"
+    assert oid("claude-haiku-4-5-20251001") == "anthropic/claude-haiku-4.5"
+    assert oid("anthropic/claude-sonnet-5") == "anthropic/claude-sonnet-5"
 
     _spend_look_up()
     _spend_metering()
@@ -1070,7 +1078,11 @@ def _spend_look_up() -> None:
             {
                 "id": "anthropic/claude-sonnet-5",
                 "pricing": {"prompt": "0.000002", "completion": "0.00001", "web_search": "0.01"},
-            }
+            },
+            {
+                "id": "anthropic/claude-opus-5.5",
+                "pricing": {"prompt": "0.000004", "completion": "0.00002", "web_search": "0.01"},
+            },
         ]
     }
 
@@ -1128,6 +1140,19 @@ def _spend_look_up() -> None:
         ledger.calls.append(spend.call_from_response("m", FakeResponse(generation="msg_1", cost=0.0)))
         ledger.look_up(secret, sleep=sleeps.append)
         assert ledger.calls[2].cost is None, ledger.calls
+        # Anthropic's own API with no OpenRouter key: no generation look-up, and the list
+        # price under OpenRouter's id (1,000 prompt and 200 completion tokens, one search)
+        own = spend.Ledger()
+        own.calls.append(
+            spend.call_from_response(
+                "anthropic/claude-opus-5-5", FakeResponse(generation="msg_2", searches=1)
+            )
+        )
+        seen.clear()
+        own.look_up("", sleep=sleeps.append)
+        assert seen == [(spend.MODELS_URL, None, None)], seen
+        assert close(own.calls[0].cost, 0.004 + 0.004 + 0.01), own.calls
+        assert own.calls[0].basis == "list price"
     finally:
         spend.requests.get = real  # type: ignore[assignment]
         spend.logger.removeHandler(handler)

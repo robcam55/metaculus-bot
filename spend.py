@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import functools
 import logging
+import re
 import time
 from collections import Counter
 from contextlib import contextmanager
@@ -96,9 +97,12 @@ class Ledger:
     ) -> None:
         """Fills in calls whose response carried no cost from OpenRouter's record of the
         generation, which can take a few seconds to appear. Free, never logs the key, and
-        gives up after `limit` seconds so a slow answer can't hold up the run."""
+        gives up after `limit` seconds so a slow answer can't hold up the run. Only
+        OpenRouter's responses carry a generation id, so a call on Anthropic's own API is
+        never looked up; with no OpenRouter key ("") nothing is, and the list prices
+        still stand in."""
         start = clock()
-        missing = [c for c in self.without_figure() if c.generation]
+        missing = [c for c in self.without_figure() if c.generation] if api_key else []
         for attempt in range(tries):
             if not missing or clock() - start > limit:
                 break
@@ -354,11 +358,24 @@ def list_prices(timeout: float = 15) -> dict[str, dict[str, float]]:
     return prices
 
 
+def openrouter_id(model: str) -> str:
+    """OpenRouter's price-list id for a model as litellm names it. litellm's
+    "openrouter/anthropic/claude-sonnet-5:online" is OpenRouter's "anthropic/claude-sonnet-5"
+    with the web-search variant; Anthropic's own API (a personal key) names
+    "anthropic/claude-opus-5-5" and "claude-haiku-4-5-20251001" what OpenRouter lists as
+    "anthropic/claude-opus-5.5" and "anthropic/claude-haiku-4.5", at the same prices."""
+    name = model.removeprefix("openrouter/").split(":", 1)[0]
+    if name.startswith("claude-"):
+        name = "anthropic/" + name
+    if name.startswith("anthropic/claude-"):
+        name = re.sub(r"-\d{8}$", "", name)  # a dated snapshot
+        name = re.sub(r"-(\d)-(\d)$", r"-\1.\2", name)
+    return name
+
+
 def list_price(call: Call, prices: dict[str, dict[str, float]]) -> float | None:
     """A call's cost at list prices, from its tokens and web searches."""
-    # litellm's "openrouter/anthropic/claude-sonnet-5:online" is OpenRouter's
-    # "anthropic/claude-sonnet-5" with the web-search variant
-    price = prices.get(call.model.removeprefix("openrouter/").split(":", 1)[0])
+    price = prices.get(openrouter_id(call.model))
     if not price or not (call.prompt_tokens or call.completion_tokens):
         return None
     return (
