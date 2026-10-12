@@ -8,7 +8,7 @@ questions a season against professional forecasters, with no money at risk.
 
 ## What's different from the template
 
-The changes are in `main.py` (`RcForecastBot`) and `budget.py`:
+The changes are in `main.py` (`RcForecastBot`), `budget.py` and `spend.py`:
 - **Claude models, on Metaculus's credits first.**
   - Metaculus's donated OpenRouter credits (`OPENROUTER_API_KEY`) pay before a personal
     `ANTHROPIC_API_KEY`.
@@ -46,13 +46,18 @@ The changes are in `main.py` (`RcForecastBot`) and `budget.py`:
   - **Never runs dry.** Below $2 the bot pauses, and one run never forecasts more
     questions than the balance covers, so credit can't run out halfway through a question.
   - **Top-ups apply at once.** When Metaculus raises the key, the next run sees it.
-  - **Measured spend.** Each run's page on GitHub shows the balance and what each tier
-    cost per question. The costs are the ones OpenRouter returns with every response;
-    its balance figure lags by minutes, so the bot reads it once, at the start of a run.
-    The response costs run slightly low: the first test's added up to $0.63 while the
-    balance fell $0.73, probably because web searches bill separately. Pacing works from
-    the balance, so it isn't affected. Recalibrate the estimates in `budget.py` from
-    those numbers after the first week.
+  - **Measured spend.** Each run's page on GitHub shows the balance, what each tier cost
+    per question, and a table per tournament of what each question cost: each research
+    source, each forecast, and parsing with the research summary (`spend.py`).
+    - The costs are OpenRouter's own figures for every model call, recorded as each
+      response returns, retries and questions left waiting for research included. The log
+      has one `Spend:` line per call.
+    - OpenRouter's balance lags by minutes, so the bot reads it once, at the start of a
+      run. The next run's starting balance is the check on this run's figures.
+    - Until 2026-10-09 the costs came from litellm's price list, which ran about 12% below
+      the balance. Then litellm dropped OpenRouter's models from the list, and every run
+      page read $0.00. Pacing works from the balance, so it wasn't affected.
+    - Recalibrate the estimates in `budget.py` from these numbers.
 - **Two independent research sources per research report.**
   - AskNews news search: by default one latest-news call per question, to fit the free
     tier's 1,000 calls a month. The template's version uses six. `ASKNEWS_STRATEGY` and
@@ -133,7 +138,8 @@ Offline checks (no network, no keys): `python tests/check_rc_bot.py`.
    - It forecasts three bot-testing-area questions (one of each type) at MiniBench's tier,
      for about $1 of credit.
    - Check that the forecasts appear on the bot's Metaculus profile.
-   - Read the run page's summary for the balance and the measured cost per question.
+   - Read the run page's summary for the balance and the measured cost per question,
+     split by research, forecasts and parsing.
 6. **Turn it on.** Set the repository variable `BOT_ENABLED` to `true`.
 7. **Start the 20-minute clock.** GitHub's own schedule fires only about five times a day.
    The Worker in `trigger/` starts the workflow every 20 minutes instead.
@@ -209,6 +215,12 @@ The main architectural choices and the reasons behind them. Each links to where 
   - **Estimates kept below measured costs.** On 2026-10-05 MiniBench questions cost $0.68 at `opus-5` and $0.45 at `opus-3` (40 questions, by the settled balance), against estimates of $0.40 and $0.30, so the pacer holds richer tiers than four weeks of credit would buy. Rob chose on 2026-10-06 to keep the estimates and tiers: he expects Metaculus to add credit after the early MiniBench results, and would fund the bot himself otherwise. In place of lowering the tiers sooner, the last week of credit runs at `sonnet-1`.
 
   — Metaculus's funding email to Rob (2026-09-27, not public); proposed in [#1](https://github.com/robcam55/metaculus-bot/pull/1), not yet ratified
+- **Spend measured call by call, from OpenRouter's own figures (`spend.py`).**
+  - **Why not the package's cost tracking.** `forecasting-tools` prices each response from litellm's price list. That list never carried web-search fees, so it ran about 12% below the balance, and on 2026-10-09 it dropped OpenRouter's models: every run page since read $0.00 while the balance kept falling.
+  - **Why both of OpenRouter's figures.** OpenRouter's billed `cost` read $0.00 on all 99 calls the logs show it for (2026-10-05 to 10-09), while the balance kept falling, so Metaculus's credits look like bring-your-own-key: the provider bills the call and OpenRouter adds its fee. A call's cost is both together. That reading is *inferred* from the logs; each run page counts which figure every call's cost came from, so the first runs confirm or refute it.
+  - **Why per question and part of the work.** Research, forecasts and parsing cost very different amounts, and the decisions on tiers and research sources turn on the split.
+
+  — Rob's go-ahead of 2026-10-12 for measurement only, built in [#7](https://github.com/robcam55/metaculus-bot/pull/7)
 - **Two independent research sources, several forecasts, a trimmed mean.**
   - **Two sources.** Search luck drove most of the night-to-night noise in rc_trader's own forecasts. So each question gets AskNews latest news and Sonnet 5 with native web search, and if one source fails, the other still feeds the forecast.
   - **One AskNews call by default.** AskNews's free tier allows 1,000 calls a month, so it gets one latest-news call per question. `ASKNEWS_STRATEGY` and `ASKNEWS_ARTICLES` raise that without a code change once AskNews confirms its quota.
