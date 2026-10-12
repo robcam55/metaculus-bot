@@ -2,6 +2,17 @@ name: Test Bot
 
 on:
   workflow_dispatch:
+    inputs:
+      pay_with:
+        description: "Who pays: Metaculus's credits, or your own key (ANTHROPIC_API_KEY)"
+        type: choice
+        options:
+          - credits
+          - own-key
+        default: credits
+      questions:
+        description: "How many bot-testing-area questions (empty: the TEST_QUESTIONS variable, or 3)"
+        default: ""
 
 # Add concurrency group to prevent parallel runs
 concurrency:
@@ -47,12 +58,13 @@ jobs:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          PAY_WITH: ${{ inputs.pay_with }}
           ASKNEWS_CLIENT_ID: ${{ secrets.ASKNEWS_CLIENT_ID }}
           ASKNEWS_SECRET: ${{ secrets.ASKNEWS_SECRET }}
           ASKNEWS_API_KEY: ${{ secrets.ASKNEWS_API_KEY }}
           # Optional settings (repository variables, not secrets); empty = default
           BUDGET_TIER: ${{ vars.BUDGET_TIER }}
-          TEST_QUESTIONS: ${{ vars.TEST_QUESTIONS }}
+          TEST_QUESTIONS: ${{ inputs.questions || vars.TEST_QUESTIONS }}
           FORECASTER_MODEL: ${{ vars.FORECASTER_MODEL }}
           PARSER_MODEL: ${{ vars.PARSER_MODEL }}
           ASKNEWS_STRATEGY: ${{ vars.ASKNEWS_STRATEGY }}

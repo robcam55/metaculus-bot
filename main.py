@@ -19,6 +19,9 @@ import budget
 # What each run spends, call by call, by question and part of the work.
 import spend
 
+# GitHub issues that tell Rob when the credits run low or his own key stops.
+import alerts
+
 # Runtime helpers (env validation, banners, dependency-warning suppression).
 from bot_helpers import (
     check_environment,
@@ -55,6 +58,7 @@ from forecasting_tools import (
     structure_output,
 )
 from forecasting_tools.ai_models import general_llm
+import litellm
 
 dotenv.load_dotenv()
 logger = logging.getLogger(__name__)
@@ -101,6 +105,51 @@ FALL_2026_METACULUS_CUP_ID = 33108  # https://www.metaculus.com/tournament/metac
 # MiniBench round would outlast the workflow's 60-minute timeout. Runs come every 20
 # minutes and pick up the rest.
 MAX_QUESTIONS_PER_RUN = 25
+
+# litellm caps an Anthropic reply at 4,096 tokens unless told otherwise, and Opus 5.5 and
+# Sonnet 5 think on every request, inside that cap. OpenRouter sets its own.
+ANTHROPIC_MAX_TOKENS = 16000
+# Anthropic's own web search for the search-backed model on Rob's key: litellm sends it
+# as web_search_20250305 with up to five searches ("medium"), $10 per 1,000 searches.
+ANTHROPIC_WEB_SEARCH = {"search_context_size": "medium"}
+
+# What Anthropic says when a key can't spend: a workspace or organization spend limit
+# (400 invalid_request_error, or 429 enforced_spend_limit_reached), or prepaid credit gone
+SPEND_LIMIT_MARKERS = (
+    "api usage limits",
+    "enforced_spend_limit_reached",
+    "credit balance is too low",
+)
+
+
+def spend_limit_reached(error: BaseException) -> bool:
+    """Whether an error, or any error grouped inside it, is Anthropic refusing to spend."""
+    if any(marker in str(error).lower() for marker in SPEND_LIMIT_MARKERS):
+        return True
+    if isinstance(error, BaseExceptionGroup):
+        return any(spend_limit_reached(e) for e in error.exceptions)
+    return False
+
+
+def own_key_check() -> str | None:
+    """One tiny request on Rob's own key (about $0.00002) before a run spends AskNews calls
+    and research on questions the key can't pay for. None when the key works or the
+    failure looks passing; otherwise "limit" (a spend limit or no credit) or "rejected: "
+    and the error type (a bad or revoked key)."""
+    try:
+        litellm.completion(
+            model="anthropic/claude-haiku-4-5",
+            messages=[{"role": "user", "content": "Reply with OK."}],
+            max_tokens=1,
+            timeout=60,
+        )
+    except Exception as e:  # never log the message: keep request details out of logs
+        if spend_limit_reached(e):
+            return "limit"
+        if isinstance(e, (litellm.AuthenticationError, litellm.PermissionDeniedError)):
+            return f"rejected: {type(e).__name__}"
+        logger.warning(f"Own-key check failed ({type(e).__name__}); forecasting anyway")
+    return None
 
 
 def asknews_strategy() -> str:
@@ -257,6 +306,8 @@ async def parse(*args, **kwargs):
 
 def source_name(source: GeneralLlm | str) -> str:
     if isinstance(source, GeneralLlm):
+        if source.litellm_kwargs.get("web_search_options"):
+            return f"{source.model} + web search"
         return source.model
     if source == ASKNEWS_RESEARCHER:
         return asknews_label()
@@ -322,19 +373,25 @@ def llm_route() -> str | None:
 def build_llms(
     route: str | None, tier: budget.Tier | None = None
 ) -> dict[str, str | GeneralLlm | None]:
-    """The bot's models on one route. On Metaculus's OpenRouter credits the pacing tier
-    picks the forecaster (Opus 5.5 without one); a personal Anthropic key runs Sonnet 5,
-    or FORECASTER_MODEL. Haiku 4.5 parses on both; PARSER_MODEL overrides it."""
+    """The bot's models on one route. A pacing tier picks the forecaster on either route:
+    on Metaculus's OpenRouter credits (Opus 5.5 without one), and on Rob's own Anthropic
+    key once the credits run out. Without a tier (the Metaculus Cup) a personal key runs
+    Sonnet 5, or FORECASTER_MODEL. Haiku 4.5 parses on both; PARSER_MODEL overrides it."""
     defaults = dict(ForecastBot._llm_config_defaults())
     if route is None:
         defaults["researcher_2"] = None
         return defaults
+    # Anthropic's API through litellm needs a reply cap that leaves room for thinking
+    room = {"max_tokens": ANTHROPIC_MAX_TOKENS} if route == "anthropic" else {}
     if route == "openrouter":
         prefix, haiku = "openrouter/anthropic/", "claude-haiku-4.5"
         forecaster = tier.forecaster if tier and tier.forecaster else budget.OPUS
     else:
         prefix, haiku = "anthropic/", "claude-haiku-4-5"
-        forecaster = os.getenv("FORECASTER_MODEL") or f"{prefix}claude-sonnet-5"
+        if tier and tier.forecaster:
+            forecaster = budget.on_route(tier.forecaster, route)
+        else:
+            forecaster = os.getenv("FORECASTER_MODEL") or f"{prefix}claude-sonnet-5"
     parser = os.getenv("PARSER_MODEL") or f"{prefix}{haiku}"
     defaults["default"] = GeneralLlm(
         model=forecaster,
@@ -342,6 +399,7 @@ def build_llms(
         temperature=None,
         timeout=_env_int("FORECASTER_TIMEOUT_S", 300),
         allowed_tries=2,
+        **room,
     )
     parser_llm = GeneralLlm(
         model=parser,
@@ -357,7 +415,7 @@ def build_llms(
     # Metaculus's OpenRouter credits cover only OpenAI, Anthropic and Google models,
     # so the searcher there is Sonnet 5 with ":online" (the provider's own web
     # search; OpenRouter's Exa fallback is not covered). A personal-key run never
-    # touches the OpenRouter key.
+    # touches the OpenRouter key: there Sonnet 5 calls Anthropic's web search tool itself.
     search_llm: GeneralLlm | None = None
     if os.getenv("PERPLEXITY_API_KEY"):
         search_llm = GeneralLlm(model="perplexity/sonar-pro", temperature=0.1)
@@ -367,6 +425,15 @@ def build_llms(
             temperature=None,
             timeout=300,
             allowed_tries=2,
+        )
+    else:
+        search_llm = GeneralLlm(
+            model=f"{prefix}claude-sonnet-5",
+            temperature=None,
+            timeout=300,
+            allowed_tries=2,
+            web_search_options=ANTHROPIC_WEB_SEARCH,
+            **room,
         )
     if os.getenv("RESEARCHER"):
         defaults["researcher"] = os.getenv("RESEARCHER")
@@ -1194,10 +1261,11 @@ def make_bot(
     skip_previous: bool = True,
     research_health: ResearchHealth | None = None,
 ) -> RcForecastBot:
-    """One research report (two independent sources) per question. On Metaculus's
-    credits the pacing tier sets the forecaster and the number of predictions; on a
-    personal key RESEARCH_REPORTS and PREDICTIONS_PER_REPORT do (1 and 5 by default)."""
-    if route == "openrouter" and tier is not None:
+    """One research report (two independent sources) per question. A pacing tier (on
+    Metaculus's credits, or on Rob's own key once they run out) sets the forecaster and
+    the number of predictions; without one, on a personal key, RESEARCH_REPORTS and
+    PREDICTIONS_PER_REPORT do (1 and 5 by default)."""
+    if tier is not None:
         reports, predictions = 1, tier.predictions
     else:
         reports = _env_int("RESEARCH_REPORTS", 1)
@@ -1296,6 +1364,71 @@ def question_statuses(
     return statuses
 
 
+def pay_with() -> str:
+    """PAY_WITH (the Test Bot's input): credits, the default, or own-key, which makes Rob's
+    own Anthropic key pay even while Metaculus's credits last."""
+    value = os.getenv("PAY_WITH", "").strip().lower() or "credits"
+    if value not in ("credits", "own-key"):
+        raise SystemExit(f"PAY_WITH must be credits or own-key; got {value!r}")
+    if value == "own-key" and not os.getenv("ANTHROPIC_API_KEY"):
+        raise SystemExit("PAY_WITH=own-key needs the ANTHROPIC_API_KEY secret")
+    return value
+
+
+def own_key_reason(credits_left: float | None) -> str | None:
+    """Why Rob's own Anthropic key pays this run instead of Metaculus's credits, or None.
+    It takes over once the credits are under the floor (Rob's choice of 2026-10-11), if
+    ANTHROPIC_API_KEY is set; PAY_WITH=own-key asks for it sooner."""
+    if not os.getenv("ANTHROPIC_API_KEY"):
+        return None
+    if pay_with() == "own-key":
+        return "PAY_WITH=own-key"
+    if budget.under_floor(credits_left):
+        return f"Metaculus's credits are under the ${budget.FLOOR:.0f} floor"
+    return None
+
+
+def credit_alerts(meter: budget.SpendMeter) -> list[str]:
+    """Opens an issue the first time the credits fall below LOW_CREDIT, and another when
+    they fall below the floor (each once per credit limit). Lines for the run page."""
+    left = budget.remaining_of(meter.start)
+    if left is None or math.isinf(left) or left >= budget.LOW_CREDIT:
+        return []
+    limit = (meter.start or {}).get("limit")
+    limit = None if limit is None else float(limit)
+    own_key = bool(os.getenv("ANTHROPIC_API_KEY"))
+    if left < budget.FLOOR:
+        opened = alerts.credits_out(left, limit, own_key)
+    else:
+        opened = alerts.credits_low(left, limit, own_key)
+    return ["- Opened an issue to tell Rob about the credits."] if opened else []
+
+
+class OwnKey:
+    """Rob's own Anthropic key during one run. It is checked once, before the first
+    question it would pay for, so a key that can't pay costs no AskNews calls or
+    research, and the run stays green (one issue tells Rob instead)."""
+
+    def __init__(self) -> None:
+        self.checked = False
+        self.problem: str | None = None
+
+    def stopped(self) -> str | None:
+        """Why the key can't pay this run, or None; checks it the first time."""
+        if not self.checked:
+            self.checked = True
+            self.problem = own_key_check()
+            if self.problem == "limit":
+                alerts.own_key_limit()
+            elif self.problem:
+                alerts.own_key_rejected(self.problem.removeprefix("rejected: "))
+        if self.problem == "limit":
+            return "your Anthropic key reached its spend limit"
+        if self.problem:
+            return f"Anthropic rejected your key ({self.problem.removeprefix('rejected: ')})"
+        return None
+
+
 def main() -> None:
     logging.basicConfig(
         level=logging.INFO,
@@ -1314,9 +1447,10 @@ def main() -> None:
     run_mode: Literal["tournament", "metaculus_cup", "test_questions"] = args.mode
 
     check_environment(strict=True)
-    # A mistyped AskNews setting stops the run here, not quietly at every question
+    # A mistyped AskNews or PAY_WITH setting stops the run here, not quietly later
     asknews_strategy()
     asknews_articles()
+    pay_with()
     # PUBLISH=false gives a dry run: full research and forecasts, nothing posted
     publish = _env_flag("PUBLISH", True)
     print_startup_banner(run_mode, will_publish=publish)
@@ -1331,9 +1465,13 @@ def main() -> None:
             )
         route = "anthropic"
 
-    # Pacing applies to Metaculus's credits; a personal key runs unpaced.
+    # Pacing applies to Metaculus's credits. Once they are under the floor, Rob's own
+    # Anthropic key takes over, capped by its workspace's monthly spend limit; the
+    # Metaculus Cup's personal key runs unpaced.
     meter: budget.SpendMeter | None = None
     plan: budget.Plan | None = None
+    own_key: OwnKey | None = None
+    notes: list[str] = []
     if route == "openrouter":
         meter = budget.SpendMeter(os.environ["OPENROUTER_API_KEY"])
         plan = budget.make_plan(meter.remaining(), budget.pinned_tier())
@@ -1341,6 +1479,17 @@ def main() -> None:
             f"Credits left: {budget.dollars(meter.remaining())}. FutureEval runs"
             f" {plan.futureeval.name}, MiniBench {plan.minibench.name} ({plan.note})."
         )
+        notes += credit_alerts(meter)
+        reason = own_key_reason(meter.remaining())
+        if reason:
+            route = "anthropic"
+            own_key = OwnKey()
+            meter = budget.OwnKeyMeter(meter.start)
+            plan = budget.own_key_plan(budget.pinned_tier(), reason)
+            logger.info(
+                f"Your Anthropic key pays this run ({reason}). FutureEval runs"
+                f" {plan.futureeval.name}, MiniBench {plan.minibench.name}."
+            )
 
     client = MetaculusClient()
     tournament_id = _tournament_id(os.getenv("AIB_TOURNAMENT_ID"), FALL_2026_FUTUREEVAL_ID)
@@ -1381,6 +1530,17 @@ def main() -> None:
             meter.record(label, tier, len(results) - failed, failed, ledger.total())
         return results
 
+    def paused_by(tier: budget.Tier | None, has_work: bool) -> str | None:
+        """Why a pass forecasts nothing ("paused", or why Rob's key can't pay), or None.
+        Rob's key is checked only when a pass has work for it."""
+        if tier is not None and tier.predictions == 0:
+            return "paused"
+        if has_work and own_key is not None:
+            stop = own_key.stopped()
+            if stop:
+                return f"paused: {stop}"
+        return None
+
     reports: list[ForecastReport | BaseException] = []
     if run_mode == "tournament":
         room = MAX_QUESTIONS_PER_RUN
@@ -1391,10 +1551,11 @@ def main() -> None:
         for label, tid, tier in tournaments:
             open_questions = client.get_all_open_questions_from_tournament(tid)
             new = [q for q in open_questions if not q.already_forecasted]
-            if tier is not None and tier.predictions == 0:
+            why = paused_by(tier, bool(new))
+            if why:
                 if new:
-                    logger.warning(f"{label}: paused; {len(new)} new question(s) skipped")
-                passes.append(describe_pass(label, tid, len(open_questions), 0, len(new), "paused"))
+                    logger.warning(f"{label}: {why}; {len(new)} new question(s) skipped")
+                passes.append(describe_pass(label, tid, len(open_questions), 0, len(new), why))
                 continue
             limit = room
             if meter is not None and tier is not None:
@@ -1430,9 +1591,10 @@ def main() -> None:
         # MiniBench's tier, the richer of the two.
         # https://www.metaculus.com/tournament/bot-testing-area/
         tier = plan.minibench if plan else None
-        if tier is not None and tier.predictions == 0:
-            logger.warning("bot-testing-area: paused; nothing forecast")
-            passes.append("- bot-testing-area: paused; nothing forecast.")
+        why = paused_by(tier, True)
+        if why:
+            logger.warning(f"bot-testing-area: {why}; nothing forecast")
+            passes.append(f"- bot-testing-area: {why}; nothing forecast.")
         else:
             testing = client.get_all_open_questions_from_tournament("bot-testing-area")
             questions = one_of_each_type(testing, _env_int("TEST_QUESTIONS", 3))
@@ -1440,6 +1602,17 @@ def main() -> None:
                 describe_pass("bot-testing-area", "bot-testing-area", len(testing), len(questions))
             )
             reports += run_pass("bot-testing-area", questions, tier, skip_previous=False)
+
+    failures = [r for r in reports if isinstance(r, BaseException)]
+    # Questions Anthropic refused to pay for mid-run: no red run (the next run's key check
+    # pauses quietly), but one alert
+    limited = sum(spend_limit_reached(r) for r in failures)
+    if limited:
+        alerts.own_key_limit()
+        notes.append(
+            f"- {limited} question(s) not forecast: your Anthropic key reached its spend"
+            " limit. Runs stay paused until it resets or you raise it."
+        )
 
     RcForecastBot.log_report_summary(reports, raise_errors=False)
     print_run_summary_banner(
@@ -1456,15 +1629,17 @@ def main() -> None:
         budget.write_step_summary(breakdowns)
     configured = [source_name(s) for s in research_sources(build_llms(route))]
     lines = run_report(passes, configured, health, reports)
+    if notes:
+        lines += ["", *notes]
     print("\n".join(lines) + "\n")
     budget.write_step_summary(lines)
-    failures = sum(isinstance(r, BaseException) for r in reports)
-    if failures:
+    failed = len(failures) - limited
+    if failed:
         # a failed question turns the Actions run red; one that waits for research too,
         # so a source that keeps failing doesn't go unnoticed
-        deferred = sum(deferred_for_research(r) for r in reports)
+        deferred = sum(deferred_for_research(r) for r in failures)
         why = f" ({deferred} for lack of research; the next run retries them)" if deferred else ""
-        sys.exit(f"{failures} question(s) failed{why}; see the log above")
+        sys.exit(f"{failed} question(s) failed{why}; see the log above")
 
 
 if __name__ == "__main__":

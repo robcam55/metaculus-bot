@@ -2,10 +2,11 @@
 
 Run from the repo root:  python tests/check_rc_bot.py
 Covers model routing by environment, credit pacing (budget.py and the run loop in
-main.main), the binary trimmed mean, research that survives one failing source and waits
-for the next run when every source fails, the dates in every prompt, the run page's
-report, the posted comment's sections, the AskNews settings, and the spend measured per
-call (spend.py). Fake key values only; nothing is sent anywhere.
+main.main), Rob's own key taking over under the floor, the alert issues (alerts.py), the
+binary trimmed mean, research that survives one failing source and waits for the next
+run when every source fails, the dates in every prompt, the run page's report, the
+posted comment's sections, the AskNews settings, and the spend measured per call
+(spend.py). Fake key values only; nothing is sent anywhere.
 """
 
 import asyncio
@@ -46,6 +47,10 @@ KEYS = (
     "PREDICTIONS_PER_REPORT",
     "RESEARCH_REPORTS",
     "GITHUB_STEP_SUMMARY",
+    "PAY_WITH",
+    "GITHUB_TOKEN",
+    "GITHUB_REPOSITORY",
+    "GITHUB_REPOSITORY_OWNER",
 )
 
 
@@ -62,6 +67,7 @@ def env(**values: str):
 
 
 with env():
+    import alerts  # noqa: E402
     import budget  # noqa: E402
     import main  # noqa: E402  (import after clearing keys: dotenv must not leak real ones)
     import spend  # noqa: E402
@@ -107,10 +113,14 @@ def check_routing() -> None:
         d = main.RcForecastBot._llm_config_defaults()
         assert model_of(d["default"]) == "anthropic/claude-sonnet-5", d["default"]
         assert d["default"].litellm_kwargs["temperature"] is None
+        # litellm's 4,096-token default for Anthropic would leave no room to think
+        assert d["default"].litellm_kwargs["max_tokens"] == main.ANTHROPIC_MAX_TOKENS
         assert model_of(d["parser"]) == "anthropic/claude-haiku-4-5"
         assert d["parser"].litellm_kwargs["temperature"] == 0
-        # no search provider: the forecaster researches from its own knowledge
-        assert model_of(d["researcher"]) == "anthropic/claude-sonnet-5"
+        # no AskNews: Sonnet 5 with Anthropic's own web search is the one source
+        assert main.source_name(d["researcher"]) == "anthropic/claude-sonnet-5 + web search"
+        assert d["researcher"].litellm_kwargs["web_search_options"] == main.ANTHROPIC_WEB_SEARCH
+        assert d["researcher"].litellm_kwargs["max_tokens"] == main.ANTHROPIC_MAX_TOKENS
         assert d["researcher_2"] is None
 
     with env(OPENROUTER_API_KEY="x", ASKNEWS_CLIENT_ID="x", ASKNEWS_SECRET="y"):
@@ -146,12 +156,17 @@ def check_routing() -> None:
         assert main.llm_route() == "openrouter"
         d = main.RcForecastBot._llm_config_defaults()
         assert model_of(d["default"]) == "openrouter/anthropic/claude-opus-5.5"
-        # the personal route (Metaculus Cup) never touches the OpenRouter key
+        # the personal route (Metaculus Cup, and Rob's key once the credits run out) never
+        # touches the OpenRouter key: its searcher calls Anthropic's web search itself
         d = main.build_llms("anthropic")
         assert model_of(d["default"]) == "anthropic/claude-sonnet-5"
         assert model_of(d["parser"]) == "anthropic/claude-haiku-4-5"
         assert d["researcher"] == main.ASKNEWS_RESEARCHER
-        assert d["researcher_2"] is None
+        assert main.source_name(d["researcher_2"]) == "anthropic/claude-sonnet-5 + web search"
+        # the OpenRouter route sends no reply cap and no web search options
+        d = main.build_llms("openrouter")
+        assert "max_tokens" not in d["default"].litellm_kwargs
+        assert "web_search_options" not in d["researcher_2"].litellm_kwargs
 
     # a pacing tier picks the forecaster on the donated credits
     with env(OPENROUTER_API_KEY="x", FORECASTER_MODEL="openrouter/some/other-model"):
@@ -159,6 +174,15 @@ def check_routing() -> None:
         assert model_of(d["default"]) == "openrouter/anthropic/claude-sonnet-5"
         # FORECASTER_MODEL applies to a personal key only
         assert model_of(main.build_llms("openrouter")["default"]) == budget.OPUS
+
+    # and on Rob's own key, in Anthropic's ids; FORECASTER_MODEL doesn't override a tier
+    with env(ANTHROPIC_API_KEY="x", FORECASTER_MODEL="anthropic/some-other-model"):
+        d = main.build_llms("anthropic", budget.TIERS["opus-3"])
+        assert model_of(d["default"]) == "anthropic/claude-opus-5-5", d["default"]
+        assert d["default"].litellm_kwargs["max_tokens"] == main.ANTHROPIC_MAX_TOKENS
+        d = main.build_llms("anthropic", budget.TIERS["sonnet-1"])
+        assert model_of(d["default"]) == "anthropic/claude-sonnet-5"
+    assert budget.on_route(budget.OPUS, "openrouter") == budget.OPUS
     print("routing: ok")
 
 
@@ -288,6 +312,16 @@ def research_deferral(url: str) -> BaseException:
     )
 
 
+# What the last run_main call alerted (issue titles) and how often it checked Rob's key
+LAST: dict = {}
+
+SPEND_LIMIT_ERROR = (
+    'litellm.BadRequestError: AnthropicException - {"type":"error","error":{"type":'
+    '"invalid_request_error","message":"You have reached your specified workspace API'
+    ' usage limits. You will regain access on 2026-11-01 at 00:00 UTC."}}'
+)
+
+
 def run_main(
     mode: str,
     balance,
@@ -295,15 +329,28 @@ def run_main(
     fail_urls=(),
     cost_each=0.25,
     deferred_urls=(),
+    limit_urls=(),
+    key_check=None,
     **env_values,
 ):
     """Runs main.main() offline: fake Metaculus client, a fake key balance (None when
     unreadable), and fake forecasting whose one model call per question OpenRouter bills
-    at `cost_each`. Questions in `deferred_urls` come back as research deferrals.
-    Returns (forecast calls, step summary, exit message or None, number of balance
-    reads)."""
+    at `cost_each`. Questions in `deferred_urls` come back as research deferrals, those in
+    `limit_urls` as Anthropic's spend-limit error. Rob's own key's check returns
+    `key_check`; alerts are recorded in LAST, not opened. Returns (forecast calls, step
+    summary, exit message or None, number of balance reads)."""
     calls: list[tuple] = []
     reads: list[str] = []
+    LAST.clear()
+    LAST.update(alerts=[], key_checks=0)
+
+    def fake_alert(title, body, timeout=15):
+        LAST["alerts"].append(title)
+        return True
+
+    def fake_key_check():
+        LAST["key_checks"] += 1
+        return key_check
 
     class FakeClient:
         CURRENT_MINIBENCH_ID = "minibench"
@@ -332,6 +379,8 @@ def run_main(
             bot.research_health.record("fake-search", "RuntimeError" if failed else None)
             if q.page_url in fail_urls:
                 results.append(RuntimeError("boom"))
+            elif q.page_url in limit_urls:
+                results.append(ExceptionGroup("question failed", [RuntimeError(SPEND_LIMIT_ERROR)]))
             elif q.page_url in deferred_urls:
                 results.append(research_deferral(q.page_url))
             else:
@@ -357,6 +406,8 @@ def run_main(
         budget.key_status,
         spend.generation_record,
         sys.argv,
+        alerts.raise_alert,
+        main.own_key_check,
     )
     summary_path = Path(tempfile.mkdtemp()) / "summary.md"
     exit_message = None
@@ -367,6 +418,8 @@ def run_main(
         main.print_run_summary_banner = lambda *a, **k: None
         budget.key_status = fake_status
         spend.generation_record = fake_generation
+        alerts.raise_alert = fake_alert
+        main.own_key_check = fake_key_check
         sys.argv = ["main.py", "--mode", mode]
         with env(METACULUS_TOKEN="x", GITHUB_STEP_SUMMARY=str(summary_path), **env_values):
             try:
@@ -382,6 +435,8 @@ def run_main(
             budget.key_status,
             spend.generation_record,
             sys.argv,
+            alerts.raise_alert,
+            main.own_key_check,
         ) = saved
     summary = summary_path.read_text(encoding="utf-8") if summary_path.exists() else ""
     return calls, summary, exit_message, len(reads)
@@ -556,6 +611,188 @@ def check_run_loop() -> None:
         assert exited and next(iter(bad)) in exited, exited
     assert LOOKUPS == [], LOOKUPS  # every response carried its cost: nothing looked up
     print("run loop: ok")
+
+
+def check_own_key() -> None:
+    """Rob's own Anthropic key takes over under the floor (his choice of 2026-10-11)."""
+    fe_id = main.FALL_2026_FUTUREEVAL_ID
+    opus_own = "anthropic/claude-opus-5-5"
+    questions = {
+        fe_id: [open_question(1, 2), open_question(2, 1)],
+        "minibench": [open_question(4, 50)],
+    }
+    keys = dict(OPENROUTER_API_KEY="sk-fake", ANTHROPIC_API_KEY="x")
+
+    # under the floor with the key set: opus-3 on Rob's key for both tournaments, checked
+    # once, uncapped by the credits; the run page says whose money paid
+    calls, summary, exited, reads = run_main("tournament", 1.5, questions, **keys)
+    assert exited is None and reads == 1, (exited, reads)
+    assert calls == [(opus_own, 3, ["2", "1"], True), (opus_own, 3, ["4"], True)], calls
+    assert LAST["key_checks"] == 1, LAST
+    assert "### Your Anthropic key" in summary and "OpenRouter credits" not in summary, summary
+    assert "Metaculus's credits: $1.50 left. Spent on your key this run: $0.75." in summary
+    assert "(Metaculus's credits are under the $2 floor)" in summary, summary
+    assert "| FutureEval | opus-3 | 2 | 0 | $0.50 | $0.25 |" in summary, summary
+    assert "- Research sources: anthropic/claude-sonnet-5 + web search." in summary, summary
+    assert LAST["alerts"] == ["Metaculus's credits ran out (of the $100 limit)"], LAST
+    assert "- Opened an issue to tell Rob about the credits." in summary, summary
+
+    # the key's workspace at its spend limit: nothing forecast, the run green, one alert
+    calls, summary, exited, _ = run_main("tournament", 1.5, questions, key_check="limit", **keys)
+    assert calls == [] and exited is None, (calls, exited)
+    assert LAST["key_checks"] == 1, LAST  # checked once, not once per tournament
+    assert (
+        "- FutureEval (`33121`): 2 open, 2 not yet forecast, 0 taken this run"
+        " (paused: your Anthropic key reached its spend limit)." in summary
+    ), summary
+    assert any("reached its spend limit" in t for t in LAST["alerts"]), LAST
+
+    # a rejected key: the same, with its own alert
+    calls, summary, exited, _ = run_main(
+        "tournament", 1.5, questions, key_check="rejected: AuthenticationError", **keys
+    )
+    assert calls == [] and exited is None, (calls, exited)
+    assert "(paused: Anthropic rejected your key (AuthenticationError))." in summary, summary
+    assert any("Anthropic rejected the bot's key" in t for t in LAST["alerts"]), LAST
+
+    # nothing new to forecast: the key isn't checked at all
+    idle = {"minibench": [open_question(9, 5, forecasted=True)]}
+    calls, _, _, _ = run_main("tournament", 1.5, idle, **keys)
+    assert calls == [] and LAST["key_checks"] == 0, (calls, LAST)
+
+    # no key set: paused under the floor, and the alert says so
+    calls, summary, _, _ = run_main("tournament", 1.5, questions, OPENROUTER_API_KEY="sk-fake")
+    assert calls == [] and LAST["key_checks"] == 0, (calls, LAST)
+    assert "(paused)." in summary and "### Metaculus's OpenRouter credits" in summary, summary
+
+    # BUDGET_TIER=pause stops Rob's key too
+    calls, _, _, _ = run_main("tournament", 1.5, questions, BUDGET_TIER="pause", **keys)
+    assert calls == [] and LAST["key_checks"] == 0, (calls, LAST)
+
+    # low but above the floor: still on the credits, one alert
+    calls, _, _, _ = run_main("tournament", 10.0, questions, **keys)
+    assert calls and all(c[0].startswith("openrouter/") for c in calls), calls
+    assert LAST["alerts"] == ["Metaculus's credits are below $15 (of the $100 limit)"], LAST
+    calls, _, _, _ = run_main("tournament", 100.0, questions, **keys)
+    assert LAST["alerts"] == [], LAST
+
+    # the spend limit reached mid-run: those questions don't turn the run red, others do
+    calls, summary, exited, _ = run_main(
+        "tournament", 1.5, questions, limit_urls=("https://example.invalid/q/4",), **keys
+    )
+    assert exited is None, exited
+    assert "- 1 question(s) not forecast: your Anthropic key reached its spend limit." in summary
+    assert any("reached its spend limit" in t for t in LAST["alerts"]), LAST
+    _, _, exited, _ = run_main(
+        "tournament", 1.5, questions,
+        limit_urls=("https://example.invalid/q/4",), fail_urls=("https://example.invalid/q/1",),
+        **keys,
+    )
+    assert exited and exited.startswith("1 question(s) failed"), exited
+
+    # PAY_WITH=own-key (the Test Bot's input) makes Rob's key pay while credits last
+    testing = {"bot-testing-area": [open_question(1, 5), open_question(3, 5, "mc")]}
+    calls, summary, _, _ = run_main("test_questions", 80.0, testing, PAY_WITH="own-key", **keys)
+    assert calls == [(opus_own, 3, ["1", "3"], False)], calls
+    assert "(PAY_WITH=own-key)" in summary, summary
+    # ... and stops the run before anything is read without a key, or when mistyped
+    for bad, needle in (
+        (dict(PAY_WITH="own-key", OPENROUTER_API_KEY="sk-fake"), "ANTHROPIC_API_KEY"),
+        (dict(PAY_WITH="own_key", **keys), "PAY_WITH"),
+    ):
+        calls, summary, exited, reads = run_main("test_questions", 80.0, testing, **bad)
+        assert calls == [] and reads == 0 and summary == "", (calls, reads, summary)
+        assert exited and needle in exited, exited
+
+    # Anthropic's spend-limit errors, found inside forecasting-tools' error groups
+    assert main.spend_limit_reached(RuntimeError(SPEND_LIMIT_ERROR))
+    assert main.spend_limit_reached(
+        ExceptionGroup("q", [ExceptionGroup("r", [RuntimeError("enforced_spend_limit_reached")])])
+    )
+    assert main.spend_limit_reached(RuntimeError("Your credit balance is too low to access"))
+    assert not main.spend_limit_reached(RuntimeError("rate_limit_error: retry after 20s"))
+    assert not main.spend_limit_reached(research_deferral("https://example.invalid/q/1"))
+
+    plan = budget.own_key_plan(None, "why")
+    assert plan.futureeval == plan.minibench == budget.TIERS["opus-3"] and plan.remaining is None
+    assert budget.own_key_plan(budget.TIERS["sonnet-3"], "why").minibench.name == "sonnet-3"
+    assert budget.under_floor(1.99) and not budget.under_floor(2.0)
+    assert not budget.under_floor(None)
+    print("own key: ok")
+
+
+def check_alerts() -> None:
+    """One issue per alert title, mentioning the owner; nothing leaks into the log."""
+    secret = "ghs_FAKE-never-logged"
+    issues: list[dict] = [{"title": "Already said"}]
+    sent: list[tuple] = []
+
+    class FakeResponse:
+        def __init__(self, payload):
+            self.payload = payload
+
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return self.payload
+
+    def fake_get(url, headers, params, timeout):
+        sent.append(("GET", url, params))
+        assert headers["Authorization"] == f"Bearer {secret}"
+        return FakeResponse(issues)
+
+    def fake_post(url, headers, json, timeout):
+        sent.append(("POST", url, json))
+        return FakeResponse({})
+
+    def failing_get(url, headers, params, timeout):
+        raise RuntimeError(f"connection refused while sending {headers}")
+
+    real_get, real_post = alerts.requests.get, alerts.requests.post
+    records: list[logging.LogRecord] = []
+    handler = logging.Handler()
+    handler.emit = records.append  # type: ignore[method-assign]
+    alerts.logger.addHandler(handler)
+    try:
+        alerts.requests.get, alerts.requests.post = fake_get, fake_post  # type: ignore[assignment]
+        with env():  # outside the workflow: only logged
+            assert alerts.raise_alert("Title", "Body") is False and sent == []
+        repo = dict(GITHUB_TOKEN=secret, GITHUB_REPOSITORY="o/r", GITHUB_REPOSITORY_OWNER="o")
+        with env(**repo):
+            assert alerts.raise_alert("Already said", "Body") is False
+            assert [s[0] for s in sent] == ["GET"], sent
+            assert sent[0][1] == "https://api.github.com/repos/o/r/issues"
+            assert sent[0][2]["state"] == "all"  # a closed issue still counts as said
+            sent.clear()
+            assert alerts.raise_alert("New", "Body") is True
+            assert sent[1] == (
+                "POST", "https://api.github.com/repos/o/r/issues", {"title": "New", "body": "@o Body"}
+            ), sent
+            alerts.requests.get = failing_get  # type: ignore[assignment]
+            assert alerts.raise_alert("New", "Body") is False
+    finally:
+        alerts.requests.get, alerts.requests.post = real_get, real_post  # type: ignore[assignment]
+        alerts.logger.removeHandler(handler)
+    assert records and all(secret not in r.getMessage() for r in records)
+
+    # titles change only with what makes the event new: the limit, or the month
+    titles: list[str] = []
+    real = alerts.raise_alert
+    alerts.raise_alert = lambda title, body, timeout=15: titles.append(title) or True  # type: ignore[assignment]
+    try:
+        alerts.credits_low(14.2, 100.0, own_key=True)
+        alerts.credits_low(9.0, 100.0, own_key=False)
+        alerts.credits_low(14.2, 250.0, own_key=True)
+        alerts.credits_out(1.5, None, own_key=True)
+        alerts.own_key_limit()
+    finally:
+        alerts.raise_alert = real  # type: ignore[assignment]
+    assert titles[0] == titles[1] == "Metaculus's credits are below $15 (of the $100 limit)"
+    assert titles[2] == "Metaculus's credits are below $15 (of the $250 limit)"
+    assert titles[3] == "Metaculus's credits ran out"
+    assert titles[4].startswith("Your Anthropic key reached its spend limit (20"), titles
+    print("alerts: ok")
 
 
 def binary_question() -> BinaryQuestion:
@@ -1305,6 +1542,8 @@ if __name__ == "__main__":
     check_plan()
     check_key_status()
     check_run_loop()
+    check_own_key()
+    check_alerts()
     check_aggregation()
     check_research_survives_one_failure()
     check_prompts()

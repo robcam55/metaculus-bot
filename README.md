@@ -8,16 +8,25 @@ questions a season against professional forecasters, with no money at risk.
 
 ## What's different from the template
 
-The changes are in `main.py` (`RcForecastBot`), `budget.py` and `spend.py`:
+The changes are in `main.py` (`RcForecastBot`), `budget.py`, `spend.py` and `alerts.py`:
 - **Claude models, on Metaculus's credits first.**
   - Metaculus's donated OpenRouter credits (`OPENROUTER_API_KEY`) pay before a personal
     `ANTHROPIC_API_KEY`.
   - They never pay for the Metaculus Cup, because Metaculus gives them for FutureEval and
     MiniBench only.
-  - On the credits, the pacing tier below picks Opus 5.5 or Sonnet 5. A personal key runs
-    Sonnet 5.
+  - On the credits, the pacing tier below picks Opus 5.5 or Sonnet 5. The Cup's personal
+    key runs Sonnet 5.
+  - **Your own key takes over when the credits run out.** Once they are under the $2
+    floor, and if `ANTHROPIC_API_KEY` is set, FutureEval and MiniBench run on your key at
+    `opus-3` (or the tier `BUDGET_TIER` pins), with the same research. The cap is the
+    monthly spend limit on the key's workspace in the Claude Console, which Anthropic
+    enforces; at the limit the bot pauses quietly until the 1st. Each run checks the key
+    with one tiny request before it spends anything else on it. A Metaculus top-up moves
+    the bot back onto the credits at the next run.
 
-  Haiku 4.5 parses in both cases. These models reject sampling parameters, so none are sent.
+  Haiku 4.5 parses in every case. These models reject sampling parameters, so none are
+  sent. On Anthropic's own API each reply may run to 16,000 tokens, where litellm's default
+  of 4,096 would leave Opus 5.5 and Sonnet 5, which always think, too little room.
 - **Paced spending (`budget.py`).** Metaculus funds the key in steps:
   - about $100 to start;
   - more automatically after above-average MiniBench results;
@@ -43,8 +52,12 @@ The changes are in `main.py` (`RcForecastBot`), `budget.py` and `spend.py`:
     about $17), both tournaments drop to `sonnet-1`, so the last of the credit covers more
     questions. Research is most of a question's cost, so this stretches it by only about a
     quarter.
-  - **Never runs dry.** Below $2 the bot pauses, and one run never forecasts more
-    questions than the balance covers, so credit can't run out halfway through a question.
+  - **A pin skips the ladder.** `BUDGET_TIER` pins one tier for both tournaments, and
+    then neither the ladder nor the last week applies; the floor still does. It has
+    pinned `opus-3` since 2026-10-07.
+  - **Never runs dry.** Below $2 the credits stop: your own key takes over if it is set,
+    and otherwise the bot pauses. One run never forecasts more questions than the balance
+    covers, so credit can't run out halfway through a question.
   - **Top-ups apply at once.** When Metaculus raises the key, the next run sees it.
   - **Measured spend.** Each run's page on GitHub shows the balance, what each tier cost
     per question, and a table per tournament of what each question cost: each research
@@ -58,13 +71,18 @@ The changes are in `main.py` (`RcForecastBot`), `budget.py` and `spend.py`:
       the balance. Then litellm dropped OpenRouter's models from the list, and every run
       page read $0.00. Pacing works from the balance, so it wasn't affected.
     - Recalibrate the estimates in `budget.py` from these numbers.
+  - **Alerts as GitHub issues.** The bot opens an issue, which emails the repository's
+    owner, the first time the credits fall below $15, when they run out, and when your own
+    key hits its spend limit or is rejected. Each event opens one issue, never again for
+    the same credit limit (or month, for your key), so there's no stream of red runs.
 - **Two independent research sources per research report.**
   - AskNews news search: by default one latest-news call per question, to fit the free
     tier's 1,000 calls a month. The template's version uses six. `ASKNEWS_STRATEGY` and
     `ASKNEWS_ARTICLES` change this without a code change.
   - A search-backed model: Sonnet 5 with OpenRouter's `:online` (Anthropic's own web search,
-    which Metaculus's credits cover), or Perplexity with your own key. Its prompt carries
-    the question's background.
+    which Metaculus's credits cover). On your own key, Sonnet 5 calls Anthropic's web
+    search tool directly, up to five searches a question. Or Perplexity, with its own key.
+    Its prompt carries the question's background.
 
   Every prompt, the search-backed model's and the forecasters', carries today's date and
   the question's close and resolution times.
@@ -89,10 +107,10 @@ The changes are in `main.py` (`RcForecastBot`), `budget.py` and `spend.py`:
   `# SUMMARY`, `# RESEARCH` and `# FORECASTS` sections that `forecasting-tools` and
   `bot-review` find by position. Headings inside research and the research summary are kept
   as bold lines, so they can't add or shift a section.
-- **Several predictions per question** from one research report: three or five on
-  Metaculus's credits (by tier), five on a personal key. With four or more, binary questions
-  use a trimmed mean (dropping the highest and lowest), which beat the median in Halawi et
-  al. (2024). With three they use the package's median.
+- **Several predictions per question** from one research report: three or five by tier,
+  on Metaculus's credits or on your own key after them; five on the Cup. With four or
+  more, binary questions use a trimmed mean (dropping the highest and lowest), which beat
+  the median in Halawi et al. (2024). With three they use the package's median.
 - **An outside-view-first binary prompt.** It asks for a reference class and base rate,
   weights the status quo, and checks explicitly against language models' lean toward
   "Yes".
@@ -126,7 +144,7 @@ Offline checks (no network, no keys): `python tests/check_rc_bot.py`.
    ```
 
    Without it, `ANTHROPIC_API_KEY` (your own key, billed to you) runs the bot unpaced on
-   Sonnet 5.
+   Sonnet 5. With both, your key only takes over when the credits run out (step 9).
 4. **Research (optional but recommended).** Get free AskNews access: make an AskNews account
    with the bot's email, then contact AskNews. Add `ASKNEWS_CLIENT_ID` and `ASKNEWS_SECRET`,
    or `ASKNEWS_API_KEY`.
@@ -140,6 +158,8 @@ Offline checks (no network, no keys): `python tests/check_rc_bot.py`.
    - Check that the forecasts appear on the bot's Metaculus profile.
    - Read the run page's summary for the balance and the measured cost per question,
      split by research, forecasts and parsing.
+   - Setting "Who pays" to `own-key` runs it on your own key instead (step 9).
+     "Questions" sets how many it forecasts (empty: `TEST_QUESTIONS`, or 3).
 6. **Turn it on.** Set the repository variable `BOT_ENABLED` to `true`.
 7. **Start the 20-minute clock.** GitHub's own schedule fires only about five times a day.
    The Worker in `trigger/` starts the workflow every 20 minutes instead.
@@ -167,24 +187,46 @@ Offline checks (no network, no keys): `python tests/check_rc_bot.py`.
    schedule; make a new token and repeat step 3.
 8. **Keep the schedule alive.** GitHub pauses scheduled workflows in a public repo after 60
    days without a commit, and the Fall 2026 season runs to Jan 6. Push any commit at least
-   every 50 days: the next by Nov 16.
+   every 50 days: the next by Dec 1.
+9. **Your own key, for when the credits run out (optional).** The bot moves to it once
+   Metaculus's credits are under $2, and back to the credits when Metaculus tops them up.
+   At this season's volume, about 50 questions a week, it costs roughly $100 to $120 a
+   month on Opus.
+   1. In the Claude Console, create a workspace for the bot (Settings → Workspaces). The
+      default workspace can't take a spend limit.
+   2. Open the new workspace's limits and set a monthly spend limit. That is the cap:
+      Anthropic enforces it, and it resets on the 1st. At the limit the bot pauses
+      quietly and opens one issue.
+   3. Create an API key in that workspace (Settings → API keys), then store it. The command
+      prompts for the value:
+
+      ```bash
+      gh secret set ANTHROPIC_API_KEY --repo robcam55/metaculus-bot
+      ```
+
+   4. Test it: `Actions → Test Bot → Run workflow` with "Who pays" set to `own-key`. It
+      forecasts three bot-testing-area questions on your key, for about $1.50. The run
+      page's "Your Anthropic key" section shows the spend, and the research table should
+      show `anthropic/claude-sonnet-5 + web search` working.
+
+   The Metaculus Cup workflow uses this key too, but only when you run it by hand.
 
 Other optional repository variables (empty means the default):
 
 | Variable | Default |
 |---|---|
-| `BUDGET_TIER` | Empty: paced. `opus-5`, `opus-3`, `sonnet-3` or `sonnet-1` pins that tier for both tournaments. `pause` stops all spending of Metaculus's credits. The $2 floor always applies. |
+| `BUDGET_TIER` | Empty: paced. `opus-5`, `opus-3`, `sonnet-3` or `sonnet-1` pins that tier for both tournaments, on the credits and on your own key after them. `pause` stops all spending, your key's included. The $2 floor always applies. |
 | `TEST_QUESTIONS` | 3 (Test Bot only) |
 | `AIB_TOURNAMENT_ID` | `33121`, the Fall 2026 FutureEval |
 | `MINIBENCH_ID` | The package's current MiniBench (`minibench`) |
 | `METACULUS_CUP_ID` | `33108`, the Fall 2026 Cup (personal key only) |
 | `PARSER_MODEL` | Claude Haiku 4.5 through the same route |
 | `SEARCH_MODEL` | `openrouter/anthropic/claude-sonnet-5:online` (OpenRouter route only) |
-| `FORECASTER_MODEL` | `anthropic/claude-sonnet-5` (personal key only; on Metaculus's credits the tier picks) |
-| `PREDICTIONS_PER_REPORT` | 5 (personal key only) |
+| `FORECASTER_MODEL` | `anthropic/claude-sonnet-5` (Metaculus Cup only; on the credits, and on your own key after them, the tier picks) |
+| `PREDICTIONS_PER_REPORT` | 5 (Metaculus Cup only) |
 | `ASKNEWS_STRATEGY` | `latest`: one latest-news search per question, covering the past day or two. `archive` searches the AskNews archive (about two months) instead; `both` does both, 12 seconds apart. Archive searches may count as several calls against AskNews's quota: confirm with AskNews first. |
 | `ASKNEWS_ARTICLES` | 8 articles per AskNews search |
-| `RESEARCH_REPORTS` | 1 (personal key only). Setting it to 2 with `PREDICTIONS_PER_REPORT=3` gives six predictions over two independent searches, for about 35–45% more cost. |
+| `RESEARCH_REPORTS` | 1 (Metaculus Cup only). Setting it to 2 with `PREDICTIONS_PER_REPORT=3` gives six predictions over two independent searches, for about 35–45% more cost. |
 
 ## Why it's built this way
 
@@ -201,7 +243,7 @@ The main architectural choices and the reasons behind them. Each links to where 
   - **Why off by default.** Scheduled runs, and runs the Worker starts, stay off until `BOT_ENABLED`, so they can't fail every 20 minutes before the secrets exist.
 
   — [rc_trader's 2026-09-23 audit](https://github.com/robcam55/rc_trader/blob/main/docs/audit/2026-09-23-AUDIT.md) (§8, Rob's hosting choice, 2026-09-23). The Cloudflare clock is Rob's choice of 2026-10-02, built in [#3](https://github.com/robcam55/metaculus-bot/pull/3). The question windows are from [Metaculus's resources page](https://www.metaculus.com/notebooks/38928/ai-benchmark-resources/), and the `BOT_ENABLED` gate from [the workflow](.github/workflows/run_bot_on_tournament.yaml). No storage is *inferred*.
-- **Claude models: Opus 5.5 on Metaculus's credits, Sonnet 5 on a personal key.** The bot is the external check on rc_trader's forecasting engine, which runs on Claude, and Metaculus's credits cover Anthropic models. — [rc_trader's 2026-09-23 audit](https://github.com/robcam55/rc_trader/blob/main/docs/audit/2026-09-23-AUDIT.md) (§8, D-14: "upgrade it as the §4 engine lands"). The switch to Opus 5.5 was Claude's, in [f4dfc32](https://github.com/robcam55/metaculus-bot/commit/f4dfc32), and Rob's credit application of 2026-09-24 described it.
+- **Claude models: Opus 5.5 on Metaculus's credits and on Rob's key after them, Sonnet 5 on the Cup's personal key.** The bot is the external check on rc_trader's forecasting engine, which runs on Claude, and Metaculus's credits cover Anthropic models. — [rc_trader's 2026-09-23 audit](https://github.com/robcam55/rc_trader/blob/main/docs/audit/2026-09-23-AUDIT.md) (§8, D-14: "upgrade it as the §4 engine lands"). The switch to Opus 5.5 was Claude's, in [f4dfc32](https://github.com/robcam55/metaculus-bot/commit/f4dfc32), and Rob's credit application of 2026-09-24 described it.
 - **Metaculus's credits pay first, and never for the Metaculus Cup.**
   - **Cup on a personal key.** Metaculus gives the credits for FutureEval and MiniBench only, so the Cup, and any experiment run there, needs a personal key.
   - **Credits before a personal key.** The personal key was meant as a stopgap until the credits arrived, so when both are set the credits win.
@@ -212,15 +254,25 @@ The main architectural choices and the reasons behind them. Each links to where 
   - **The rule.** Each run buys the richest tier the balance covers for four weeks of expected volume, with MiniBench (which decides the funding) never below FutureEval.
   - **The promise it keeps.** The credit application promised a fallback to Sonnet 5 if credits ran short; pacing makes that fallback automatic.
   - **Awaiting Rob's ratification.** The tiers, the four-week horizon and MiniBench's priority are Claude's proposal.
-  - **Estimates kept below measured costs.** On 2026-10-05 MiniBench questions cost $0.68 at `opus-5` and $0.45 at `opus-3` (40 questions, by the settled balance), against estimates of $0.40 and $0.30, so the pacer holds richer tiers than four weeks of credit would buy. Rob chose on 2026-10-06 to keep the estimates and tiers: he expects Metaculus to add credit after the early MiniBench results, and would fund the bot himself otherwise. In place of lowering the tiers sooner, the last week of credit runs at `sonnet-1`.
+  - **Estimates kept below measured costs.** On 2026-10-05 MiniBench questions cost $0.68 at `opus-5` and $0.45 at `opus-3` (40 questions, by the settled balance), against estimates of $0.40 and $0.30, so the pacer holds richer tiers than four weeks of credit would buy. Rob chose on 2026-10-06 to keep the estimates and tiers: he expects Metaculus to add credit after the early MiniBench results, and would fund the bot himself otherwise. In place of lowering the tiers sooner, the last week of credit runs at `sonnet-1` when no tier is pinned.
+  - **Pinned to Opus since 2026-10-07 (D-21).** `BUDGET_TIER=opus-3` holds both tournaments on three Opus 5.5 forecasts. Web search is about 70% of a question's cost, so Sonnet 5 would save only $0.03 to $0.06 a question, and MiniBench decides the top-ups. While pinned, neither the ladder nor the `sonnet-1` last week applies; the $2 floor does.
 
-  — Metaculus's funding email to Rob (2026-09-27, not public); proposed in [#1](https://github.com/robcam55/metaculus-bot/pull/1), not yet ratified
+  — Metaculus's funding email to Rob (2026-09-27, not public); proposed in [#1](https://github.com/robcam55/metaculus-bot/pull/1), not yet ratified. The pin is [rc_trader's D-21](https://github.com/robcam55/rc_trader/blob/main/docs/audit/2026-10-06-DECISIONS.md), approved by Rob on 2026-10-06 and set by him on 2026-10-07.
 - **Spend measured call by call, from OpenRouter's own figures (`spend.py`).**
   - **Why not the package's cost tracking.** `forecasting-tools` prices each response from litellm's price list. That list never carried web-search fees, so it ran about 12% below the balance, and on 2026-10-09 it dropped OpenRouter's models: every run page since read $0.00 while the balance kept falling.
   - **Why both of OpenRouter's figures.** OpenRouter's billed `cost` read $0.00 on all 99 calls the logs show it for (2026-10-05 to 10-09), while the balance kept falling, so Metaculus's credits look like bring-your-own-key: the provider bills the call and OpenRouter adds its fee. A call's cost is both together. That reading is *inferred* from the logs; each run page counts which figure every call's cost came from, so the first runs confirm or refute it.
   - **Why per question and part of the work.** Research, forecasts and parsing cost very different amounts, and the decisions on tiers and research sources turn on the split.
 
   — Rob's go-ahead of 2026-10-12 for measurement only, built in [#7](https://github.com/robcam55/metaculus-bot/pull/7)
+- **Rob's own Anthropic key after the credits, capped by a workspace spend limit.**
+  - **Why.** At the measured costs Metaculus's first $100 runs out around the end of October, and the season runs to Jan 6. Without more credit the bot would sit dark for about nine weeks. On 2026-10-06 Rob said he would fund the bot himself if Metaculus didn't.
+  - **How.** Once the credits are under the $2 floor and `ANTHROPIC_API_KEY` is set, both tournaments run on Rob's key at the pinned tier (`opus-3` without a pin), with the same two research sources: Sonnet 5 calls Anthropic's web search tool where the credits use OpenRouter's `:online`. A top-up moves the bot back onto the credits at the next run.
+  - **The cap lives at Anthropic.** A plain key can't read what its workspace has spent, and the bot keeps no storage, so the cap is the workspace's monthly spend limit in the Claude Console. Anthropic enforces it, and it can't drift the way a count the bot kept itself could. One tiny request before the first question of a run tells a key at its limit, or a rejected one, from a working one. The bot then pauses quietly and opens one issue, without spending AskNews calls or research.
+
+  — Rob's choice of option (b) in chat on 2026-10-11, after Claude's status review that day. The design (the tier, Anthropic's web search, the cap as a workspace spend limit, the key check) is Claude's, in [#6](https://github.com/robcam55/metaculus-bot/pull/6); not otherwise ratified.
+- **Alerts as GitHub issues, one per event.** The bot runs every 20 minutes, so a run that fails to get attention would email Rob every 20 minutes until fixed. Instead `alerts.py` opens one issue, mentioning the owner, the first time the credits fall below $15, when they run out, and when Rob's key hits its spend limit or is rejected. An issue with the same title, open or closed, stops a repeat. Titles carry the credit limit, or the month for Rob's key, so a new limit or month alerts again. The workflow's token gets `issues: write` for this and nothing more.
+
+  — Rob approved a low-credit warning in chat on 2026-10-11. Claude proposed failing the run; the issue form replaced that on finding the email stream it would cause, in [#6](https://github.com/robcam55/metaculus-bot/pull/6); not otherwise ratified.
 - **Two independent research sources, several forecasts, a trimmed mean.**
   - **Two sources.** Search luck drove most of the night-to-night noise in rc_trader's own forecasts. So each question gets AskNews latest news and Sonnet 5 with native web search, and if one source fails, the other still feeds the forecast.
   - **One AskNews call by default.** AskNews's free tier allows 1,000 calls a month, so it gets one latest-news call per question. `ASKNEWS_STRATEGY` and `ASKNEWS_ARTICLES` raise that without a code change once AskNews confirms its quota.

@@ -27,6 +27,8 @@ KEY_URL = "https://openrouter.ai/api/v1/key"
 
 OPUS = "openrouter/anthropic/claude-opus-5.5"
 SONNET = "openrouter/anthropic/claude-sonnet-5"
+# The same models on Rob's own Anthropic key, in litellm's ids for Anthropic's API
+ANTHROPIC_IDS = {OPUS: "anthropic/claude-opus-5-5", SONNET: "anthropic/claude-sonnet-5"}
 
 
 @dataclass(frozen=True)
@@ -78,6 +80,12 @@ FLOOR = 2.0
 # floor stops the bot. Rob's choice of 2026-10-06, in place of lowering the tiers sooner.
 LAST_RESORT = "sonnet-1"
 LAST_RESORT_WEEKS = 1
+# Below this the bot opens a GitHub issue (one email) saying the credits are nearly gone.
+# About four days of questions at the measured costs (2026-10-11).
+LOW_CREDIT = 15.0
+# Rob's own key, once the credits are under the floor (Rob's choice of 2026-10-11), runs
+# this tier unless BUDGET_TIER pins another: Opus, as D-21 keeps the credits on Opus.
+OWN_KEY_TIER = "opus-3"
 
 
 @dataclass(frozen=True)
@@ -117,6 +125,24 @@ def pinned_tier() -> Tier | None:
     if name not in TIERS:
         raise SystemExit(f"BUDGET_TIER must be one of {', '.join(TIERS)}; got {name!r}")
     return TIERS[name]
+
+
+def on_route(model: str, route: str | None) -> str:
+    """A tier's model as the route names it: the tiers use OpenRouter's ids."""
+    return ANTHROPIC_IDS.get(model, model) if route == "anthropic" else model
+
+
+def under_floor(remaining: float | None) -> bool:
+    return remaining is not None and remaining < FLOOR
+
+
+def own_key_plan(pinned: Tier | None, note: str) -> Plan:
+    """Both tournaments' tier on Rob's own Anthropic key: the pinned tier, so
+    BUDGET_TIER=pause stops this too, or OWN_KEY_TIER. A plain Anthropic key can't read
+    what its workspace has spent, so nothing here paces it: the workspace's monthly spend
+    limit, set in the Claude Console, is the cap."""
+    tier = pinned or TIERS[OWN_KEY_TIER]
+    return Plan(tier, tier, None, note)
 
 
 def horizon_cost(futureeval: Tier, minibench: Tier, weeks: float = HORIZON_WEEKS) -> float:
@@ -210,14 +236,42 @@ class SpendMeter:
             f"- Tiers: FutureEval {plan.futureeval.name}, MiniBench {plan.minibench.name}"
             f" ({plan.note}).",
         ]
-        if self.rows:
-            lines += [
-                "",
-                "| Pass | Tier | Questions | Failed | Spent | Per question |",
-                "|---|---|---|---|---|---|",
-                *self.rows,
-            ]
-        return lines
+        return lines + self.table()
+
+    def table(self) -> list[str]:
+        if not self.rows:
+            return []
+        return [
+            "",
+            "| Pass | Tier | Questions | Failed | Spent | Per question |",
+            "|---|---|---|---|---|---|",
+            *self.rows,
+        ]
+
+
+class OwnKeyMeter(SpendMeter):
+    """What each pass spent on Rob's own Anthropic key, as litellm prices Anthropic's
+    responses (its price list covers the web searches too). A plain key can't read its
+    workspace's spend, so there is no balance here: the workspace's monthly spend limit,
+    set in the Claude Console, is the cap, and Anthropic enforces it."""
+
+    def __init__(self, credits: dict[str, Any] | None) -> None:
+        self.start = None  # no balance: remaining() is unknown, so runs aren't capped by it
+        self.credits = credits  # the OpenRouter key's status, for the run page
+        self.spent = 0.0
+        self.rows = []
+
+    def summary(self, plan: Plan) -> list[str]:
+        lines = [
+            "### Your Anthropic key",
+            "",
+            f"- Metaculus's credits: {dollars(remaining_of(self.credits))} left."
+            f" Spent on your key this run: {dollars(self.spent)}. Its cap is the monthly"
+            " spend limit on its workspace in the Claude Console.",
+            f"- Tiers: FutureEval {plan.futureeval.name}, MiniBench {plan.minibench.name}"
+            f" ({plan.note}).",
+        ]
+        return lines + self.table()
 
 
 def write_step_summary(lines: list[str]) -> None:
