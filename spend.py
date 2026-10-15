@@ -53,7 +53,7 @@ BASES = {
     "upstream": "provider's bill only",
     "lookup": "looked up from OpenRouter afterwards",
     "list price": "estimated at OpenRouter's list prices",
-    "litellm": "litellm's token prices plus Anthropic's search fees",
+    "litellm": "litellm's prices (on Anthropic's API: tokens plus $0.01 a search)",
 }
 
 # Anthropic's fee for a web search on its own API: $10 per 1,000
@@ -216,7 +216,10 @@ def _litellm_estimate(response: Any, model: str, searches: int) -> float | None:
     usage = getattr(response, "usage", None)
     prompt = int(_number(_field(usage, "prompt_tokens")) or 0)
     completion = int(_number(_field(usage, "completion_tokens")) or 0)
-    if prompt or completion:
+    # Only Anthropic's own models: another provider's search fees and extras (Perplexity's,
+    # say) are litellm's own business, in its figure for the response below
+    anthropic = model.startswith(("anthropic/", "claude-"))
+    if anthropic and (prompt or completion):
         try:
             import litellm
 

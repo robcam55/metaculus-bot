@@ -70,6 +70,8 @@ def env(**values: str):
 with env():
     import alerts  # noqa: E402
     import budget  # noqa: E402
+
+    budget.KEY_RETRY_WAIT = 0.0  # the second balance read, without the wait
     import main  # noqa: E402  (import after clearing keys: dotenv must not leak real ones)
     import spend  # noqa: E402
     from forecasting_tools import (  # noqa: E402
@@ -103,6 +105,30 @@ class FakeResponse:
         self.id = generation
         self.usage = FakeUsage(**usage)
         self._hidden_params = {"response_cost": 0.0}
+
+
+@contextmanager
+def fixed_anthropic_prices():
+    """Anthropic's list prices, fixed in litellm's table for the spend checks. litellm
+    downloads its table at import and falls back to a bundled copy, and litellm 1.80.10's
+    copy lacks these models, so a failed download must not fail an unrelated change."""
+    import litellm
+
+    rows = {"claude-opus-5-5": (4e-06, 2e-05), "claude-sonnet-5": (2e-06, 1e-05), "claude-haiku-4-5": (1e-06, 5e-06)}  # fmt: skip
+    saved = {name: litellm.model_cost.get(name) for name in rows}
+    litellm.register_model({
+        name: {"input_cost_per_token": i, "output_cost_per_token": o,
+               "litellm_provider": "anthropic", "mode": "chat"}
+        for name, (i, o) in rows.items()
+    })  # fmt: skip
+    try:
+        yield
+    finally:
+        for name, row in saved.items():
+            if row is None:
+                litellm.model_cost.pop(name, None)
+            else:
+                litellm.model_cost[name] = row
 
 
 def model_of(llm) -> str:
@@ -237,7 +263,10 @@ def check_plan() -> None:
         else:
             raise AssertionError("an unknown BUDGET_TIER must stop the run")
 
-    assert budget.affordable(10, tiers["sonnet-3"]) == 34  # (10 - 2) / 0.23
+    # the run cap prices a question at the measured cost, not the pacing estimate
+    assert budget.affordable(10, tiers["sonnet-3"]) == 14  # (10 - 2) / 0.55
+    assert budget.cap_cost(tiers["opus-3"]) == 0.65 and tiers["opus-3"].cost == 0.30
+    assert budget.affordable(2.64, tiers["opus-3"]) == 0 and budget.affordable(2.66, tiers["opus-3"]) == 1
     assert budget.affordable(1, tiers["sonnet-3"]) == 0
     assert budget.affordable(None, tiers["opus-5"]) is None
     assert budget.affordable(math.inf, tiers["opus-5"]) is None
@@ -496,19 +525,19 @@ def check_run_loop() -> None:
     assert "| Research source |" not in summary  # no searches, no table
 
     # $5, less than a week of credit: the last resort (one Sonnet forecast a question),
-    # and only what the balance pays for above the $2 floor
+    # and only what the balance pays for above the $2 floor at $0.50 a question
     many = {"minibench": [open_question(n, 100 - n) for n in range(10, 40)]}
     calls, summary, exited, _ = run_main("tournament", 5.0, many, OPENROUTER_API_KEY="sk-fake")
     assert exited is None
     assert (
-        "- MiniBench (`minibench`): 30 open, 30 not yet forecast, 16 taken this run"
+        "- MiniBench (`minibench`): 30 open, 30 not yet forecast, 6 taken this run"
         " (run size or credit; later runs take the rest)." in summary
     ), summary
     assert len(calls) == 1 and calls[0][:2] == (sonnet, 1), calls
-    assert calls[0][2] == [str(n) for n in range(39, 23, -1)], calls  # the 16 closing soonest
+    assert calls[0][2] == [str(n) for n in range(39, 33, -1)], calls  # the 6 closing soonest
 
-    # spend earlier in a run shrinks the next pass's cap: $6 pays for 22 sonnet-1
-    # questions above the floor; FutureEval's 5 at $0.50 leave $3.50, room for 8 more
+    # spend earlier in a run shrinks the next pass's cap: $6 pays for 8 sonnet-1
+    # questions above the floor; FutureEval's 5 at $0.50 leave $3.50, room for 3 more
     split = {
         fe_id: [open_question(n, n) for n in range(1, 6)],
         "minibench": [open_question(n, n) for n in range(100, 130)],
@@ -516,7 +545,7 @@ def check_run_loop() -> None:
     calls, _, _, _ = run_main(
         "tournament", 6.0, split, cost_each=0.5, OPENROUTER_API_KEY="sk-fake"
     )
-    assert [len(c[2]) for c in calls] == [5, 8], calls
+    assert [len(c[2]) for c in calls] == [5, 3], calls
 
     # under the floor: nothing runs
     calls, summary, _, _ = run_main("tournament", 1.5, questions, OPENROUTER_API_KEY="sk-fake")
@@ -534,8 +563,10 @@ def check_run_loop() -> None:
         (opus, 5, main.MAX_QUESTIONS_PER_RUN - 20),
     ], calls
 
-    # an unreadable balance: cheapest tiers, no credit cap; the spend is still measured
-    calls, summary, _, _ = run_main("tournament", None, questions, OPENROUTER_API_KEY="sk-fake")
+    # an unreadable balance, tried twice: cheapest tiers, no credit cap; the spend is
+    # still measured
+    calls, summary, _, reads = run_main("tournament", None, questions, OPENROUTER_API_KEY="sk-fake")
+    assert reads == 2, reads
     assert [c[:2] for c in calls] == [(sonnet, 3), (sonnet, 3)], calls
     assert "start of this run: unknown. Spent: $1.00. Left now: unknown." in summary, summary
 
@@ -733,10 +764,13 @@ def check_own_key() -> None:
     assert calls == [] and exited is None, (calls, exited)
     assert "(paused)." in summary and "later runs take the rest" not in summary, summary
     assert LAST["alerts"] == ["Metaculus's credits ran out (of the $100 limit)"], LAST
-    # one question's worth above the reserve: still on the credits, capped at one
-    calls, _, _, _ = run_main("tournament", 2.40, questions, BUDGET_TIER="opus-3", **keys)
+    # one question's worth above the reserve ($0.65 at opus-3): still on the credits,
+    # capped at one; $2.40 is already spent
+    calls, _, _, _ = run_main("tournament", 2.70, questions, BUDGET_TIER="opus-3", **keys)
     assert [(c[0], len(c[2])) for c in calls] == [(budget.OPUS, 1)], calls
     assert LAST["key_checks"] == 0, LAST
+    calls, _, _, _ = run_main("tournament", 2.40, questions, BUDGET_TIER="opus-3", **keys)
+    assert [c[0] for c in calls] == [opus_own, opus_own], calls
     # BUDGET_TIER=pause in the band is a deliberate stop, not spent credits
     calls, _, _, _ = run_main("tournament", 2.16, questions, BUDGET_TIER="pause", **keys)
     assert calls == [] and LAST["key_checks"] == 0, (calls, LAST)
@@ -1659,5 +1693,6 @@ if __name__ == "__main__":
     check_run_report()
     check_comment_sections()
     check_asknews()
-    check_spend()
+    with fixed_anthropic_prices():
+        check_spend()
     print("all checks passed")

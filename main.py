@@ -1409,8 +1409,9 @@ def credits_spent(credits_left: float | None, plan: budget.Plan) -> str | None:
 
 def own_key_reason(credits_left: float | None, plan: budget.Plan) -> str | None:
     """Why Rob's own Anthropic key pays this run instead of Metaculus's credits, or None.
-    It takes over once the credits can't pay for another question (Rob's choice of
-    2026-10-11), if ANTHROPIC_API_KEY is set; PAY_WITH=own-key asks for it sooner."""
+    His key after the credits is Rob's choice of 2026-10-11; it takes over once they can't
+    pay for another question (budget.exhausted, Claude's rule in #8), if ANTHROPIC_API_KEY
+    is set. PAY_WITH=own-key asks for it sooner."""
     if not os.getenv("ANTHROPIC_API_KEY"):
         return None
     if pay_with() == "own-key":

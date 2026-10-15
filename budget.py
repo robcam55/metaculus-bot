@@ -16,6 +16,7 @@ from __future__ import annotations
 import logging
 import math
 import os
+import time
 from dataclasses import dataclass
 from typing import Any
 
@@ -83,9 +84,25 @@ LAST_RESORT_WEEKS = 1
 # Below this the bot opens a GitHub issue (one email) saying the credits are nearly gone.
 # About four days of questions at the measured costs (2026-10-11).
 LOW_CREDIT = 15.0
-# Rob's own key, once the credits are under the floor (Rob's choice of 2026-10-11), runs
-# this tier unless BUDGET_TIER pins another: Opus, as D-21 keeps the credits on Opus.
+# Rob's own key, once the credits run out (Rob's choice of 2026-10-11), runs this tier
+# unless BUDGET_TIER pins another: Opus, as D-21 keeps the credits on Opus.
 OWN_KEY_TIER = "opus-3"
+# What one question really costs, for the cap on how many questions a run takes, kept
+# apart from the pacing estimates above (Rob chose on 2026-10-06 to keep those, so the
+# pacer holds richer tiers). Measured 2026-10-12 to 10-15 at opus-3 (15 questions): $0.58
+# on average, $0.41 of it research, $0.05 an Opus forecast, $0.02 parsing; a Sonnet 5
+# forecast costs about half an Opus one. Capping at the pacing estimate ($0.30) let a big
+# burst plan about twice what lies above the floor, so OpenRouter could refuse the key
+# halfway through a question.
+CAP_COSTS = {"opus-5": 0.75, "opus-3": 0.65, "sonnet-3": 0.55, "sonnet-1": 0.50}
+# A balance read that fails is tried once more after this many seconds before the run
+# goes ahead on an unknown balance
+KEY_RETRY_WAIT = 5.0
+
+
+def cap_cost(tier: Tier) -> float:
+    """A question's cost at this tier, for the run cap: measured, never below the estimate."""
+    return max(tier.cost, CAP_COSTS.get(tier.name, tier.cost))
 
 
 @dataclass(frozen=True)
@@ -139,10 +156,11 @@ def under_floor(remaining: float | None) -> bool:
 def exhausted(remaining: float | None, plan: Plan) -> bool:
     """Whether the credits are spent: under the floor, or unable to pay for one more
     question at a tier the plan runs. affordable() lets a run spend only while the
-    balance above the floor covers a question's estimate, so the balance comes to rest
-    between the floor and the floor plus one estimate ($2.00 to $2.30 at opus-3) and stays
-    there. Checking the floor alone left the bot idle in that band, on neither key, until
-    a top-up. A plan that pauses on purpose (BUDGET_TIER=pause) is not exhausted."""
+    balance above the floor covers a question (cap_cost), so a balance can come to rest
+    between the floor and the floor plus one question ($2.00 to $2.65 at opus-3) and stay
+    there; at measured costs the last run usually ends a little under the floor instead.
+    Checking the floor alone would leave the bot idle in that band, on neither key, until a
+    top-up. A plan that pauses on purpose (BUDGET_TIER=pause) is not exhausted."""
     if under_floor(remaining):
         return True
     running = [t for t in (plan.futureeval, plan.minibench) if t.predictions > 0]
@@ -192,12 +210,13 @@ def make_plan(remaining: float | None, pinned: Tier | None = None) -> Plan:
 
 
 def affordable(remaining: float | None, tier: Tier) -> int | None:
-    """Questions the balance pays for at this tier above the floor; None means no cap."""
+    """Questions the balance pays for at this tier above the floor, at the measured cost
+    (cap_cost); None means no cap."""
     if tier.predictions == 0:
         return 0
     if remaining is None or math.isinf(remaining):
         return None
-    return max(0, math.floor((remaining - FLOOR) / tier.cost))
+    return max(0, math.floor((remaining - FLOOR) / cap_cost(tier)))
 
 
 def dollars(amount: float | None) -> str:
@@ -220,6 +239,11 @@ class SpendMeter:
 
     def __init__(self, api_key: str) -> None:
         self.start = key_status(api_key)
+        if self.start is None:
+            # One more try: an unknown balance runs the cheapest tiers uncapped, which
+            # after the credits run out would send a run back onto an empty key
+            time.sleep(KEY_RETRY_WAIT)
+            self.start = key_status(api_key)
         self.spent = 0.0
         self.rows: list[str] = []
 
