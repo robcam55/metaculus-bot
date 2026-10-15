@@ -78,9 +78,10 @@ def credits_low(left: float, limit: float | None, own_key: bool) -> bool:
     )
     return raise_alert(
         f"Metaculus's credits are below ${budget.LOW_CREDIT:.0f}{_limit(limit)}",
-        f"Metaculus's OpenRouter credits are down to {budget.dollars(left)}. When they fall"
-        f" below the ${budget.FLOOR:.0f} floor, {then}. A top-up from Metaculus shows in the"
-        " next run. This issue opens once per credit limit; close it whenever.",
+        f"Metaculus's OpenRouter credits are down to {budget.dollars(left)}. When they can't"
+        f" pay for another question above the ${budget.FLOOR:.0f} reserve, {then}. A top-up"
+        " from Metaculus shows in the next run. This issue opens once per credit limit;"
+        " close it whenever.",
     )
 
 
@@ -93,18 +94,21 @@ def credits_out(left: float, limit: float | None, own_key: bool) -> bool:
     )
     return raise_alert(
         f"Metaculus's credits ran out{_limit(limit)}",
-        f"Metaculus's OpenRouter credits are under the ${budget.FLOOR:.0f} floor"
-        f" ({budget.dollars(left)} left). {now} A top-up from Metaculus moves the bot back"
-        " onto the credits at the next run.",
+        f"Metaculus's OpenRouter credits ({budget.dollars(left)} left) can't pay for another"
+        f" question above the ${budget.FLOOR:.0f} reserve. {now} A top-up from Metaculus"
+        " moves the bot back onto the credits at the next run.",
     )
 
 
 def own_key_limit() -> bool:
     return raise_alert(
         f"Your Anthropic key reached its spend limit ({_month()})",
-        "Anthropic is refusing the bot's requests because the key's workspace reached its"
-        " monthly spend limit. The bot pauses quietly until the limit resets on the 1st of"
-        " next month, or until you raise it in the Claude Console (Settings, Workspaces).",
+        "Anthropic is refusing the bot's requests on spending grounds. Usually the key's"
+        " workspace reached its monthly spend limit: the bot pauses quietly until the limit"
+        " resets on the 1st of next month, or until you raise it in the Claude Console"
+        " (Settings, Workspaces). If your account is prepaid and out of credit instead, buy"
+        " credit or turn on auto-reload (Settings, Billing); the bot resumes at the next run"
+        " either way.",
     )
 
 

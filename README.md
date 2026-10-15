@@ -16,8 +16,10 @@ The changes are in `main.py` (`RcForecastBot`), `budget.py`, `spend.py` and `ale
     MiniBench only.
   - On the credits, the pacing tier below picks Opus 5.5 or Sonnet 5. The Cup's personal
     key runs Sonnet 5.
-  - **Your own key takes over when the credits run out.** Once they are under the $2
-    floor, and if `ANTHROPIC_API_KEY` is set, FutureEval and MiniBench run on your key at
+  - **Your own key takes over when the credits run out.** Once they can't pay for another
+    question above the $2 reserve (at most $2.65 left at `opus-3`; at measured costs the
+    last credits run usually ends a little under $2), and if `ANTHROPIC_API_KEY` is set,
+    FutureEval and MiniBench run on your key at
     `opus-3` (or the tier `BUDGET_TIER` pins), with the same research. The cap is the
     monthly spend limit on the key's workspace in the Claude Console, which Anthropic
     enforces; at the limit the bot pauses quietly until the 1st. Each run checks the key
@@ -55,9 +57,12 @@ The changes are in `main.py` (`RcForecastBot`), `budget.py`, `spend.py` and `ale
   - **A pin skips the ladder.** `BUDGET_TIER` pins one tier for both tournaments, and
     then neither the ladder nor the last week applies; the floor still does. It has
     pinned `opus-3` since 2026-10-07.
-  - **Never runs dry.** Below $2 the credits stop: your own key takes over if it is set,
-    and otherwise the bot pauses. One run never forecasts more questions than the balance
-    covers, so credit can't run out halfway through a question.
+  - **Never runs dry.** One run takes no more questions than the balance above $2 covers
+    at measured costs ($0.65 a question at `opus-3`, $0.75 at `opus-5`, $0.55 at
+    `sonnet-3`, $0.50 at `sonnet-1`), not at the estimates above, and the $2 reserve
+    absorbs a costly question. When the balance can't pay for one more question at the
+    tier, the credits stop: your own key takes over if it is set, and otherwise the bot
+    pauses and says so. A balance that can't be read is tried once more.
   - **Top-ups apply at once.** When Metaculus raises the key, the next run sees it.
   - **Measured spend.** Each run's page on GitHub shows the balance, what each tier cost
     per question, and a table per tournament of what each question cost: each research
@@ -126,7 +131,10 @@ The changes are in `main.py` (`RcForecastBot`), `budget.py`, `spend.py` and `ale
     round can't outlast the 60-minute timeout. The rest wait 20 minutes for the next run.
   - The Metaculus Cup workflow is manual-only.
 
-Offline checks (no network, no keys): `python tests/check_rc_bot.py`.
+Offline checks (no keys): `python tests/check_rc_bot.py`. They also run on every pull
+request and push to `main`, on the packages `poetry.lock` pins, which the forecasting runs
+install (`.github/workflows/checks.yaml`). A local virtualenv can drift from the lock: a
+newer local litellm once hid a call that crashes on the pinned one.
 
 ## Setup
 
@@ -189,7 +197,8 @@ Offline checks (no network, no keys): `python tests/check_rc_bot.py`.
    days without a commit, and the Fall 2026 season runs to Jan 6. Push any commit at least
    every 50 days: the next by Dec 1.
 9. **Your own key, for when the credits run out (optional).** The bot moves to it once
-   Metaculus's credits are under $2, and back to the credits when Metaculus tops them up.
+   Metaculus's credits can't pay for another question (around $2 left), and back to the
+   credits when Metaculus tops them up.
    At this season's volume, about 50 questions a week, it costs roughly $100 to $120 a
    month on Opus.
    1. In the Claude Console, create a workspace for the bot (Settings → Workspaces). The
@@ -262,14 +271,16 @@ The main architectural choices and the reasons behind them. Each links to where 
   - **Why not the package's cost tracking.** `forecasting-tools` prices each response from litellm's price list. That list never carried web-search fees, so it ran about 12% below the balance, and on 2026-10-09 it dropped OpenRouter's models: every run page since read $0.00 while the balance kept falling.
   - **Why both of OpenRouter's figures.** OpenRouter's billed `cost` read $0.00 on all 99 calls the logs show it for (2026-10-05 to 10-09), while the balance kept falling, so Metaculus's credits look like bring-your-own-key: the provider bills the call and OpenRouter adds its fee. A call's cost is both together. That reading is *inferred* from the logs; each run page counts which figure every call's cost came from, so the first runs confirm or refute it.
   - **Why per question and part of the work.** Research, forecasts and parsing cost very different amounts, and the decisions on tiers and research sources turn on the split.
+  - **On Rob's own key.** Anthropic's API returns no cost, so each call is priced as its tokens at litellm's prices plus $0.01 a web search. litellm 1.80.10's own figure for a response leaves the searches out, about 10% of a question's cost. If litellm can't price the model, OpenRouter's list prices stand in.
 
-  — Rob's go-ahead of 2026-10-12 for measurement only, built in [#7](https://github.com/robcam55/metaculus-bot/pull/7)
+  — Rob's go-ahead of 2026-10-12 for measurement only, built in [#7](https://github.com/robcam55/metaculus-bot/pull/7). Pricing Rob's key as tokens plus searches is Claude's fix in [#8](https://github.com/robcam55/metaculus-bot/pull/8), found by the 2026-10-15 review; not otherwise ratified.
 - **Rob's own Anthropic key after the credits, capped by a workspace spend limit.**
   - **Why.** At the measured costs Metaculus's first $100 runs out around the end of October, and the season runs to Jan 6. Without more credit the bot would sit dark for about nine weeks. On 2026-10-06 Rob said he would fund the bot himself if Metaculus didn't.
-  - **How.** Once the credits are under the $2 floor and `ANTHROPIC_API_KEY` is set, both tournaments run on Rob's key at the pinned tier (`opus-3` without a pin), with the same two research sources: Sonnet 5 calls Anthropic's web search tool where the credits use OpenRouter's `:online`. A top-up moves the bot back onto the credits at the next run.
+  - **How.** Once the credits can't pay for another question above the $2 reserve and `ANTHROPIC_API_KEY` is set, both tournaments run on Rob's key at the pinned tier (`opus-3` without a pin), with the same two research sources: Sonnet 5 calls Anthropic's web search tool where the credits use OpenRouter's `:online`. A top-up moves the bot back onto the credits at the next run.
+  - **Why "can't pay for another question", not "under $2".** The run cap spends only while the balance above $2 covers a question, so a balance can come to rest above $2 (up to $2.65 at `opus-3`) and stay there. The first version switched only under $2, so the bot would have sat idle in that band, on neither key, until a top-up. A pre-launch review caught this on 2026-10-15. The same review moved the run cap from the pacing estimates to measured costs, because capping at $0.30 a question let a burst plan about twice what lay above the reserve, so OpenRouter could refuse the key mid-question. The pacing estimates themselves are unchanged (Rob's choice of 2026-10-06).
   - **The cap lives at Anthropic.** A plain key can't read what its workspace has spent, and the bot keeps no storage, so the cap is the workspace's monthly spend limit in the Claude Console. Anthropic enforces it, and it can't drift the way a count the bot kept itself could. One tiny request before the first question of a run tells a key at its limit, or a rejected one, from a working one. The bot then pauses quietly and opens one issue, without spending AskNews calls or research.
 
-  — Rob's choice of option (b) in chat on 2026-10-11, after Claude's status review that day. The design (the tier, Anthropic's web search, the cap as a workspace spend limit, the key check) is Claude's, in [#6](https://github.com/robcam55/metaculus-bot/pull/6); not otherwise ratified.
+  — Rob's choice of option (b) in chat on 2026-10-11, after Claude's status review that day. The design (the tier, Anthropic's web search, the cap as a workspace spend limit, the key check) is Claude's, in [#6](https://github.com/robcam55/metaculus-bot/pull/6). The "can't pay for another question" rule and the measured run cap are Claude's, in [#8](https://github.com/robcam55/metaculus-bot/pull/8). None of it is otherwise ratified.
 - **Alerts as GitHub issues, one per event.** The bot runs every 20 minutes, so a run that fails to get attention would email Rob every 20 minutes until fixed. Instead `alerts.py` opens one issue, mentioning the owner, the first time the credits fall below $15, when they run out, and when Rob's key hits its spend limit or is rejected. An issue with the same title, open or closed, stops a repeat. Titles carry the credit limit, or the month for Rob's key, so a new limit or month alerts again. The workflow's token gets `issues: write` for this and nothing more.
 
   — Rob approved a low-credit warning in chat on 2026-10-11. Claude proposed failing the run; the issue form replaced that on finding the email stream it would cause, in [#6](https://github.com/robcam55/metaculus-bot/pull/6); not otherwise ratified.

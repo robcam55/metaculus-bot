@@ -53,8 +53,11 @@ BASES = {
     "upstream": "provider's bill only",
     "lookup": "looked up from OpenRouter afterwards",
     "list price": "estimated at OpenRouter's list prices",
-    "litellm": "litellm's price-list estimate",
+    "litellm": "litellm's prices (on Anthropic's API: tokens plus $0.01 a search)",
 }
+
+# Anthropic's fee for a web search on its own API: $10 per 1,000
+ANTHROPIC_SEARCH_FEE = 0.01
 
 PARSING = "Parsing and summary"
 OTHER = "Other"
@@ -204,8 +207,30 @@ def openrouter_figure(
     return None
 
 
-def _litellm_estimate(response: Any) -> float | None:
-    """litellm's own price for the response (its price list), when it has one."""
+def _litellm_estimate(response: Any, model: str, searches: int) -> float | None:
+    """A call that isn't OpenRouter's (Rob's own Anthropic key): its tokens at litellm's
+    prices plus Anthropic's fee for each web search. litellm 1.80.10, which the runs
+    install, leaves the searches out of its own figure for a response, and newer litellm
+    counts them, so the tokens are priced here and the searches added: the same total on
+    either version. Failing that, litellm's own figure for the response."""
+    usage = getattr(response, "usage", None)
+    prompt = int(_number(_field(usage, "prompt_tokens")) or 0)
+    completion = int(_number(_field(usage, "completion_tokens")) or 0)
+    # Only Anthropic's own models: another provider's search fees and extras (Perplexity's,
+    # say) are litellm's own business, in its figure for the response below
+    anthropic = model.startswith(("anthropic/", "claude-"))
+    if anthropic and (prompt or completion):
+        try:
+            import litellm
+
+            costs = litellm.cost_per_token(
+                model=model, prompt_tokens=prompt, completion_tokens=completion
+            )
+            tokens = sum(_number(c) or 0.0 for c in costs)
+        except Exception:  # a model litellm doesn't price
+            tokens = 0.0
+        if tokens > 0:
+            return tokens + searches * ANTHROPIC_SEARCH_FEE
     hidden = getattr(response, "_hidden_params", None) or {}
     cost = _number(_field(hidden, "response_cost"))
     if cost:
@@ -231,8 +256,11 @@ def call_from_response(
     generation = getattr(response, "id", None)
     if not (isinstance(generation, str) and generation.startswith("gen-")):
         generation = None
+    searches = int(
+        _number(_field(_field(usage, "server_tool_use"), "web_search_requests")) or 0
+    )
     if figure is None and generation is None:  # not an OpenRouter response
-        estimate = _litellm_estimate(response)
+        estimate = _litellm_estimate(response, model, searches)
         figure = None if estimate is None else (estimate, "litellm")
     return Call(
         question=question,
@@ -243,9 +271,7 @@ def call_from_response(
         generation=generation,
         prompt_tokens=int(_number(_field(usage, "prompt_tokens")) or 0),
         completion_tokens=int(_number(_field(usage, "completion_tokens")) or 0),
-        searches=int(
-            _number(_field(_field(usage, "server_tool_use"), "web_search_requests")) or 0
-        ),
+        searches=searches,
     )
 
 
