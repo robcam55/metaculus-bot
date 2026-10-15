@@ -16,8 +16,9 @@ The changes are in `main.py` (`RcForecastBot`), `budget.py`, `spend.py` and `ale
     MiniBench only.
   - On the credits, the pacing tier below picks Opus 5.5 or Sonnet 5. The Cup's personal
     key runs Sonnet 5.
-  - **Your own key takes over when the credits run out.** Once they are under the $2
-    floor, and if `ANTHROPIC_API_KEY` is set, FutureEval and MiniBench run on your key at
+  - **Your own key takes over when the credits run out.** Once they can't pay for another
+    question above the $2 reserve (in practice $2.00 to $2.30 left, at `opus-3`), and if
+    `ANTHROPIC_API_KEY` is set, FutureEval and MiniBench run on your key at
     `opus-3` (or the tier `BUDGET_TIER` pins), with the same research. The cap is the
     monthly spend limit on the key's workspace in the Claude Console, which Anthropic
     enforces; at the limit the bot pauses quietly until the 1st. Each run checks the key
@@ -55,9 +56,10 @@ The changes are in `main.py` (`RcForecastBot`), `budget.py`, `spend.py` and `ale
   - **A pin skips the ladder.** `BUDGET_TIER` pins one tier for both tournaments, and
     then neither the ladder nor the last week applies; the floor still does. It has
     pinned `opus-3` since 2026-10-07.
-  - **Never runs dry.** Below $2 the credits stop: your own key takes over if it is set,
-    and otherwise the bot pauses. One run never forecasts more questions than the balance
-    covers, so credit can't run out halfway through a question.
+  - **Never runs dry.** One run never forecasts more questions than the balance covers
+    above $2, so credit can't run out halfway through a question. When the balance can't
+    pay for one more question at the tier, the credits stop: your own key takes over if it
+    is set, and otherwise the bot pauses and says so.
   - **Top-ups apply at once.** When Metaculus raises the key, the next run sees it.
   - **Measured spend.** Each run's page on GitHub shows the balance, what each tier cost
     per question, and a table per tournament of what each question cost: each research
@@ -126,7 +128,10 @@ The changes are in `main.py` (`RcForecastBot`), `budget.py`, `spend.py` and `ale
     round can't outlast the 60-minute timeout. The rest wait 20 minutes for the next run.
   - The Metaculus Cup workflow is manual-only.
 
-Offline checks (no network, no keys): `python tests/check_rc_bot.py`.
+Offline checks (no keys): `python tests/check_rc_bot.py`. They also run on every pull
+request and push to `main`, on the packages `poetry.lock` pins, which the forecasting runs
+install (`.github/workflows/checks.yaml`). A local virtualenv can drift from the lock: a
+newer local litellm once hid a call that crashes on the pinned one.
 
 ## Setup
 
@@ -189,7 +194,8 @@ Offline checks (no network, no keys): `python tests/check_rc_bot.py`.
    days without a commit, and the Fall 2026 season runs to Jan 6. Push any commit at least
    every 50 days: the next by Dec 1.
 9. **Your own key, for when the credits run out (optional).** The bot moves to it once
-   Metaculus's credits are under $2, and back to the credits when Metaculus tops them up.
+   Metaculus's credits can't pay for another question (about $2.30 left), and back to the
+   credits when Metaculus tops them up.
    At this season's volume, about 50 questions a week, it costs roughly $100 to $120 a
    month on Opus.
    1. In the Claude Console, create a workspace for the bot (Settings → Workspaces). The
@@ -266,7 +272,8 @@ The main architectural choices and the reasons behind them. Each links to where 
   — Rob's go-ahead of 2026-10-12 for measurement only, built in [#7](https://github.com/robcam55/metaculus-bot/pull/7)
 - **Rob's own Anthropic key after the credits, capped by a workspace spend limit.**
   - **Why.** At the measured costs Metaculus's first $100 runs out around the end of October, and the season runs to Jan 6. Without more credit the bot would sit dark for about nine weeks. On 2026-10-06 Rob said he would fund the bot himself if Metaculus didn't.
-  - **How.** Once the credits are under the $2 floor and `ANTHROPIC_API_KEY` is set, both tournaments run on Rob's key at the pinned tier (`opus-3` without a pin), with the same two research sources: Sonnet 5 calls Anthropic's web search tool where the credits use OpenRouter's `:online`. A top-up moves the bot back onto the credits at the next run.
+  - **How.** Once the credits can't pay for another question above the $2 reserve and `ANTHROPIC_API_KEY` is set, both tournaments run on Rob's key at the pinned tier (`opus-3` without a pin), with the same two research sources: Sonnet 5 calls Anthropic's web search tool where the credits use OpenRouter's `:online`. A top-up moves the bot back onto the credits at the next run.
+  - **Why "can't pay for another question", not "under $2".** The run cap spends only while the balance above $2 covers a question's estimate, so the balance comes to rest between $2.00 and $2.30 and stays there. The first version switched only under $2, so the bot would have sat idle in that band, on neither key, until a top-up. A pre-launch review caught this on 2026-10-15, in [#8](https://github.com/robcam55/metaculus-bot/pull/8).
   - **The cap lives at Anthropic.** A plain key can't read what its workspace has spent, and the bot keeps no storage, so the cap is the workspace's monthly spend limit in the Claude Console. Anthropic enforces it, and it can't drift the way a count the bot kept itself could. One tiny request before the first question of a run tells a key at its limit, or a rejected one, from a working one. The bot then pauses quietly and opens one issue, without spending AskNews calls or research.
 
   — Rob's choice of option (b) in chat on 2026-10-11, after Claude's status review that day. The design (the tier, Anthropic's web search, the cap as a workspace spend limit, the key check) is Claude's, in [#6](https://github.com/robcam55/metaculus-bot/pull/6); not otherwise ratified.

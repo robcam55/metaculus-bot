@@ -15,6 +15,7 @@ import math
 import os
 import sys
 import tempfile
+import types
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -713,6 +714,78 @@ def check_own_key() -> None:
     assert not main.spend_limit_reached(RuntimeError("rate_limit_error: retry after 20s"))
     assert not main.spend_limit_reached(research_deferral("https://example.invalid/q/1"))
 
+    # The band above the floor: the cap lets a run spend only while the balance above $2
+    # covers one $0.30 opus-3 estimate, so the credits come to rest between $2.00 and
+    # $2.30. That counts as spent: Rob's key takes over, and "ran out" opens
+    calls, summary, exited, _ = run_main("tournament", 2.16, questions, BUDGET_TIER="opus-3", **keys)
+    assert exited is None and calls == [
+        (opus_own, 3, ["2", "1"], True), (opus_own, 3, ["4"], True)
+    ], calls
+    assert "can't pay for another question above the $2 reserve" in summary, summary
+    assert LAST["alerts"] == ["Metaculus's credits ran out (of the $100 limit)"], LAST
+    # unpinned, the same band under the last resort ($0.18 a question)
+    calls, _, _, _ = run_main("tournament", 2.10, questions, **keys)
+    assert [c[0] for c in calls] == [opus_own, opus_own], calls
+    # without a key: paused there, said plainly, not "later runs take the rest"
+    calls, summary, exited, _ = run_main(
+        "tournament", 2.16, questions, BUDGET_TIER="opus-3", OPENROUTER_API_KEY="sk-fake"
+    )
+    assert calls == [] and exited is None, (calls, exited)
+    assert "(paused)." in summary and "later runs take the rest" not in summary, summary
+    assert LAST["alerts"] == ["Metaculus's credits ran out (of the $100 limit)"], LAST
+    # one question's worth above the reserve: still on the credits, capped at one
+    calls, _, _, _ = run_main("tournament", 2.40, questions, BUDGET_TIER="opus-3", **keys)
+    assert [(c[0], len(c[2])) for c in calls] == [(budget.OPUS, 1)], calls
+    assert LAST["key_checks"] == 0, LAST
+    # BUDGET_TIER=pause in the band is a deliberate stop, not spent credits
+    calls, _, _, _ = run_main("tournament", 2.16, questions, BUDGET_TIER="pause", **keys)
+    assert calls == [] and LAST["key_checks"] == 0, (calls, LAST)
+    assert not any("ran out" in t for t in LAST["alerts"]), LAST
+
+    # Rob's key hits its limit in the FutureEval pass: the MiniBench pass pauses quietly
+    # instead of spending AskNews calls and refused requests on every question
+    calls, summary, exited, _ = run_main(
+        "tournament", 1.5, questions, limit_urls=("https://example.invalid/q/2",), **keys
+    )
+    assert exited is None and [c[2] for c in calls] == [["2", "1"]], (exited, calls)
+    assert "(paused: your Anthropic key reached its spend limit)." in summary, summary
+    # on Metaculus's credits the same words are someone else's limit: an ordinary failure
+    _, _, exited, _ = run_main(
+        "tournament", 100.0, questions, limit_urls=("https://example.invalid/q/4",), **keys
+    )
+    assert exited and exited.startswith("1 question(s) failed"), exited
+    assert not any("spend limit" in t for t in LAST["alerts"]), LAST
+
+    # The real key check, against a stand-in litellm with nothing but completion(): a
+    # class one litellm version lacks (1.80.10, which the runs install, has no top-level
+    # PermissionDeniedError) can't crash it, and every outcome is classified
+    class Refused(Exception):
+        def __init__(self, text, status_code=None):
+            super().__init__(text)
+            self.status_code = status_code
+
+    outcomes = [
+        (None, None),
+        (Refused(SPEND_LIMIT_ERROR, 400), "limit"),
+        (Refused('AnthropicException - {"error":{"type":"billing_error"}}', 402), "limit"),
+        (Refused("invalid x-api-key", 401), "rejected: Refused"),
+        (Refused('AnthropicException - {"error":{"type":"permission_error"}}', 500), "rejected: Refused"),
+        (Refused("Overloaded", 529), None),  # passing: the run goes ahead
+        (TimeoutError("timed out"), None),
+    ]
+    real_litellm = main.litellm
+    try:
+        for error, expected in outcomes:
+            def completion(error=error, **kwargs):
+                assert kwargs["model"] == "anthropic/claude-haiku-4-5" and kwargs["max_tokens"] == 1
+                if error is not None:
+                    raise error
+
+            main.litellm = types.SimpleNamespace(completion=completion)
+            assert main.own_key_check() == expected, (error, expected)
+    finally:
+        main.litellm = real_litellm
+
     plan = budget.own_key_plan(None, "why")
     assert plan.futureeval == plan.minibench == budget.TIERS["opus-3"] and plan.remaining is None
     assert budget.own_key_plan(budget.TIERS["sonnet-3"], "why").minibench.name == "sonnet-3"
@@ -852,6 +925,23 @@ def _research_survives_one_failure() -> None:
     bot._run_one_research_source = both  # type: ignore[method-assign]
     research = asyncio.run(bot.run_research(binary_question()))
     assert research.count("## Research from") == 2, research
+
+    # every source failed and one because Rob's key hit its spend limit: that error comes
+    # through (counted as stopped by the limit), not "no research" (a red failure)
+    async def limited(source, prompt, question):
+        if source == main.ASKNEWS_RESEARCHER:
+            raise RuntimeError("asknews down")
+        raise RuntimeError(SPEND_LIMIT_ERROR)
+
+    bot._run_one_research_source = limited  # type: ignore[method-assign]
+    try:
+        asyncio.run(bot.run_research(binary_question()))
+    except main.ResearchUnavailable as e:
+        raise AssertionError(f"a spend limit must not read as missing research: {e}")
+    except RuntimeError as e:
+        assert main.spend_limit_reached(e), e
+    else:
+        raise AssertionError("research with every source failed must raise")
 
 
 def timed_question(kind: str = "binary", closes_in: timedelta | None = timedelta(hours=2)):
@@ -1280,11 +1370,16 @@ def check_spend() -> None:
     # OpenRouter gave no figure: kept for a look-up by its generation id
     call = spend.call_from_response("m", FakeResponse(generation="gen-2", cost=0.0))
     assert (call.cost, call.basis, call.generation) == (None, None, "gen-2"), call
-    # not an OpenRouter response (Anthropic's API on a personal key): litellm's estimate
-    other = FakeResponse(generation="msg_01", cost=None)
+    # not an OpenRouter response (Anthropic's API on Rob's key): the tokens at litellm's
+    # prices (Sonnet 5: $2/$10 per M) plus $0.01 a web search, which litellm 1.80.10
+    # leaves out of its own figure; litellm's figure only for a model it can't price
+    other = FakeResponse(generation="msg_01", searches=4)
     other._hidden_params = {"response_cost": 0.03}
     call = spend.call_from_response("anthropic/claude-sonnet-5", other)
-    assert (call.cost, call.basis, call.generation) == (0.03, "litellm", None), call
+    assert call.basis == "litellm" and call.generation is None, call
+    assert math.isclose(call.cost, 1000 * 2e-6 + 200 * 1e-5 + 4 * 0.01), call
+    call = spend.call_from_response("anthropic/no-such-model", other)
+    assert (call.cost, call.basis) == (0.03, "litellm"), call
     assert spend.label("https://www.metaculus.com/questions/45958/") == "45958"
     assert spend.label(None) == "outside any question"
     # list prices are OpenRouter's, by its ids, for Anthropic's own API names too
@@ -1377,14 +1472,27 @@ def _spend_look_up() -> None:
         ledger.calls.append(spend.call_from_response("m", FakeResponse(generation="msg_1", cost=0.0)))
         ledger.look_up(secret, sleep=sleeps.append)
         assert ledger.calls[2].cost is None, ledger.calls
-        # Anthropic's own API with no OpenRouter key: no generation look-up, and the list
-        # price under OpenRouter's id (1,000 prompt and 200 completion tokens, one search)
+        # Anthropic's own API with no OpenRouter key (1,000 prompt and 200 completion
+        # tokens, one search): litellm's token prices plus the search fee, nothing fetched
         own = spend.Ledger()
-        own.calls.append(
-            spend.call_from_response(
-                "anthropic/claude-opus-5-5", FakeResponse(generation="msg_2", searches=1)
-            )
-        )
+        own_response = FakeResponse(generation="msg_2", searches=1)
+        own.calls.append(spend.call_from_response("anthropic/claude-opus-5-5", own_response))
+        seen.clear()
+        own.look_up("", sleep=sleeps.append)
+        assert seen == [], seen
+        assert close(own.calls[0].cost, 0.004 + 0.004 + 0.01), own.calls
+        assert own.calls[0].basis == "litellm"
+        # ... and when litellm can't price the model: no generation look-up, and the list
+        # price under OpenRouter's id, the same total
+        import litellm
+
+        real_cost_per_token = litellm.cost_per_token
+        litellm.cost_per_token = lambda **kwargs: (_ for _ in ()).throw(ValueError("unpriced"))
+        try:
+            own = spend.Ledger()
+            own.calls.append(spend.call_from_response("anthropic/claude-opus-5-5", own_response))
+        finally:
+            litellm.cost_per_token = real_cost_per_token
         seen.clear()
         own.look_up("", sleep=sleeps.append)
         assert seen == [(spend.MODELS_URL, None, None)], seen

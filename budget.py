@@ -136,6 +136,19 @@ def under_floor(remaining: float | None) -> bool:
     return remaining is not None and remaining < FLOOR
 
 
+def exhausted(remaining: float | None, plan: Plan) -> bool:
+    """Whether the credits are spent: under the floor, or unable to pay for one more
+    question at a tier the plan runs. affordable() lets a run spend only while the
+    balance above the floor covers a question's estimate, so the balance comes to rest
+    between the floor and the floor plus one estimate ($2.00 to $2.30 at opus-3) and stays
+    there. Checking the floor alone left the bot idle in that band, on neither key, until
+    a top-up. A plan that pauses on purpose (BUDGET_TIER=pause) is not exhausted."""
+    if under_floor(remaining):
+        return True
+    running = [t for t in (plan.futureeval, plan.minibench) if t.predictions > 0]
+    return any(affordable(remaining, t) == 0 for t in running)
+
+
 def own_key_plan(pinned: Tier | None, note: str) -> Plan:
     """Both tournaments' tier on Rob's own Anthropic key: the pinned tier, so
     BUDGET_TIER=pause stops this too, or OWN_KEY_TIER. A plain Anthropic key can't read
@@ -250,8 +263,8 @@ class SpendMeter:
 
 
 class OwnKeyMeter(SpendMeter):
-    """What each pass spent on Rob's own Anthropic key, as litellm prices Anthropic's
-    responses (its price list covers the web searches too). A plain key can't read its
+    """What each pass spent on Rob's own Anthropic key: each response's tokens at litellm's
+    prices plus $0.01 a web search (spend.py). A plain key can't read its
     workspace's spend, so there is no balance here: the workspace's monthly spend limit,
     set in the Claude Console, is the cap, and Anthropic enforces it."""
 

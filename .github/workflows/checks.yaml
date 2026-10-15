@@ -1,0 +1,38 @@
+name: Offline checks
+
+# The offline checks on the lockfile's packages, the ones every forecasting run installs
+# (litellm 1.80.10 among them). A local virtualenv can drift from the lock: on 2026-10-15
+# a local litellm 1.102.1 hid a call that crashes on 1.80.10. No keys, nothing posted.
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+      - name: Install poetry
+        uses: snok/install-poetry@v1
+        with:
+          virtualenvs-create: true
+          virtualenvs-in-project: true
+          installer-parallel: true
+      - name: Install dependencies (poetry.lock)
+        run: poetry install --no-interaction --no-root
+      - name: Show the litellm version under test
+        run: poetry run python -c "import importlib.metadata as m; print('litellm', m.version('litellm'))"
+      - name: Bot checks
+        run: poetry run python tests/check_rc_bot.py
+      - name: Trigger checks
+        run: node trigger/test.mjs

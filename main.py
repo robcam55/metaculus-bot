@@ -114,12 +114,18 @@ ANTHROPIC_MAX_TOKENS = 16000
 ANTHROPIC_WEB_SEARCH = {"search_context_size": "medium"}
 
 # What Anthropic says when a key can't spend: a workspace or organization spend limit
-# (400 invalid_request_error, or 429 enforced_spend_limit_reached), or prepaid credit gone
+# (400 invalid_request_error, or 429 enforced_spend_limit_reached), prepaid credit gone,
+# or a 402 billing_error. The text survives litellm's wrapping on any version.
 SPEND_LIMIT_MARKERS = (
     "api usage limits",
     "enforced_spend_limit_reached",
     "credit balance is too low",
+    "billing_error",
 )
+# Anthropic's error types for a key it turns away (401 and 403). litellm 1.80.10, which
+# the runs install, maps a 403 to APIConnectionError and has no top-level
+# PermissionDeniedError, so the status code and these words decide, not litellm's classes.
+KEY_REJECTED_MARKERS = ("authentication_error", "permission_error")
 
 
 def spend_limit_reached(error: BaseException) -> bool:
@@ -131,11 +137,18 @@ def spend_limit_reached(error: BaseException) -> bool:
     return False
 
 
+def key_rejected(error: BaseException) -> bool:
+    """Whether Anthropic turned the key itself away: a 401 or 403."""
+    if getattr(error, "status_code", None) in (401, 403):
+        return True
+    return any(marker in str(error).lower() for marker in KEY_REJECTED_MARKERS)
+
+
 def own_key_check() -> str | None:
     """One tiny request on Rob's own key (about $0.00002) before a run spends AskNews calls
     and research on questions the key can't pay for. None when the key works or the
-    failure looks passing; otherwise "limit" (a spend limit or no credit) or "rejected: "
-    and the error type (a bad or revoked key)."""
+    failure looks passing (an overload, a timeout); otherwise "limit" (a spend limit or no
+    credit) or "rejected: " and the error type (a bad or revoked key)."""
     try:
         litellm.completion(
             model="anthropic/claude-haiku-4-5",
@@ -146,7 +159,7 @@ def own_key_check() -> str | None:
     except Exception as e:  # never log the message: keep request details out of logs
         if spend_limit_reached(e):
             return "limit"
-        if isinstance(e, (litellm.AuthenticationError, litellm.PermissionDeniedError)):
+        if key_rejected(e):
             return f"rejected: {type(e).__name__}"
         logger.warning(f"Own-key check failed ({type(e).__name__}); forecasting anyway")
     return None
@@ -593,6 +606,7 @@ class RcForecastBot(ForecastBot):
             prompt = self._research_prompt(question)
             sources = research_sources(self._llms)
             parts: list[str] = []
+            refused: BaseException | None = None  # a source Anthropic wouldn't pay for
             for source in sources:
                 name = self._source_name(source)
                 try:
@@ -604,6 +618,8 @@ class RcForecastBot(ForecastBot):
                         f" {type(e).__name__}: {e}"
                     )
                     self.research_health.record(name, type(e).__name__)
+                    if spend_limit_reached(e):
+                        refused = e
                     continue
                 if not (text and text.strip()):
                     logger.warning(
@@ -615,6 +631,10 @@ class RcForecastBot(ForecastBot):
                 parts.append(f"## Research from {name}\n{flatten_headings(text)}")
             if parts:
                 self._research_found.add(question_key(question))
+            if sources and not parts and refused is not None:
+                # Rob's key at its spend limit, not research gone missing: the run counts
+                # the question as stopped by the limit (quiet pause), not as a red failure
+                raise refused
             if sources and not parts:
                 research = self._without_research(question)
             else:
@@ -1375,29 +1395,40 @@ def pay_with() -> str:
     return value
 
 
-def own_key_reason(credits_left: float | None) -> str | None:
+def credits_spent(credits_left: float | None, plan: budget.Plan) -> str | None:
+    """Why Metaculus's credits can't pay for this run, or None (budget.exhausted)."""
+    if budget.under_floor(credits_left):
+        return f"Metaculus's credits are under the ${budget.FLOOR:.0f} floor"
+    if budget.exhausted(credits_left, plan):
+        return (
+            f"Metaculus's credits ({budget.dollars(credits_left)}) can't pay for another"
+            f" question above the ${budget.FLOOR:.0f} reserve"
+        )
+    return None
+
+
+def own_key_reason(credits_left: float | None, plan: budget.Plan) -> str | None:
     """Why Rob's own Anthropic key pays this run instead of Metaculus's credits, or None.
-    It takes over once the credits are under the floor (Rob's choice of 2026-10-11), if
-    ANTHROPIC_API_KEY is set; PAY_WITH=own-key asks for it sooner."""
+    It takes over once the credits can't pay for another question (Rob's choice of
+    2026-10-11), if ANTHROPIC_API_KEY is set; PAY_WITH=own-key asks for it sooner."""
     if not os.getenv("ANTHROPIC_API_KEY"):
         return None
     if pay_with() == "own-key":
         return "PAY_WITH=own-key"
-    if budget.under_floor(credits_left):
-        return f"Metaculus's credits are under the ${budget.FLOOR:.0f} floor"
-    return None
+    return credits_spent(credits_left, plan)
 
 
-def credit_alerts(meter: budget.SpendMeter) -> list[str]:
+def credit_alerts(meter: budget.SpendMeter, plan: budget.Plan) -> list[str]:
     """Opens an issue the first time the credits fall below LOW_CREDIT, and another when
-    they fall below the floor (each once per credit limit). Lines for the run page."""
+    they can't pay for another question (each once per credit limit). Lines for the run
+    page."""
     left = budget.remaining_of(meter.start)
     if left is None or math.isinf(left) or left >= budget.LOW_CREDIT:
         return []
     limit = (meter.start or {}).get("limit")
     limit = None if limit is None else float(limit)
     own_key = bool(os.getenv("ANTHROPIC_API_KEY"))
-    if left < budget.FLOOR:
+    if credits_spent(left, plan):
         opened = alerts.credits_out(left, limit, own_key)
     else:
         opened = alerts.credits_low(left, limit, own_key)
@@ -1465,9 +1496,9 @@ def main() -> None:
             )
         route = "anthropic"
 
-    # Pacing applies to Metaculus's credits. Once they are under the floor, Rob's own
-    # Anthropic key takes over, capped by its workspace's monthly spend limit; the
-    # Metaculus Cup's personal key runs unpaced.
+    # Pacing applies to Metaculus's credits. Once they can't pay for another question,
+    # Rob's own Anthropic key takes over, capped by its workspace's monthly spend limit;
+    # the Metaculus Cup's personal key runs unpaced.
     meter: budget.SpendMeter | None = None
     plan: budget.Plan | None = None
     own_key: OwnKey | None = None
@@ -1479,8 +1510,9 @@ def main() -> None:
             f"Credits left: {budget.dollars(meter.remaining())}. FutureEval runs"
             f" {plan.futureeval.name}, MiniBench {plan.minibench.name} ({plan.note})."
         )
-        notes += credit_alerts(meter)
-        reason = own_key_reason(meter.remaining())
+        notes += credit_alerts(meter, plan)
+        reason = own_key_reason(meter.remaining(), plan)
+        spent = credits_spent(meter.remaining(), plan)
         if reason:
             route = "anthropic"
             own_key = OwnKey()
@@ -1490,6 +1522,11 @@ def main() -> None:
                 f"Your Anthropic key pays this run ({reason}). FutureEval runs"
                 f" {plan.futureeval.name}, MiniBench {plan.minibench.name}."
             )
+        elif spent:
+            # No key to take over: say so on the run page, rather than "later runs take
+            # the rest" while nothing can pay
+            pause = budget.TIERS["pause"]
+            plan = budget.Plan(pause, pause, meter.remaining(), f"{spent}: paused")
 
     client = MetaculusClient()
     tournament_id = _tournament_id(os.getenv("AIB_TOURNAMENT_ID"), FALL_2026_FUTUREEVAL_ID)
@@ -1520,6 +1557,11 @@ def main() -> None:
         # failed questions, retries and questions left waiting for research included
         with spend.collecting() as ledger:
             results = asyncio.run(bot.forecast_questions(questions, return_exceptions=True))
+        if own_key is not None and any(
+            isinstance(r, BaseException) and spend_limit_reached(r) for r in results
+        ):
+            # Rob's key reached its limit mid-pass: later passes this run pause quietly
+            own_key.checked, own_key.problem = True, "limit"
         # OpenRouter's records only on its own route; list prices fill gaps on every route
         ledger.look_up(os.environ["OPENROUTER_API_KEY"] if route == "openrouter" else "")
         breakdowns.extend(
@@ -1604,9 +1646,10 @@ def main() -> None:
             reports += run_pass("bot-testing-area", questions, tier, skip_previous=False)
 
     failures = [r for r in reports if isinstance(r, BaseException)]
-    # Questions Anthropic refused to pay for mid-run: no red run (the next run's key check
-    # pauses quietly), but one alert
-    limited = sum(spend_limit_reached(r) for r in failures)
+    # Questions Anthropic refused to pay for on Rob's key mid-run: no red run (the next
+    # run's key check pauses quietly), but one alert. On Metaculus's credits the same words
+    # would be about someone else's account, so there they stay ordinary failures.
+    limited = sum(spend_limit_reached(r) for r in failures) if route == "anthropic" else 0
     if limited:
         alerts.own_key_limit()
         notes.append(
