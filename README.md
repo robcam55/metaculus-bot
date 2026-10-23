@@ -292,6 +292,9 @@ The main architectural choices and the reasons behind them. Each links to where 
   - **No blind forecasts.** When every research source fails, the question waits for the next run rather than being forecast from the model's memory. A missed question adds nothing to the score, while a blind forecast on a question about current events can take points away. A question closing within 45 minutes gets no further try, so it is forecast without research and the forecasters are told so. A question that waits turns the run red, so a source that keeps failing gets noticed.
 
   — the noise finding from [rc_trader's 2026-09-23 audit](https://github.com/robcam55/rc_trader/blob/main/docs/audit/2026-09-23-AUDIT.md) (§2.4 and §4). The design was Claude's, in [de2f36f](https://github.com/robcam55/metaculus-bot/commit/de2f36f) and [e0fac54](https://github.com/robcam55/metaculus-bot/commit/e0fac54), and Rob's credit application of 2026-09-24 described it; not otherwise ratified. No blind forecasts, the AskNews settings and the run-page report were Claude's proposals, which Rob approved on 2026-10-04.
+- **Workflow actions pinned to commit SHAs, not version tags.** Every run carries the bot's API keys, including Rob's paid Anthropic, OpenAI and OpenRouter keys, and runs start every 20 minutes. A tag such as `@v1` can be moved to new code by the action's owner, or by anyone who takes over the owner's GitHub account. The OVHcloud CLI and LiteLLM 1.107.0 compromises of October 2026 both started that way. A commit SHA can't be moved. Each pin names its version in a comment, so an upgrade is a deliberate edit.
+
+  — Rob, 2026-10-23 ("Yes — pin the third-party GitHub Actions to commit SHAs"), after Claude's Black October audit of 2026-10-22
 
 ---
 

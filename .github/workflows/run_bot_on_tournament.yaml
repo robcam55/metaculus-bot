@@ -34,12 +34,12 @@ jobs:
     steps: # sets up the steps that will be run in order
       # setup repository with all necessary dependencies - keep as is
       - name: Check out repository
-        uses: actions/checkout@v5
-      - uses: actions/setup-python@v6
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
         with:
           python-version: "3.11"
       - name: Install poetry
-        uses: snok/install-poetry@v1
+        uses: snok/install-poetry@a783c322200f0519c7926aa6faa857c4e23e9263 # v1.4.2
         with:
           virtualenvs-create: true
           virtualenvs-in-project: true
@@ -47,7 +47,7 @@ jobs:
       # Adding the below will make the workflow faster, but will mean you don't automatically get updates from forecasting-tools and other packages
       # - name: Load cached venv
       #   id: cached-poetry-dependencies
-      #   uses: actions/cache@v4
+      #   uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
       #   with:
       #     path: .venv
       #     key: venv-${{ runner.os }}-${{ steps.setup-python.outputs.python-version }}-${{ hashFiles('**/poetry.lock') }}
