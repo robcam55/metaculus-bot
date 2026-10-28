@@ -49,6 +49,7 @@ jobs:
           # Optional settings (repository variables, not secrets); empty = default
           METACULUS_CUP_ID: ${{ vars.METACULUS_CUP_ID }}
           FORECASTER_MODEL: ${{ vars.FORECASTER_MODEL }}
+          FORECASTER_EFFORT: ${{ vars.FORECASTER_EFFORT }}
           PARSER_MODEL: ${{ vars.PARSER_MODEL }}
           ASKNEWS_STRATEGY: ${{ vars.ASKNEWS_STRATEGY }}
           ASKNEWS_ARTICLES: ${{ vars.ASKNEWS_ARTICLES }}

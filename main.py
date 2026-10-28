@@ -115,6 +115,17 @@ MAX_QUESTIONS_PER_RUN = 25
 # litellm caps an Anthropic reply at 4,096 tokens unless told otherwise, and Opus 5.5 and
 # Sonnet 5 think on every request, inside that cap. OpenRouter sets its own.
 ANTHROPIC_MAX_TOKENS = 16000
+# The forecasters on Rob's key think at "high" effort (FORECASTER_EFFORT), so they get
+# more room: a reply that spends the whole cap thinking comes back empty and is retried
+ANTHROPIC_FORECAST_MAX_TOKENS = 32000
+# Opus 5.5 thinks at "medium" when no effort is sent, a level below Opus 5's default. In
+# Metaculus's Spring 2026 analysis, high-effort versions beat their standard-effort twins
+# in 8 of 8 model pairs, though most of those pairs compared no thinking with thinking.
+# The forecasts are about $0.05 of a question's $0.60. litellm 1.80.10 passes Anthropic's
+# output_config through (and accepts only low, medium and high); its reasoning_effort would
+# send a thinking budget, which Opus 5.5 rejects.
+FORECASTER_EFFORTS = ("low", "medium", "high")
+DEFAULT_FORECASTER_EFFORT = "high"
 # Anthropic's own web search for the search-backed model on Rob's key, up to five searches
 # a question at $10 per 1,000. It is passed as a tool, not litellm's web_search_options,
 # which litellm 1.80.10 always sends as the older web_search_20250305: this version
@@ -175,6 +186,20 @@ def own_key_check() -> str | None:
             return f"rejected: {type(e).__name__}"
         logger.warning(f"Own-key check failed ({type(e).__name__}); forecasting anyway")
     return None
+
+
+def forecaster_effort() -> str | None:
+    """FORECASTER_EFFORT (a repository variable): the forecasters' effort on Anthropic's
+    own API, high by default; "default" sends none, leaving the model's own."""
+    value = os.getenv("FORECASTER_EFFORT", "").strip().lower() or DEFAULT_FORECASTER_EFFORT
+    if value == "default":
+        return None
+    if value not in FORECASTER_EFFORTS:
+        raise SystemExit(
+            f"FORECASTER_EFFORT must be one of {', '.join(FORECASTER_EFFORTS)} or default;"
+            f" got {value!r}"
+        )
+    return value
 
 
 def asknews_strategy() -> str:
@@ -470,13 +495,20 @@ def build_llms(
         else:
             forecaster = os.getenv("FORECASTER_MODEL") or f"{prefix}claude-sonnet-5"
     parser = os.getenv("PARSER_MODEL") or f"{prefix}{haiku}"
+    thinking: dict = {}
+    if route == "anthropic":
+        thinking["max_tokens"] = ANTHROPIC_FORECAST_MAX_TOKENS
+        effort = forecaster_effort()
+        if effort and "haiku" not in forecaster:  # Haiku 4.5 takes no effort setting
+            thinking["output_config"] = {"effort": effort}
     defaults["default"] = GeneralLlm(
         model=forecaster,
         # Sonnet 5, Opus 5 and newer reject sampling parameters: send none
         temperature=None,
-        timeout=_env_int("FORECASTER_TIMEOUT_S", 300),
+        # more thinking takes longer: up to 10 minutes on Anthropic's API, not streamed
+        timeout=_env_int("FORECASTER_TIMEOUT_S", 600 if route == "anthropic" else 300),
         allowed_tries=2,
-        **room,
+        **thinking,
     )
     parser_llm = GeneralLlm(
         model=parser,
@@ -1577,9 +1609,10 @@ def main() -> None:
     run_mode: Literal["tournament", "metaculus_cup", "test_questions"] = args.mode
 
     check_environment(strict=True)
-    # A mistyped AskNews or PAY_WITH setting stops the run here, not quietly later
+    # A mistyped AskNews, effort or PAY_WITH setting stops the run here, not quietly later
     asknews_strategy()
     asknews_articles()
+    forecaster_effort()
     pay_with()
     # PUBLISH=false gives a dry run: full research and forecasts, nothing posted
     publish = _env_flag("PUBLISH", True)

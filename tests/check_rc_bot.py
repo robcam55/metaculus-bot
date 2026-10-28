@@ -36,6 +36,8 @@ KEYS = (
     "EXA_API_KEY",
     "RESEARCHER",
     "FORECASTER_MODEL",
+    "FORECASTER_EFFORT",
+    "FORECASTER_TIMEOUT_S",
     "PARSER_MODEL",
     "SEARCH_MODEL",
     "METACULUS_TOKEN",
@@ -146,8 +148,11 @@ def check_routing() -> None:
         d = main.RcForecastBot._llm_config_defaults()
         assert model_of(d["default"]) == "anthropic/claude-sonnet-5", d["default"]
         assert d["default"].litellm_kwargs["temperature"] is None
-        # litellm's 4,096-token default for Anthropic would leave no room to think
-        assert d["default"].litellm_kwargs["max_tokens"] == main.ANTHROPIC_MAX_TOKENS
+        # litellm's 4,096-token default for Anthropic would leave no room to think, and
+        # the forecasters think at high effort, so they get the larger cap and timeout
+        assert d["default"].litellm_kwargs["max_tokens"] == main.ANTHROPIC_FORECAST_MAX_TOKENS
+        assert d["default"].litellm_kwargs["output_config"] == {"effort": "high"}
+        assert d["default"].litellm_kwargs["timeout"] == 600
         assert model_of(d["parser"]) == "anthropic/claude-haiku-4-5"
         assert d["parser"].litellm_kwargs["temperature"] == 0
         # no AskNews: Sonnet 5 with Anthropic's own web search is the one source
@@ -218,10 +223,31 @@ def check_routing() -> None:
     with env(ANTHROPIC_API_KEY="x", FORECASTER_MODEL="anthropic/some-other-model"):
         d = main.build_llms("anthropic", budget.TIERS["opus-3"])
         assert model_of(d["default"]) == "anthropic/claude-opus-5-5", d["default"]
-        assert d["default"].litellm_kwargs["max_tokens"] == main.ANTHROPIC_MAX_TOKENS
+        assert d["default"].litellm_kwargs["max_tokens"] == main.ANTHROPIC_FORECAST_MAX_TOKENS
+        assert d["default"].litellm_kwargs["output_config"] == {"effort": "high"}
         d = main.build_llms("anthropic", budget.TIERS["sonnet-1"])
         assert model_of(d["default"]) == "anthropic/claude-sonnet-5"
     assert budget.on_route(budget.OPUS, "openrouter") == budget.OPUS
+
+    # FORECASTER_EFFORT: another level, or "default" for the model's own; a mistyped one
+    # stops the run; never sent on OpenRouter, to the parser, or to a Haiku forecaster
+    with env(ANTHROPIC_API_KEY="x", FORECASTER_EFFORT=" Medium "):
+        assert main.build_llms("anthropic")["default"].litellm_kwargs["output_config"] == {"effort": "medium"}  # fmt: skip
+    with env(ANTHROPIC_API_KEY="x", FORECASTER_EFFORT="default"):
+        assert "output_config" not in main.build_llms("anthropic")["default"].litellm_kwargs
+    with env(ANTHROPIC_API_KEY="x", FORECASTER_EFFORT="xhigh"):
+        try:
+            main.forecaster_effort()
+        except SystemExit as e:
+            assert "FORECASTER_EFFORT" in str(e) and "'xhigh'" in str(e), e
+        else:
+            raise AssertionError("an effort litellm 1.80.10 rejects must stop the run")
+    with env(ANTHROPIC_API_KEY="x", OPENROUTER_API_KEY="y", FORECASTER_MODEL="anthropic/claude-haiku-4-5"):
+        assert "output_config" not in main.build_llms("openrouter")["default"].litellm_kwargs
+        d = main.build_llms("anthropic")
+        assert "output_config" not in d["default"].litellm_kwargs  # Haiku 4.5
+        assert "output_config" not in d["parser"].litellm_kwargs
+        assert "output_config" not in d["researcher"].litellm_kwargs  # the searcher
     print("routing: ok")
 
 
@@ -1129,6 +1155,24 @@ def check_own_key_research() -> None:
                 assert "stopped early (pause_turn)" in repr(e), repr(e)
             else:
                 raise AssertionError("a reply cut short must not count as research")
+
+            # an Opus 5.5 forecast: effort high in output_config, the larger reply cap, no
+            # thinking budget or sampling parameters (Opus 5.5 rejects both)
+            sent.clear()
+            replies.append({
+                "id": "msg_fake", "type": "message", "role": "assistant", "model": "claude-opus-5-5",
+                "content": [{"type": "thinking", "thinking": "", "signature": "sig"},
+                            {"type": "text", "text": "Probability: 35%"}],
+                "stop_reason": "end_turn", "stop_sequence": None,
+                "usage": {"input_tokens": 5000, "output_tokens": 3000},
+            })  # fmt: skip
+            forecaster = main.build_llms("anthropic", budget.TIERS["opus-3"])["default"]
+            assert asyncio.run(forecaster.invoke("Forecast this.")) == "Probability: 35%"
+            body = sent[0]["body"]
+            assert body["model"] == "claude-opus-5-5" and body["output_config"] == {"effort": "high"}, body  # fmt: skip
+            assert body["max_tokens"] == main.ANTHROPIC_FORECAST_MAX_TOKENS, body
+            for absent in ("thinking", "temperature", "top_p", "reasoning_effort"):
+                assert absent not in body, (absent, body)
     finally:
         httpx.AsyncClient.send = real_send  # type: ignore[method-assign]
     print("own-key research: ok")
