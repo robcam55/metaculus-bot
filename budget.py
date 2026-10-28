@@ -26,10 +26,18 @@ logger = logging.getLogger(__name__)
 
 KEY_URL = "https://openrouter.ai/api/v1/key"
 
+# The bot's Claude models, in OpenRouter's ids: Opus forecasts, Sonnet researches (and
+# forecasts on the cheaper tiers and the Metaculus Cup), Haiku parses. model_watch.py
+# reads them here to notice newer releases; a switch changes them here
 OPUS = "openrouter/anthropic/claude-opus-5.5"
 SONNET = "openrouter/anthropic/claude-sonnet-5.5"
+HAIKU = "openrouter/anthropic/claude-haiku-5.5"
 # The same models on Rob's own Anthropic key, in litellm's ids for Anthropic's API
-ANTHROPIC_IDS = {OPUS: "anthropic/claude-opus-5-5", SONNET: "anthropic/claude-sonnet-5-5"}
+ANTHROPIC_IDS = {
+    OPUS: "anthropic/claude-opus-5-5",
+    SONNET: "anthropic/claude-sonnet-5-5",
+    HAIKU: "anthropic/claude-haiku-5-5",
+}
 
 
 @dataclass(frozen=True)

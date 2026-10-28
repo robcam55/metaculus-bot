@@ -1,0 +1,39 @@
+name: Model watch
+
+# Once a day: opens an issue when Anthropic releases a Claude model the bot hasn't been
+# evaluated on, or stops offering one the bot runs (model_watch.py). It changes no model:
+# the issue says how to try the new one on the Test Bot first. Listing models costs
+# nothing. Like the backup clock, GitHub disables this schedule after 60 days without a
+# commit; Actions -> Model watch -> Enable workflow brings it back.
+on:
+  schedule:
+    - cron: "41 15 * * *" # once a day, off the hour
+  workflow_dispatch:
+
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      issues: write # the alert issues
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.11"
+      - name: Install poetry
+        uses: snok/install-poetry@a783c322200f0519c7926aa6faa857c4e23e9263 # v1.4.2
+        with:
+          version: 2.5.1
+          virtualenvs-create: true
+          virtualenvs-in-project: true
+          installer-parallel: true
+      - name: Install dependencies
+        run: poetry install --no-interaction --no-root
+      - name: Check for new Claude models
+        run: poetry run python model_watch.py
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }} # lists models only
+          GITHUB_TOKEN: ${{ github.token }} # opens the alert issues

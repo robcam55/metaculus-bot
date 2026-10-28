@@ -127,13 +127,13 @@ ANTHROPIC_FORECAST_MAX_TOKENS = 32000
 # send a thinking budget, which Opus 5.5 rejects.
 FORECASTER_EFFORTS = ("low", "medium", "high")
 DEFAULT_FORECASTER_EFFORT = "high"
-# The models on each route: the newest Sonnet and Haiku (2026-10), with Opus 5.5 from the
-# pacing tiers (budget.py). Haiku 5.5 parses at a tenth of Haiku 4.5's price, at low
+# The models on each route, from budget.py: the newest Sonnet and Haiku (2026-10), with
+# Opus 5.5 from the pacing tiers. Haiku 5.5 parses at a tenth of Haiku 4.5's price, at low
 # effort: thinking counts against its reply cap, and copying numbers out of a forecast
 # needs little of it. It rejects a temperature other than the default, which Haiku 4.5
 # (PARSER_MODEL can still pick it) ran at 0.
-SONNET_MODEL = {"openrouter": "openrouter/anthropic/claude-sonnet-5.5", "anthropic": "anthropic/claude-sonnet-5-5"}  # fmt: skip
-HAIKU_MODEL = {"openrouter": "openrouter/anthropic/claude-haiku-5.5", "anthropic": "anthropic/claude-haiku-5-5"}  # fmt: skip
+SONNET_MODEL = {"openrouter": budget.SONNET, "anthropic": budget.ANTHROPIC_IDS[budget.SONNET]}
+HAIKU_MODEL = {"openrouter": budget.HAIKU, "anthropic": budget.ANTHROPIC_IDS[budget.HAIKU]}
 PARSER_EFFORT = "low"
 ANTHROPIC_PARSER_MAX_TOKENS = 8000
 # Models that take no effort setting and accept a temperature: Haiku 4.5 and older
@@ -502,6 +502,21 @@ class AnthropicSearchLlm(GeneralLlm):
         return urls or GeneralLlm._extract_citations(response, choices)
 
 
+# The Test Bot's inputs for trying another model in one role (test_bot.yaml sets these
+# from its own inputs; no other workflow does, and main() drops them outside the Test Bot):
+# how a newly released model is run before a switch (model_watch.py)
+TRIAL_MODELS = {
+    "forecaster": "TRIAL_FORECASTER_MODEL",
+    "researcher": "TRIAL_RESEARCHER_MODEL",
+    "parser": "TRIAL_PARSER_MODEL",
+}
+
+
+def trial_model(role: str) -> str:
+    """The model the Test Bot is trying for `role`, or "" for the bot's own."""
+    return os.getenv(TRIAL_MODELS[role], "").strip()
+
+
 def llm_route() -> str | None:
     """Which key pays: Metaculus's donated OpenRouter credits before a personal
     Anthropic key. None leaves forecasting-tools' own defaults in charge."""
@@ -525,14 +540,16 @@ def build_llms(
         return defaults
     # Anthropic's API through litellm needs a reply cap that leaves room for thinking
     room = {"max_tokens": ANTHROPIC_MAX_TOKENS} if route == "anthropic" else {}
-    if route == "openrouter":
+    if trial_model("forecaster"):
+        forecaster = trial_model("forecaster")
+    elif route == "openrouter":
         forecaster = tier.forecaster if tier and tier.forecaster else budget.OPUS
     else:
         if tier and tier.forecaster:
             forecaster = budget.on_route(tier.forecaster, route)
         else:
             forecaster = os.getenv("FORECASTER_MODEL") or SONNET_MODEL[route]
-    parser = os.getenv("PARSER_MODEL") or HAIKU_MODEL[route]
+    parser = trial_model("parser") or os.getenv("PARSER_MODEL") or HAIKU_MODEL[route]
     older_parser = bool(_OLDER_HAIKU.search(parser))
     thinking: dict = {}
     if route == "anthropic":
@@ -578,14 +595,16 @@ def build_llms(
         search_llm = GeneralLlm(model="perplexity/sonar-pro", temperature=0.1)
     elif route == "openrouter":
         search_llm = GeneralLlm(
-            model=os.getenv("SEARCH_MODEL") or f"{SONNET_MODEL['openrouter']}:online",
+            model=trial_model("researcher")
+            or os.getenv("SEARCH_MODEL")
+            or f"{SONNET_MODEL['openrouter']}:online",
             temperature=None,
             timeout=300,
             allowed_tries=2,
         )
     else:
         search_llm = AnthropicSearchLlm(
-            model=SONNET_MODEL["anthropic"],
+            model=trial_model("researcher") or SONNET_MODEL["anthropic"],
             temperature=None,
             timeout=300,
             allowed_tries=2,
@@ -1668,6 +1687,11 @@ def main() -> None:
     asknews_articles()
     forecaster_effort()
     pay_with()
+    # A model on trial (the Test Bot's inputs) never reaches a tournament or the Cup
+    trials = {role: trial_model(role) for role in TRIAL_MODELS}
+    if run_mode != "test_questions":
+        for variable in TRIAL_MODELS.values():
+            os.environ.pop(variable, None)
     # PUBLISH=false gives a dry run: full research and forecasts, nothing posted
     publish = _env_flag("PUBLISH", True)
     print_startup_banner(run_mode, will_publish=publish)
@@ -1841,6 +1865,9 @@ def main() -> None:
                 describe_pass("bot-testing-area", "bot-testing-area", len(testing), len(questions))
             )
             reports += run_pass("bot-testing-area", questions, tier, skip_previous=False)
+        trying = [f"{role} `{model}`" for role, model in trials.items() if model]
+        if trying:
+            notes.append(f"- On trial (Test Bot inputs): {', '.join(trying)}.")
 
     failures = [r for r in reports if isinstance(r, BaseException)]
     # Questions Anthropic refused to pay for on Rob's key mid-run: no red run (the next

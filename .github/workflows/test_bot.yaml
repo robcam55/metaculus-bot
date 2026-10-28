@@ -13,6 +13,17 @@ on:
       questions:
         description: "How many bot-testing-area questions (empty: the TEST_QUESTIONS variable, or 3)"
         default: ""
+      # Trying a new model before a switch (model_watch.py opens an issue for each release).
+      # Empty runs the bot's own. On your key, Anthropic's ids: anthropic/claude-...
+      forecaster:
+        description: "Forecaster model to try (empty: the bot's own)"
+        default: ""
+      researcher:
+        description: "Research model to try, with web search (empty: the bot's own)"
+        default: ""
+      parser:
+        description: "Parsing model to try (empty: the bot's own)"
+        default: ""
 
 # Add concurrency group to prevent parallel runs
 concurrency:
@@ -75,3 +86,7 @@ jobs:
           SEARCH_MODEL: ${{ vars.SEARCH_MODEL }}
           RESEARCH_REPORTS: ${{ vars.RESEARCH_REPORTS }}
           PREDICTIONS_PER_REPORT: ${{ vars.PREDICTIONS_PER_REPORT }}
+          # This workflow's inputs only, never repository variables: no other run tries them
+          TRIAL_FORECASTER_MODEL: ${{ inputs.forecaster }}
+          TRIAL_RESEARCHER_MODEL: ${{ inputs.researcher }}
+          TRIAL_PARSER_MODEL: ${{ inputs.parser }}

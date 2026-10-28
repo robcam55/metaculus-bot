@@ -40,6 +40,9 @@ KEYS = (
     "FORECASTER_TIMEOUT_S",
     "PARSER_MODEL",
     "SEARCH_MODEL",
+    "TRIAL_FORECASTER_MODEL",
+    "TRIAL_RESEARCHER_MODEL",
+    "TRIAL_PARSER_MODEL",
     "METACULUS_TOKEN",
     "BUDGET_TIER",
     "TEST_QUESTIONS",
@@ -242,6 +245,27 @@ def check_routing() -> None:
         d = main.build_llms("anthropic", budget.TIERS["sonnet-1"])
         assert model_of(d["default"]) == "anthropic/claude-sonnet-5-5"
     assert budget.on_route(budget.OPUS, "openrouter") == budget.OPUS
+
+    # the Test Bot's trial models replace the bot's own in their role, tier or not
+    trial = {
+        "TRIAL_FORECASTER_MODEL": "anthropic/claude-opus-9",
+        "TRIAL_RESEARCHER_MODEL": " anthropic/claude-sonnet-9 ",
+        "TRIAL_PARSER_MODEL": "anthropic/claude-haiku-9",
+    }
+    with env(ANTHROPIC_API_KEY="x", PARSER_MODEL="anthropic/claude-haiku-4-5", **trial):
+        d = main.build_llms("anthropic", budget.TIERS["opus-3"])
+        assert model_of(d["default"]) == "anthropic/claude-opus-9", d["default"]
+        assert d["default"].litellm_kwargs["output_config"] == {"effort": "high"}
+        assert model_of(d["researcher"]) == "anthropic/claude-sonnet-9"  # no AskNews here
+        assert isinstance(d["researcher"], main.AnthropicSearchLlm)
+        assert model_of(d["parser"]) == "anthropic/claude-haiku-9"
+    with env(OPENROUTER_API_KEY="x", TRIAL_RESEARCHER_MODEL="openrouter/anthropic/claude-sonnet-9:online"):
+        d = main.build_llms("openrouter", budget.TIERS["opus-3"])
+        assert model_of(d["researcher"]) == "openrouter/anthropic/claude-sonnet-9:online"
+        assert model_of(d["default"]) == budget.OPUS
+    # one source for the ids: model_watch.py reads budget.py's
+    assert main.SONNET_MODEL["anthropic"] == budget.ANTHROPIC_IDS[budget.SONNET]
+    assert main.HAIKU_MODEL == {"openrouter": budget.HAIKU, "anthropic": "anthropic/claude-haiku-5-5"}
 
     # FORECASTER_EFFORT: another level, or "default" for the model's own; a mistyped one
     # stops the run; never sent on OpenRouter, to the searcher, or to a Haiku 4.5 forecaster
@@ -1049,6 +1073,97 @@ def check_watchdog() -> None:
     finally:
         watchdog.requests.get, watchdog.alerts.raise_alert = real_get, real_alert  # type: ignore[assignment]
     print("watchdog: ok")
+
+
+def check_model_watch() -> None:
+    """model_watch.py: the daily check for new Claude models and retired ones."""
+    import model_watch
+
+    pages: list[dict] = []
+    asked: list[dict] = []
+    raised: list[tuple] = []
+
+    class FakeResponse:
+        def __init__(self, page):
+            self.page = page
+
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return self.page
+
+    def fake_get(url, headers, params, timeout):
+        assert url == "https://api.anthropic.com/v1/models", url
+        assert headers["x-api-key"] == "sk-fake" and headers["anthropic-version"], headers
+        asked.append(dict(params))
+        return FakeResponse(pages[len(asked) - 1])
+
+    def model(model_id: str, released: str, name: str = "") -> dict:
+        return {"type": "model", "id": model_id, "display_name": name or model_id,
+                "created_at": f"{released}T00:00:00Z"}  # fmt: skip
+
+    in_use = [
+        model("claude-opus-5-5", "2026-08-12"),
+        model("claude-sonnet-5-5", "2026-09-30"),
+        model("claude-haiku-5-5", "2026-10-14"),
+        model("claude-fable-5-1", "2026-10-02"),
+        model("claude-opus-4-8", "1970-01-01"),  # an unknown release date reads as the epoch
+    ]
+    real_get, real_alert = model_watch.requests.get, model_watch.alerts.raise_alert
+    try:
+        model_watch.requests.get = fake_get  # type: ignore[assignment]
+        model_watch.alerts.raise_alert = lambda title, body, **kw: raised.append((title, body, kw)) or True  # type: ignore[assignment]
+        with env(ANTHROPIC_API_KEY="sk-fake"):
+            # nothing released since the review: no issue
+            pages[:] = [{"data": in_use, "has_more": False, "last_id": "claude-opus-4-8"}]
+            lines = model_watch.check()
+            assert lines == ["Claude models: nothing new since 2026-10-28 (5 listed)."], lines
+            assert raised == [] and asked == [{"limit": 1000}], (raised, asked)
+            # a new Opus on the second page, and a new line: one issue each, by role
+            asked.clear()
+            pages[:] = [
+                {"data": in_use[:3], "has_more": True, "last_id": "claude-haiku-5-5"},
+                {"data": [*in_use[3:], model("claude-opus-5-6", "2026-11-19", "Claude Opus 5.6"),
+                          model("claude-vellum-1", "2026-12-02")], "has_more": False},
+            ]  # fmt: skip
+            lines = model_watch.check()
+            assert asked[1] == {"limit": 1000, "after_id": "claude-haiku-5-5"}, asked
+            titles = [t for t, _, _ in raised]
+            assert titles == [
+                "New Claude model to evaluate: Claude Opus 5.6 (claude-opus-5-6)",
+                "New Claude model to evaluate: claude-vellum-1 (claude-vellum-1)",
+            ], titles
+            opus_body, other_body = raised[0][1], raised[1][1]
+            assert "runs for forecasts" in opus_body, opus_body
+            assert "`anthropic/claude-opus-5-6` as the forecaster model" in opus_body
+            assert "own-key" in opus_body and "never tournament questions" in opus_body
+            assert "weigh it against Opus 5.5" in other_body, other_body
+            assert all(kw == {} for _, _, kw in raised), raised  # once ever, closed or not
+            assert lines[0] == "Claude models: new, `claude-opus-5-6` (2026-11-19); opened an issue.", lines
+            # a model the bot runs drops off the list: an issue, before any new-model one
+            asked.clear()
+            raised.clear()
+            pages[:] = [{"data": [m for m in in_use if m["id"] != "claude-haiku-5-5"]}]
+            lines = model_watch.check()
+            assert [t for t, _, _ in raised] == ["Claude model no longer offered: claude-haiku-5-5"]
+            assert "parsing" in raised[0][1] and "fails" in raised[0][1], raised
+            assert lines == ["Claude models: `anthropic/claude-haiku-5-5` is no longer listed; opened an issue."], lines
+            # an empty or failed list is never read as every model gone
+            raised.clear()
+            asked.clear()
+            pages[:] = [{"data": []}]
+            assert model_watch.check() == ["Claude models: not checked (the list came back empty)."]
+            model_watch.requests.get = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("sk-fake"))  # type: ignore[assignment]
+            assert model_watch.check() == ["Claude models: not checked (RuntimeError)."]
+            assert raised == []
+        with env():
+            assert "no ANTHROPIC_API_KEY" in model_watch.check()[0]
+    finally:
+        model_watch.requests.get, model_watch.alerts.raise_alert = real_get, real_alert  # type: ignore[assignment]
+    # the roles cover every model the bot runs by default
+    assert set(model_watch.ROLES) == set(budget.ANTHROPIC_IDS.values()), model_watch.ROLES
+    print("model watch: ok")
 
 
 def check_scorecard() -> None:
@@ -2142,6 +2257,7 @@ if __name__ == "__main__":
     check_own_key()
     check_alerts()
     check_watchdog()
+    check_model_watch()
     check_scorecard()
     check_aggregation()
     check_guards()

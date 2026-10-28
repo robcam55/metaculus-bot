@@ -9,7 +9,7 @@ questions a season against professional forecasters, with no money at risk.
 ## What's different from the template
 
 The changes are in `main.py` (`RcForecastBot`), `budget.py`, `spend.py`, `alerts.py`,
-`forecast_guards.py`, `clock_watchdog.py` and `scorecard.py`:
+`forecast_guards.py`, `clock_watchdog.py`, `model_watch.py` and `scorecard.py`:
 - **Claude models, on Metaculus's credits first.**
   - Metaculus's donated OpenRouter credits (`OPENROUTER_API_KEY`) pay before a personal
     `ANTHROPIC_API_KEY`.
@@ -153,6 +153,11 @@ The changes are in `main.py` (`RcForecastBot`), `budget.py`, `spend.py`, `alerts
   - One run forecasts at most 25 new questions, soonest-closing first, so a new MiniBench
     round can't outlast the 60-minute timeout. The rest wait 20 minutes for the next run.
   - The Metaculus Cup workflow is manual-only.
+  - **New Claude models are flagged, not switched to.** Once a day `model_watch.yaml`
+    lists the models your key can use and opens one issue for each Claude model released
+    since 2026-10-28, saying which role it could take and how to try it. It also opens an
+    issue if a model the bot runs drops off the list. The Test Bot's model inputs try a new
+    model on bot-testing-area questions without a code change (Setup, step 10).
 - **A calibration scorecard in the weekly review (`scorecard.py`).** Mean spot peer score
   per question with its standard error, by tournament and type; binary calibration;
   where numeric outcomes fell against the forecasters' 10th and 90th percentiles; and the
@@ -197,6 +202,8 @@ newer local litellm once hid a call that crashes on the pinned one.
      split by research, forecasts and parsing.
    - Setting "Who pays" to `own-key` runs it on your own key instead (step 9).
      "Questions" sets how many it forecasts (empty: `TEST_QUESTIONS`, or 3).
+   - The forecaster, researcher and parser inputs try another model in that role for this
+     run only (step 10). Empty runs the bot's own.
 6. **Turn it on.** Set the repository variable `BOT_ENABLED` to `true`.
 7. **Start the 20-minute clock.** GitHub's own schedule fires only about five times a day.
    The Worker in `trigger/` starts the workflow every 20 minutes instead.
@@ -225,8 +232,8 @@ newer local litellm once hid a call that crashes on the pinned one.
    stopped; make a new token and repeat step 3.
 8. **The backup clock's 60-day pause.** GitHub disables a scheduled workflow in a public
    repo after 60 days without a commit, and a disabled workflow refuses every trigger. Only
-   the backup clock (`backup_clock.yaml`) and the weekly review have a schedule, so only
-   they can lapse; the Worker keeps starting the tournament workflow either way. GitHub
+   the backup clock (`backup_clock.yaml`), the model watch (`model_watch.yaml`) and the
+   weekly review have a schedule, so only they can lapse; the Worker keeps starting the tournament workflow either way. GitHub
    emails a week before. The Cloudflare watchdog runs inside the backup clock and lapses
    with it. To keep both, push any commit within 60 days of the last (for this season, one
    after about Nov 8 lasts to Jan 6), or re-enable it afterwards (`Actions → Backup clock →
@@ -262,6 +269,33 @@ newer local litellm once hid a call that crashes on the pinned one.
       the research calls' cache reads.
 
    The Metaculus Cup workflow uses this key too, but only when you run it by hand.
+10. **When a new Claude model comes out.** An issue titled "New Claude model to evaluate"
+    opens within a day of the release, mentioning you. Nothing switches on its own: two
+    releases in a row each rejected a setting the bot sent (Haiku 5.5 the parser's
+    temperature, Sonnet 5.5 a way of turning thinking off), and every question that fails
+    scores zero. To evaluate it:
+    1. **What changed.** Read Anthropic's migration guide and pricing for it: settings it
+       rejects, new defaults such as effort, and a new tokenizer, which changes the cost
+       of a question.
+    2. **Does the bot run on it.** `Actions → Test Bot → Run workflow` with "Who pays" set
+       to `own-key` and the new model's id (`anthropic/claude-...`) in the forecaster,
+       researcher or parser input. That's three bot-testing-area questions, about $2,
+       never tournament questions. The run should go green, the run page should list the
+       model under "On trial", and its spend should have a figure (litellm has to know
+       the price).
+    3. **Is it better.** Not by re-forecasting resolved questions: a newer model's
+       training data runs later, so it may already know the answers. Use evidence
+       gathered before the questions resolved: Metaculus's own bots on the new model in
+       FutureEval, if it runs any; benchmarks scored on live questions, such as
+       ForecastBench; and the price against any gain.
+    4. **Switch.** Change the id in `budget.py` (`OPUS`, `SONNET` or `HAIKU`, and
+       `ANTHROPIC_IDS`; `main.py` reads them from there), run the offline checks and the
+       Test Bot, and merge, ideally between MiniBench rounds so each round runs on one
+       model. Then close the issue; it won't open again.
+
+    An issue titled "Claude model no longer offered" means a model the bot runs is gone
+    from your key's list and every call to it fails: switch that one first. Anthropic
+    also emails deprecation notices to the account well before a model is retired.
 
 Other optional repository variables (empty means the default):
 
@@ -355,6 +389,7 @@ The main architectural choices and the reasons behind them. Each links to where 
 
   — Claude's 2026-10-28 health review; Rob's go-ahead that day, built in [#13](https://github.com/robcam55/metaculus-bot/pull/13).
 - **Rob's key also when the credits' balance can't be read, or there's no OpenRouter key.** Once the credits ran out (2026-10-25), an unreadable balance sent a run back onto them, uncapped, where every question would fail. Paying with Rob's key for that run costs at most one run's questions while credits remain. Without any OpenRouter key, FutureEval and MiniBench used to fall through to the Metaculus Cup's unpaced Sonnet 5 × 5, ignoring `BUDGET_TIER=pause`.
+- **New Claude models flagged daily, never switched to automatically (`model_watch.py`).** Rob asked on 2026-10-28 to evaluate each new Claude release so the bot doesn't fall behind, by auto-update or at least a notice. A notice was chosen over an automatic switch for four reasons. Anthropic's model ids are fixed versions with no "latest" alias. Haiku 5.5 and Sonnet 5.5 each rejected a setting the bot sent, which would have failed every question until fixed. A new tier can cost far more (Fable 5.1 is 2.5 times Opus 5.5). And litellm must know a new model's price before the spend figures work. The check lists models through Anthropic's Models API, which costs nothing, and opens one issue per model released after 2026-10-28. The Test Bot's trial inputs let a new model be tried on bot-testing-area questions, which the rules allow, before a switch. Quality isn't judged by backtests, because a newer model may have seen the outcomes in training. In [#13](https://github.com/robcam55/metaculus-bot/pull/13).
 
   — Claude's 2026-10-28 health review; Rob's go-ahead that day, built in [#13](https://github.com/robcam55/metaculus-bot/pull/13).
 
@@ -408,6 +443,7 @@ Instructions for getting your METACULUS_TOKEN, OPENROUTER_API_KEY, or optional s
 ## Changing the Github automation
 To run a different script under the same workflows, edit the `poetry run python main.py` line in the appropriate file under `.github/workflows/` and replace `main.py` with your script. The workflows that exist:
 - `test_bot.yaml` — manual-trigger smoke test against the bot-testing-area tournament.
+- `model_watch.yaml` — daily check for new Claude models (opens an issue; switches nothing).
 - `run_bot_on_tournament.yaml` — every 20 min on the live AIB tournament + MiniBench.
 - `run_bot_on_metaculus_cup.yaml` — every 2 days on the Metaculus Cup.
 
