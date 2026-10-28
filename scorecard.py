@@ -26,7 +26,10 @@ from collections import defaultdict
 from typing import Any
 
 BINS = ((0.0, 0.1), (0.1, 0.3), (0.3, 0.5), (0.5, 0.7), (0.7, 0.9), (0.9, 1.0001))
-_PERCENTILE = re.compile(r"([\d.]+)% chance of value below (-?[\d.eE+]+)")
+# forecasting-tools prints values with str(round(v, 6)), so small ones come as "1e-05"
+_PERCENTILE = re.compile(r"([\d.]+)% chance of value below (-?\d+(?:\.\d*)?(?:[eE][+-]?\d+)?)")
+# How Metaculus resolves an open-bound question whose outcome fell beyond its range
+_BEYOND = {"above_upper_bound": math.inf, "below_lower_bound": -math.inf}
 
 
 def _mean_se(values: list[float]) -> str:
@@ -100,8 +103,16 @@ def _rate_se(outcomes: tuple[float, ...]) -> float:
 
 
 def _forecasters(q: dict) -> list[str]:
-    traces = [t for t in q.get("traces") or [] if t.get("forecasters")]
-    return [f.get("prediction") or "" for f in traces[-1]["forecasters"]] if traces else []
+    """The forecasters of the run that was scored: the latest before the spot scoring time,
+    as bot-review picks it (its traces come newest first), else the latest."""
+    traces = sorted(
+        (t for t in q.get("traces") or [] if t.get("forecasters")),
+        key=lambda t: t.get("run_time") or "",
+    )
+    scored_at = q.get("spot_scoring_time")
+    before = [t for t in traces if scored_at and (t.get("run_time") or "") <= scored_at]
+    chosen = (before or traces)[-1:]
+    return [f.get("prediction") or "" for f in chosen[0]["forecasters"]] if chosen else []
 
 
 def numeric_coverage(questions: list[dict]) -> list[str]:
@@ -109,12 +120,16 @@ def numeric_coverage(questions: list[dict]) -> list[str]:
     for q in questions:
         if q.get("question_type") not in ("numeric", "discrete"):
             continue
+        resolution = q.get("resolution")
         try:
-            outcome = float(q.get("resolution"))
+            outcome = _BEYOND.get(resolution) or float(resolution)
         except (TypeError, ValueError):
-            continue  # annulled, or resolved beyond a bound
+            continue  # annulled or ambiguous
         for text in _forecasters(q):
-            points = {round(float(p) / 100, 2): float(v) for p, v in _PERCENTILE.findall(text)}
+            try:
+                points = {round(float(p) / 100, 2): float(v) for p, v in _PERCENTILE.findall(text)}
+            except ValueError:
+                continue  # a forecast written some other way: skipped, not fatal
             if 0.1 not in points or 0.9 not in points:
                 continue
             if outcome < points[0.1]:
@@ -175,5 +190,9 @@ def scorecard(review: dict[str, Any]) -> list[str]:
 
 
 if __name__ == "__main__":
-    with open(sys.argv[1] if len(sys.argv) > 1 else "review.json", encoding="utf-8") as f:
-        print("\n".join(scorecard(json.load(f))))
+    # Never fails the review: a scorecard problem must not hide bot-review's own summary
+    try:
+        with open(sys.argv[1] if len(sys.argv) > 1 else "review.json", encoding="utf-8") as f:
+            print("\n".join(scorecard(json.load(f))))
+    except Exception as e:
+        print(f"Calibration scorecard unavailable ({type(e).__name__}: {e}).")

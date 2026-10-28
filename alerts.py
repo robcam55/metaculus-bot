@@ -4,7 +4,8 @@ Alerts that reach Rob as GitHub issues.
 The workflow runs every 20 minutes, so a run that fails to get attention would email Rob
 every 20 minutes for as long as the cause lasts. An alert instead opens one issue the first
 time its event happens, mentioning the repository's owner. Later runs find an issue with
-the same title, open or closed (for Rob's own key, open), and open nothing. Each title
+the same title, open or closed (for Rob's own key and the Cloudflare clock, open), and
+open nothing. Each title
 names what makes the event new: a new credit limit after a Metaculus top-up, or a new
 month for Rob's own key.
 
@@ -117,7 +118,8 @@ def credits_out(left: float, limit: float | None, own_key: bool) -> bool:
 # Rob's key's alerts count only while their issue is open: after he raises the limit or
 # replaces the key and closes the issue, a second stop the same month alerts again
 REOPEN_NOTE = (
-    " Close this issue once that's done: if it happens again this month, a new issue opens."
+    " Leave this issue open while the bot is paused, and close it once it's forecasting"
+    " again: if it stops again this month, a new issue opens."
 )
 
 

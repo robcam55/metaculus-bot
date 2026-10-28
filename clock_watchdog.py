@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 from datetime import datetime, timedelta, timezone
 
 import requests
@@ -33,8 +34,12 @@ TITLE = "The Cloudflare clock stopped"
 
 
 def last_clock_run(repo: str, token: str, timeout: float = 15) -> datetime | None:
-    """When the newest tournament run started by dispatch, other than the backup clock's
-    own (those are github-actions[bot]'s), was created; None if none is listed."""
+    """When the newest tournament run the Worker started was created; None if none is
+    listed. The workflow's run-name ends in its source, "(cloudflare)", "(backup)" or
+    "(manual)", so neither the backup clock's runs nor Rob's own hide a stopped Worker.
+    Runs from before the run-name (which read only "Forecast on new AI tournament
+    questions") count unless the backup clock's own token, github-actions[bot], started
+    them."""
     response = requests.get(
         f"{alerts.API}/repos/{repo}/actions/workflows/{WORKFLOW}/runs",
         headers={"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json"},
@@ -43,7 +48,12 @@ def last_clock_run(repo: str, token: str, timeout: float = 15) -> datetime | Non
     )
     response.raise_for_status()
     for run in response.json().get("workflow_runs", []):
-        if (run.get("triggering_actor") or {}).get("login") != alerts.BOT_LOGIN:
+        source = re.search(r"\((\w+)\)\s*$", run.get("display_title") or "")
+        if source:
+            worker = source.group(1) == "cloudflare"
+        else:
+            worker = (run.get("triggering_actor") or {}).get("login") != alerts.BOT_LOGIN
+        if worker:
             return datetime.fromisoformat(run["created_at"].replace("Z", "+00:00"))
     return None
 
@@ -62,19 +72,20 @@ def check(now: datetime | None = None) -> str:
     if last is not None and now - last <= STALE_AFTER:
         return f"Cloudflare clock: ticking (last run {last:%Y-%m-%d %H:%M} UTC)."
     since = "no run it started is listed" if last is None else f"its last run was {last:%Y-%m-%d %H:%M} UTC"
-    alerts.raise_alert(
+    opened = alerts.raise_alert(
         TITLE,
         f"The Cloudflare Worker hasn't started the tournament workflow for over"
         f" {STALE_AFTER.total_seconds() / 3600:.0f} hours ({since}), so the bot is running"
         " only on the backup clock, about every four hours, and missing FutureEval"
         " questions. Its logs are in Cloudflare's dashboard (Workers, metaculus-bot-trigger)."
         " Usually its GitHub token expired: make a new one (README, Setup step 7) and run"
-        " `npx wrangler secret put GITHUB_TOKEN --config trigger/wrangler.jsonc`. Close this"
-        " issue once the runs are back every 20 minutes; if the clock stops again, a new"
-        " issue opens.",
+        " `npx wrangler secret put GITHUB_TOKEN --config trigger/wrangler.jsonc`. Leave this"
+        " issue open until the runs are back every 20 minutes, then close it; if the clock"
+        " stops again, a new issue opens.",
         open_only=True,
     )
-    return f"Cloudflare clock: stopped ({since}); alert raised."
+    told = "opened an issue" if opened else "its issue is already open, or couldn't be opened"
+    return f"Cloudflare clock: stopped ({since}); {told}."
 
 
 if __name__ == "__main__":

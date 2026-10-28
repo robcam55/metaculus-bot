@@ -224,18 +224,7 @@ def _litellm_estimate(response: Any, model: str, searches: int) -> float | None:
     anthropic = model.startswith(("anthropic/", "claude-"))
     if anthropic and (prompt or completion):
         try:
-            import litellm
-
-            if any(cached):
-                # prompt_tokens includes the cached tokens, which cost a tenth of the
-                # input price to read (Sonnet 5; Opus 5.5 a twentieth) and 1.25 times it
-                # to write: litellm prices those from the usage itself
-                costs = litellm.cost_per_token(model=model, usage_object=usage)
-            else:
-                costs = litellm.cost_per_token(
-                    model=model, prompt_tokens=prompt, completion_tokens=completion
-                )
-            tokens = sum(_number(c) or 0.0 for c in costs)
+            tokens = _anthropic_tokens(model, prompt, completion, *cached)
         except Exception:  # a model litellm doesn't price
             tokens = 0.0
         if tokens > 0:
@@ -251,6 +240,25 @@ def _litellm_estimate(response: Any, model: str, searches: int) -> float | None:
     except Exception:
         return None
     return cost or None
+
+
+def _anthropic_tokens(model: str, prompt: int, completion: int, reads: int, writes: int) -> float:
+    """Tokens at litellm's prices for Anthropic's model. prompt_tokens includes the cached
+    tokens, which cost a tenth of the input price to read (Sonnet 5; Opus 5.5 a twentieth)
+    and 1.25 times it to write, so those are priced from the raw counts: litellm's own
+    usage-based figure prices only a thinking summary's tokens as output when one is
+    returned."""
+    import litellm
+
+    if reads or writes:
+        row = litellm.model_cost.get(model.removeprefix("anthropic/")) or {}
+        base, output = row.get("input_cost_per_token"), row.get("output_cost_per_token")
+        if base and output:
+            read = row.get("cache_read_input_token_cost") or base * 0.1
+            write = row.get("cache_creation_input_token_cost") or base * 1.25
+            return (prompt - reads - writes) * base + reads * read + writes * write + completion * output
+    costs = litellm.cost_per_token(model=model, prompt_tokens=prompt, completion_tokens=completion)
+    return sum(_number(c) or 0.0 for c in costs)
 
 
 def _cache_tokens(usage: Any) -> tuple[int, int]:
@@ -429,8 +437,11 @@ def list_price(call: Call, prices: dict[str, dict[str, float]]) -> float | None:
     price = prices.get(openrouter_id(call.model))
     if not price or not (call.prompt_tokens or call.completion_tokens):
         return None
+    # cached input at Anthropic's rates: a tenth of the input price to read, 1.25x to write
+    plain = call.prompt_tokens - call.cache_reads - call.cache_writes
+    prompt = plain + 0.1 * call.cache_reads + 1.25 * call.cache_writes
     return (
-        call.prompt_tokens * price["prompt"]
+        prompt * price["prompt"]
         + call.completion_tokens * price["completion"]
         + call.searches * price["web_search"]
     )

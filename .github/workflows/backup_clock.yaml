@@ -7,7 +7,9 @@ name: Backup clock
 # season, two weeks before it ends). Now only this backup can lapse; the forecasting
 # workflow has no schedule. GitHub fires this about every four hours, not every 20
 # minutes. Each tick starts the tournament workflow, then checks that the Cloudflare clock
-# is still starting it too (watchdog.py), and opens an issue if it isn't.
+# is still starting it too (clock_watchdog.py), and opens an issue if it isn't. This
+# workflow and the weekly review are the only ones that can lapse: a commit within 60
+# days keeps them, and Actions -> Backup clock -> Enable workflow brings this one back.
 on:
   schedule:
     - cron: "7,27,47 * * * *" # offset off the hour, like the Worker
@@ -28,8 +30,10 @@ jobs:
       contents: read
       issues: write # the watchdog's alert
     steps:
-      # Started with this workflow's own token, which may start workflow_dispatch runs
+      # Started with this workflow's own token, which may start workflow_dispatch runs.
+      # A failure here still lets the watchdog run
       - name: Start the tournament workflow
+        continue-on-error: true
         run: gh workflow run run_bot_on_tournament.yaml --ref main -f source=backup
         env:
           GH_TOKEN: ${{ github.token }}
@@ -49,6 +53,6 @@ jobs:
       - name: Install dependencies
         run: poetry install --no-interaction --no-root
       - name: Check the Cloudflare clock
-        run: poetry run python watchdog.py
+        run: poetry run python clock_watchdog.py
         env:
           GITHUB_TOKEN: ${{ github.token }} # reads the runs, opens the alert issue

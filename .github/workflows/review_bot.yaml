@@ -47,6 +47,7 @@ jobs:
         env:
           METACULUS_TOKEN: ${{ secrets.METACULUS_TOKEN }}
       - name: Add the calibration scorecard
+        continue-on-error: true # never at the cost of bot-review's summary or the artifact
         run: |
           echo >> review.md
           poetry run python scorecard.py review.json >> review.md

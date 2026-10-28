@@ -19,7 +19,9 @@ every forecast are paid for. The 2026-10-28 review reproduced each case offline:
 Numeric forecasts are combined with `mixture`, the mean of the forecasters' CDFs, rather
 than the package's pointwise median. The median keeps the spread of a single forecast,
 and language models' numeric ranges run too narrow (FermiEval, QuantSightBench). Under
-the log score a mixture never scores below the average of its members.
+the log score a mixture never scores below the average of its members. (Conditional
+questions' numeric legs still use the package's median; the bot tournaments don't ask
+conditional questions.)
 """
 
 from __future__ import annotations
@@ -156,8 +158,10 @@ def spread_repeats(
     percentiles: list[Percentile], question: NumericQuestion | DateQuestion
 ) -> list[Percentile]:
     """The percentiles in order, with any value repeated at or below an open lower bound
-    nudged up by a millionth of the range at each repeat. 0.2.92 moves such repeats a
-    hair below the bound, and its CDF then isn't increasing (the module's first case).
+    nudged up at each repeat: by a millionth of the range, or on a log-scaled question a
+    millionth of its distance from the zero point (a step in log space, so a range of
+    1 to 1e9 doesn't push it past the next percentile). 0.2.92 moves such repeats a hair
+    below the bound, and its CDF then isn't increasing (the module's first case).
     Repeats inside the range, at the upper bound or at a closed bound are left alone: the
     package handles those, and a discrete question's repeated integers stay in their bin."""
     ordered = sorted(percentiles, key=lambda p: p.percentile)
@@ -167,42 +171,47 @@ def spread_repeats(
         lower, upper = question.lower_bound.timestamp(), question.upper_bound.timestamp()
     else:
         lower, upper = question.lower_bound, question.upper_bound
-    step = 1e-6 * (upper - lower)
+    zero = getattr(question, "zero_point", None)
     spread: list[Percentile] = []
     for p in ordered:
         value = p.value
         if spread and value <= lower and value <= spread[-1].value:
-            value = spread[-1].value + step
+            previous = spread[-1].value
+            if zero is not None and previous > zero:
+                value = zero + (previous - zero) * (1 + 1e-6)
+            else:
+                value = previous + 1e-6 * (upper - lower)
         spread.append(Percentile(percentile=p.percentile, value=value))
     return spread
 
 
-def _median_location(prediction: NumericDistribution) -> float:
-    """Where a forecast's CDF crosses 50%."""
-    cdf = prediction.get_cdf()
-    return float(
-        np.interp(0.5, [p.percentile for p in cdf], [p.value for p in cdf])
-    )
+def _band(heights: np.ndarray, x_axis: list[float]) -> tuple[float, float]:
+    """Where a CDF crosses 10% and 90%."""
+    low, high = np.interp([0.1, 0.9], heights, x_axis)
+    return float(low), float(high)
 
 
 def mixture(
     predictions: list[NumericDistribution], question: NumericQuestion | DateQuestion
 ) -> NumericDistribution:
-    """The forecasts' mean CDF, the mixture of their distributions. A forecast whose
-    median falls outside the middle 80% of the pointwise-median CDF (the same band as the
-    forecasters' own 10th to 90th percentiles; with an open bound the package keeps 5% of
-    the mass beyond it, so a 90% band would span the whole range) is left out first, so
-    one misread unit can't put a third of the mass in the wrong place, as it would in a
-    plain mixture (the median ignores it). With fewer than three forecasts nothing is left
-    out, since there's no majority to judge by."""
+    """The forecasts' mean CDF, the mixture of their distributions. Under the log score the
+    plain mixture never scores below the average of its members. A forecast whose own
+    10th-to-90th range doesn't even overlap that of the pointwise-median CDF is left out
+    first: that is a misread unit, say, which would put a third of the mass in the wrong
+    place (the median ignores it). Ordinary disagreement, overlapping ranges, is what the
+    mixture is for and stays in. With fewer than three forecasts nothing is left out,
+    since there's no majority to judge by."""
     cdfs = [prediction.get_cdf() for prediction in predictions]
     x_axis = [p.value for p in cdfs[0]]
     heights = np.array([[p.percentile for p in cdf] for cdf in cdfs])
     kept = list(range(len(predictions)))
     if len(predictions) >= 3:
-        median = np.median(heights, axis=0)
-        low, high = np.interp([0.1, 0.9], median, x_axis)
-        inside = [i for i, p in enumerate(predictions) if low <= _median_location(p) <= high]
+        low, high = _band(np.median(heights, axis=0), x_axis)
+        inside = [
+            i
+            for i in range(len(predictions))
+            if _band(heights[i], x_axis)[1] >= low and _band(heights[i], x_axis)[0] <= high
+        ]
         if len(inside) >= 2 and len(inside) < len(predictions):
             logger.info(
                 f"Numeric mixture: left out {len(predictions) - len(inside)} forecast(s) far"

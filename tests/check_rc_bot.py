@@ -153,7 +153,7 @@ def check_routing() -> None:
         # the forecasters think at high effort, so they get the larger cap and timeout
         assert d["default"].litellm_kwargs["max_tokens"] == main.ANTHROPIC_FORECAST_MAX_TOKENS
         assert d["default"].litellm_kwargs["output_config"] == {"effort": "high"}
-        assert d["default"].litellm_kwargs["timeout"] == 600
+        assert d["default"].litellm_kwargs["timeout"] == 480
         assert model_of(d["parser"]) == "anthropic/claude-haiku-4-5"
         assert d["parser"].litellm_kwargs["temperature"] == 0
         # no AskNews: Sonnet 5 with Anthropic's own web search is the one source
@@ -982,8 +982,8 @@ def check_alerts() -> None:
 
 
 def check_watchdog() -> None:
-    """watchdog.py: the backup clock's check that the Cloudflare clock still ticks."""
-    import watchdog
+    """clock_watchdog.py: the backup clock's check that the Cloudflare clock still ticks."""
+    import clock_watchdog as watchdog
 
     now = datetime(2026, 11, 20, 12, 0, tzinfo=timezone.utc)
     runs: list[dict] = []
@@ -1001,9 +1001,10 @@ def check_watchdog() -> None:
         assert params["event"] == "workflow_dispatch", params
         return FakeResponse()
 
-    def run(minutes_ago: int, actor: str) -> dict:
+    def run(minutes_ago: int, source: str | None, actor: str = "robcam55") -> dict:
         created = (now - timedelta(minutes=minutes_ago)).strftime("%Y-%m-%dT%H:%M:%SZ")
-        return {"created_at": created, "triggering_actor": {"login": actor}}
+        title = "Forecast on new AI tournament questions" + (f" ({source})" if source else "")
+        return {"created_at": created, "display_title": title, "triggering_actor": {"login": actor}}
 
     real_get, real_alert = watchdog.requests.get, watchdog.alerts.raise_alert
     try:
@@ -1011,14 +1012,18 @@ def check_watchdog() -> None:
         watchdog.alerts.raise_alert = lambda title, body, **kw: raised.append((title, kw)) or True  # type: ignore[assignment]
         with env(GITHUB_TOKEN="ghs_fake", GITHUB_REPOSITORY="o/r"):
             # ticking: the Worker's run 15 minutes ago, after the backup clock's own
-            runs[:] = [run(2, "github-actions[bot]"), run(15, "robcam55")]
+            runs[:] = [run(2, "backup", "github-actions[bot]"), run(15, "cloudflare")]
             assert watchdog.check(now).startswith("Cloudflare clock: ticking"), raised
             assert raised == []
-            # stopped: only the backup clock's runs for three hours, or none at all
-            runs[:] = [run(5, "github-actions[bot]"), run(200, "robcam55")]
+            # stopped: only the backup clock's runs and Rob's own for three hours (a run by
+            # hand doesn't hide a stopped Worker, though Rob's login starts both)
+            runs[:] = [run(5, "backup", "github-actions[bot]"), run(30, "manual"), run(200, "cloudflare")]
             line = watchdog.check(now)
-            assert "stopped (its last run was 2026-11-20 08:40 UTC)" in line, line
+            assert "stopped (its last run was 2026-11-20 08:40 UTC); opened an issue" in line, line
             assert raised == [("The Cloudflare clock stopped", {"open_only": True})], raised
+            # runs from before the run-name: told apart by who started them
+            runs[:] = [run(5, None, "github-actions[bot]"), run(15, None)]
+            assert watchdog.check(now).startswith("Cloudflare clock: ticking")
             runs[:] = []
             assert "no run it started is listed" in watchdog.check(now)
             # GitHub unreachable: noted, never raised, so the tick itself goes on
@@ -1066,6 +1071,16 @@ def check_scorecard() -> None:
         "1 resolved: mean probability on the winner 40%; the winner was the favourite 0% of the time.",
     ):
         assert expected in text, (expected, text)
+    # values in scientific notation, outcomes beyond an open bound, and the run that was
+    # scored rather than a later re-post
+    tiny = "Probability distribution:\n- 10.00% chance of value below 1e-05\n- 90.00% chance of value below 2.5e-05"
+    beyond = {**numeric, "resolution": "above_upper_bound", "spot_scoring_time": "2026-10-20T15:00:00Z",
+              "traces": [
+                  {"run_time": "2026-10-20T12:00:00Z", "forecasters": [{"prediction": tiny}]},
+                  {"run_time": "2026-10-21T12:00:00Z", "forecasters": [{"prediction": "unparseable 1e"}]},
+              ]}  # fmt: skip
+    text = "\n".join(scorecard.scorecard({"questions": [beyond]}))
+    assert "1 forecaster ranges: outcome below the 10th percentile 0%, between the 10th and 90th 0%, above the 90th 100%" in text, text
     empty = "\n".join(scorecard.scorecard({"questions": []}))
     assert "No resolved binary forecasts yet." in empty, empty
     print("scorecard: ok")
@@ -1145,6 +1160,11 @@ def check_guards() -> None:
     below = fg.spread_repeats(pcts([-5, -5, -5, 3, 9, 12]), q)
     assert all(close(p.value, v) for p, v in zip(below, [-5, -5 + 1e-4, -5 + 2e-4])), below
     # repeats inside the range, and repeats at a closed bound, are the package's to handle
+    # log-scaled, 1 to 1e9: a step in log space, so the repeat stays below the next value
+    log = NumericQuestion(**{**q.model_dump(), "lower_bound": 1, "upper_bound": 1e9, "zero_point": 0})
+    logged = fg.spread_repeats(pcts([1, 1, 3, 10, 100, 1000]), log)
+    assert 1 < logged[1].value < 1.0001 and logged[2].value == 3, logged
+    assert NumericDistribution.from_question(logged, log).get_cdf()
     inside = pcts([10, 10, 20, 30, 40, 50])
     assert fg.spread_repeats(inside, q) == inside
     closed = q.model_copy(update={"open_lower_bound": False})
@@ -1175,6 +1195,11 @@ def check_guards() -> None:
         mean = [sum(t) / 3 for t in zip(*([p.percentile for p in d.get_cdf()] for d in (a, b, c)))]
         # (the declared CDF; posting standardises it again, as it does the package's median)
         assert all(abs(m.percentile - x) < 1e-6 for m, x in zip(mixed.declared_percentiles, mean))
+        # ordinary disagreement, ranges that overlap, stays in
+        d = dist([45, 60, 70, 80, 90, 100], wide)
+        mixed = asyncio.run(bot._aggregate_predictions([a, b, d], wide))
+        three = [sum(t) / 3 for t in zip(*([p.percentile for p in x.get_cdf()] for x in (a, b, d)))]
+        assert all(abs(m.percentile - x) < 1e-6 for m, x in zip(mixed.declared_percentiles, three))
         far = dist([600, 700, 750, 800, 850, 900], wide)  # the same forecast in the wrong unit
         mixed = asyncio.run(bot._aggregate_predictions([a, b, far], wide))
         both = [sum(t) / 2 for t in zip(*([p.percentile for p in d.get_cdf()] for d in (a, b)))]
@@ -1277,15 +1302,25 @@ def check_own_key_research() -> None:
             expected = 3000 * 2e-6 + 40000 * 2e-7 + 20000 * 2.5e-6 + 2000 * 1e-5 + 4 * 0.01
             assert abs(call.cost - expected) < 1e-9, (call.cost, expected)
 
-            # a reply whose server-side search loop paused holds only narration: it fails,
-            # so the research counts as missing rather than as "I'll search for this."
-            replies.append(anthropic_search_reply("pause_turn"))
-            try:
-                asyncio.run(llm.invoke("Research this question."))
-            except Exception as e:
-                assert "stopped early (pause_turn)" in repr(e), repr(e)
-            else:
-                raise AssertionError("a reply cut short must not count as research")
+            # a reply whose server-side search loop paused, ran out of tokens or was refused
+            # holds only narration: it comes back empty (run_research counts that as no
+            # research) and is not retried, since a retry reruns the whole search
+            llm.allowed_tries = 2
+            for stop in ("pause_turn", "max_tokens", "refusal"):
+                sent.clear()
+                replies[:] = [anthropic_search_reply(stop), anthropic_search_reply()]
+                assert asyncio.run(llm.invoke("Research this question.")) == "", stop
+                assert len(sent) == 1, (stop, len(sent))
+            replies.clear()
+            llm.allowed_tries = 1
+
+            # nothing cited (searches run inside code under dynamic filtering): the pages
+            # the searches returned stand in as the sources
+            uncited = anthropic_search_reply()
+            uncited["content"][-1].pop("citations")
+            replies.append(uncited)
+            text = asyncio.run(llm.invoke("Research this question."))
+            assert "https://www.reuters.com/world/example-2026-10-27/" in text, text
 
             # an Opus 5.5 forecast: effort high in output_config, the larger reply cap, no
             # thinking budget or sampling parameters (Opus 5.5 rejects both)

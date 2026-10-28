@@ -21,7 +21,8 @@ export default {
         "User-Agent": "metaculus-bot-trigger",
         "X-GitHub-Api-Version": "2022-11-28",
       },
-      // "cloudflare" tells the workflow to honour BOT_ENABLED, as its own schedule does
+      // "cloudflare" tells the workflow to honour BOT_ENABLED, as the backup clock's runs do,
+      // and names the run "(cloudflare)", which the backup clock's watchdog looks for
       body: JSON.stringify({ ref: "main", inputs: { source: "cloudflare" } }),
     });
     if (!response.ok) {

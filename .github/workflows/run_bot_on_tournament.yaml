@@ -1,4 +1,7 @@
 name: Forecast on new AI tournament questions
+# The run's source in its title, so the backup clock's watchdog can tell the Worker's runs
+# from its own and from hand-started ones
+run-name: Forecast on new AI tournament questions (${{ inputs.source }})
 
 # Started only by workflow_dispatch: every 20 minutes by the Cloudflare Worker in trigger/,
 # about every four hours by the backup clock (backup_clock.yaml), or by hand. It has no
@@ -23,7 +26,7 @@ concurrency:
 # minutes before the secrets exist. Running it by hand always works.
 jobs:
   forecast_job:
-    if: vars.BOT_ENABLED == 'true' || inputs.source == 'manual'
+    if: vars.BOT_ENABLED == 'true' || (inputs.source != 'cloudflare' && inputs.source != 'backup')
     runs-on: ubuntu-latest # determines the machine that will run the job - keep as is
     timeout-minutes: 60
     # The bot opens an issue (one email) when the credits run low or Rob's own key stops,

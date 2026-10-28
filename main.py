@@ -61,6 +61,7 @@ from forecasting_tools import (
     structure_output,
 )
 from forecasting_tools.ai_models import general_llm
+from forecasting_tools.ai_models.ai_utils.response_types import TextTokenCostResponse
 import litellm
 
 dotenv.load_dotenv()
@@ -133,8 +134,9 @@ DEFAULT_FORECASTER_EFFORT = "high"
 # fewer of them are billed as input.
 ANTHROPIC_SEARCH_TOOL = {"type": "web_search_20260209", "name": "web_search", "max_uses": 5}
 # Stop reasons (as litellm reports them) for a research reply that ended before its
-# answer: a server-side search loop paused, or the reply ran out of tokens
-CUT_SHORT = ("pause_turn", "length")
+# answer: a server-side search loop paused, the reply ran out of tokens, or a safety
+# classifier stopped it
+CUT_SHORT = ("pause_turn", "length", "refusal")
 
 # What Anthropic says when a key can't spend: a workspace or organization spend limit
 # (400 invalid_request_error, or 429 enforced_spend_limit_reached), prepaid credit gone,
@@ -433,9 +435,25 @@ class AnthropicSearchLlm(GeneralLlm):
       at a tenth of the input price, instead of billing every round again in full. The
       prompt itself is too short to cache.
     - Turn away a reply that stopped early (CUT_SHORT). GeneralLlm accepts any text, so
-      a reply holding only "I'll search for this." counted as research.
+      a reply holding only "I'll search for this." counted as research. It comes back
+      empty instead, which run_research counts as "returned nothing", and isn't retried:
+      a fresh request reruns the whole search and usually stops the same way.
     The researcher is always invoked with a plain prompt, which model_input_to_message
     turns into one user message."""
+
+    async def _mockable_direct_call_to_model(self, prompt):
+        try:
+            return await super()._mockable_direct_call_to_model(prompt)
+        except ResearchCutShort as e:  # caught here, inside GeneralLlm's retries
+            logger.warning(f"{e}: no research from {self.model} this time")
+            return TextTokenCostResponse(
+                data="",
+                prompt_tokens_used=0,
+                completion_tokens_used=0,
+                total_tokens_used=0,
+                model=self.model,
+                cost=0.0,
+            )
 
     def model_input_to_message(self, user_input, system_prompt=None):
         messages = super().model_input_to_message(user_input, system_prompt)
@@ -459,6 +477,15 @@ class AnthropicSearchLlm(GeneralLlm):
                 url = citation.get("url") if isinstance(citation, dict) else None
                 if url and url not in urls:
                     urls.append(url)
+        if not urls:
+            # Nothing cited (with dynamic filtering the searches run inside code, and
+            # the answer may cite none): the pages the searches returned, instead
+            for result in fields.get("web_search_results") or []:
+                found = result.get("content") if isinstance(result, dict) else None
+                for item in found if isinstance(found, list) else []:
+                    url = item.get("url") if isinstance(item, dict) else None
+                    if url and url not in urls:
+                        urls.append(url)
         return urls or GeneralLlm._extract_citations(response, choices)
 
 
@@ -505,8 +532,10 @@ def build_llms(
         model=forecaster,
         # Sonnet 5, Opus 5 and newer reject sampling parameters: send none
         temperature=None,
-        # more thinking takes longer: up to 10 minutes on Anthropic's API, not streamed
-        timeout=_env_int("FORECASTER_TIMEOUT_S", 600 if route == "anthropic" else 300),
+        # more thinking takes longer: up to 8 minutes on Anthropic's API, not streamed.
+        # Kept short of 10 so a dropped connection and its one retry stay well inside the
+        # job's 60 minutes
+        timeout=_env_int("FORECASTER_TIMEOUT_S", 480 if route == "anthropic" else 300),
         allowed_tries=2,
         **thinking,
     )
@@ -568,8 +597,9 @@ class RcForecastBot(ForecastBot):
     - Claude models, paid by Metaculus's donated credits (OPENROUTER_API_KEY) before a
       personal key (ANTHROPIC_API_KEY). On the donated credits, budget.py paces spending:
       each run reads the key's balance and picks Opus 5.5 or Sonnet 5 and the number of
-      predictions per tournament, MiniBench never below FutureEval. A personal key runs
-      Sonnet 5 unpaced. Haiku 4.5 parses; PARSER_MODEL overrides it.
+      predictions per tournament, MiniBench never below FutureEval. Rob's own key runs
+      the same tiers once the credits can't pay, or with no OpenRouter key; only the
+      Metaculus Cup's runs Sonnet 5 unpaced. Haiku 4.5 parses; PARSER_MODEL overrides it.
     - Two independent research sources per report: AskNews news search (one latest-news
       call by default, to stay inside the free tier; ASKNEWS_STRATEGY and ASKNEWS_ARTICLES
       change it) and a search-backed model (Sonnet 5 with ":online" through OpenRouter, or

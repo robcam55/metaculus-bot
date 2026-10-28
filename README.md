@@ -9,7 +9,7 @@ questions a season against professional forecasters, with no money at risk.
 ## What's different from the template
 
 The changes are in `main.py` (`RcForecastBot`), `budget.py`, `spend.py`, `alerts.py`,
-`forecast_guards.py`, `watchdog.py` and `scorecard.py`:
+`forecast_guards.py`, `clock_watchdog.py` and `scorecard.py`:
 - **Claude models, on Metaculus's credits first.**
   - Metaculus's donated OpenRouter credits (`OPENROUTER_API_KEY`) pay before a personal
     `ANTHROPIC_API_KEY`.
@@ -128,7 +128,8 @@ The changes are in `main.py` (`RcForecastBot`), `budget.py`, `spend.py`, `alerts
   more, binary questions use a trimmed mean (dropping the highest and lowest), which beat
   the median in Halawi et al. (2024). With three they use the package's median. Numeric,
   discrete and date questions use the mixture of the forecasts (their mean CDF), less any
-  far from the others, which is wider where they disagree than the package's median.
+  whose range doesn't overlap the others' at all (a misread unit), which is wider where
+  they disagree than the package's median.
 - **Guards for forecasting-tools 0.2.92 (`forecast_guards.py`).** One forecaster's answer
   could sink a whole question there, after its research was paid for. Numeric
   percentiles repeated at an open lower bound made a CDF that failed the question or froze
@@ -147,7 +148,7 @@ The changes are in `main.py` (`RcForecastBot`), `budget.py`, `spend.py`, `alerts
     starts the workflow every 20 minutes. GitHub's schedule is kept as a backup, in a
     workflow of its own (`backup_clock.yaml`), so GitHub's 60-day pause can't stop the
     tournament workflow. Each backup tick also checks the Worker is still starting runs
-    (`watchdog.py`) and opens an issue if not. Both clocks stay off until you set
+    (`clock_watchdog.py`) and opens an issue if not. Both clocks stay off until you set
     `BOT_ENABLED`.
   - One run forecasts at most 25 new questions, soonest-closing first, so a new MiniBench
     round can't outlast the 60-minute timeout. The rest wait 20 minutes for the next run.
@@ -226,15 +227,19 @@ newer local litellm once hid a call that crashes on the pinned one.
    repo after 60 days without a commit, and a disabled workflow refuses every trigger. Only
    the backup clock (`backup_clock.yaml`) and the weekly review have a schedule, so only
    they can lapse; the Worker keeps starting the tournament workflow either way. GitHub
-   emails a week before. To keep the backup, push any commit within 60 days of the last,
-   or re-enable it afterwards (`Actions → Backup clock → Enable workflow`).
+   emails a week before. The Cloudflare watchdog runs inside the backup clock and lapses
+   with it. To keep both, push any commit within 60 days of the last (for this season, one
+   after about Nov 8 lasts to Jan 6), or re-enable it afterwards (`Actions → Backup clock →
+   Enable workflow`).
 9. **Your own key, for when the credits run out (optional).** The bot moves to it once
    Metaculus's credits can't pay for another question (around $2 left), and back to the
    credits when Metaculus tops them up.
    At `opus-3` a question costs about $0.65 on your key (range $0.55 to $0.85; research
    is most of it). This season's volume is about 4 FutureEval questions a day plus a
    MiniBench round of about 60 every two weeks, so a month with three rounds starting
-   (November 2026) comes to about $160, and up to about $280 at the high end. A limit hit
+   (November 2026) comes to about 300 questions and $195 (range $165 to $255), before
+   whatever the forecasters' `high` effort adds: the Test Bot's and the first runs'
+   `Spend:` lines will show it. A limit hit
    mid-month pauses the bot, and every question it misses scores zero.
    1. In the Claude Console, create a workspace for the bot (Settings → Workspaces). The
       default workspace can't take a spend limit.
@@ -290,7 +295,7 @@ The main architectural choices and the reasons behind them. Each links to where 
   - **Why no storage.** Metaculus keeps the forecasts, and OpenRouter keeps the spend.
   - **Why off by default.** Runs the clocks start stay off until `BOT_ENABLED`, so they can't fail every 20 minutes before the secrets exist.
   - **Why the backup clock is a workflow of its own.** GitHub disables a scheduled workflow in a public repo after 60 days without a commit, and the disable refuses every trigger, `workflow_dispatch` included. With the backup schedule inside the tournament workflow, that pause (about Dec 23 from the Oct 24 commit, two weeks before the season ends) would have stopped the Worker's runs too. The tournament workflow now has no schedule; only the backup can lapse.
-  - **Why a watchdog.** When GitHub turns the Worker away, the error shows only in Cloudflare's logs and the bot drops to the backup clock, every four hours or so, missing a third to two thirds of FutureEval questions with every run green. `watchdog.py` opens an issue when no Worker run is under two hours old.
+  - **Why a watchdog.** When GitHub turns the Worker away, the error shows only in Cloudflare's logs and the bot drops to the backup clock, every four hours or so, missing a third to two thirds of FutureEval questions with every run green. `clock_watchdog.py` opens an issue when no Worker run is under two hours old.
 
   — [rc_trader's 2026-09-23 audit](https://github.com/robcam55/rc_trader/blob/main/docs/audit/2026-09-23-AUDIT.md) (§8, Rob's hosting choice, 2026-09-23). The Cloudflare clock is Rob's choice of 2026-10-02, built in [#3](https://github.com/robcam55/metaculus-bot/pull/3). The question windows are from [Metaculus's resources page](https://www.metaculus.com/notebooks/38928/ai-benchmark-resources/), and the `BOT_ENABLED` gate from [the workflow](.github/workflows/run_bot_on_tournament.yaml). No storage is *inferred*. The backup clock's own workflow and the watchdog came from Claude's health review of 2026-10-28, with Rob's go-ahead that day, in PR_LINK.
 - **Claude models: Opus 5.5 on Metaculus's credits and on Rob's key after them, Sonnet 5 on the Cup's personal key.** The bot is the external check on rc_trader's forecasting engine, which runs on Claude, and Metaculus's credits cover Anthropic models. — [rc_trader's 2026-09-23 audit](https://github.com/robcam55/rc_trader/blob/main/docs/audit/2026-09-23-AUDIT.md) (§8, D-14: "upgrade it as the §4 engine lands"). The switch to Opus 5.5 was Claude's, in [f4dfc32](https://github.com/robcam55/metaculus-bot/commit/f4dfc32), and Rob's credit application of 2026-09-24 described it.
@@ -338,12 +343,12 @@ The main architectural choices and the reasons behind them. Each links to where 
 - **Workflow actions pinned to commit SHAs, not version tags.** Every run carries the bot's API keys, including Rob's paid Anthropic, OpenAI and OpenRouter keys, and runs start every 20 minutes. A tag such as `@v1` can be moved to new code by the action's owner, or by anyone who takes over the owner's GitHub account. The OVHcloud CLI and LiteLLM 1.107.0 compromises of October 2026 both started that way. A commit SHA can't be moved. Each pin names its version in a comment, so an upgrade is a deliberate edit.
 
   — Rob, 2026-10-23 ("Yes — pin the third-party GitHub Actions to commit SHAs"), after Claude's Black October audit of 2026-10-22
-- **Forecasts at high effort on Rob's key.** Opus 5.5 thinks at `medium` when no effort is sent, one level below Opus 5's default, and the bot sent none. In Metaculus's Spring 2026 analysis, high-effort versions beat their standard-effort twins in 8 of 8 model pairs, but most of those pairs compared no thinking with thinking, so the step from `medium` to `high` on a model that always thinks is smaller and unproven. The forecasts are about $0.05 of a question's $0.60, so the extra thinking costs little. `FORECASTER_EFFORT` sets it back without a code change. On the credits route (OpenRouter) no effort is sent yet.
+- **Forecasts at high effort on Rob's key.** Opus 5.5 thinks at `medium` when no effort is sent, one level below Opus 5's default, and the bot sent none. In Metaculus's Spring 2026 analysis, high-effort versions beat their standard-effort twins in 8 of 8 model pairs, but most of those pairs compared no thinking with thinking, so the step from `medium` to `high` on a model that always thinks is smaller and unproven. The three forecasts were about $0.15 of a question's $0.60 to $0.65 at `medium`; the extra thinking's cost is unmeasured until the first own-key runs at `high` (their `Spend:` lines show it). `FORECASTER_EFFORT` sets it back without a code change. On the credits route (OpenRouter) no effort is sent yet.
 
   — Claude's proposal in the 2026-10-28 health review; Rob's go-ahead that day in chat ("move forward with all of your recommended enhancements that are within the rules of the competition"), built in PR_LINK.
 - **Guards for forecasting-tools 0.2.92, and a numeric mixture (`forecast_guards.py`).**
   - **Why guards.** Offline, one forecaster's answer could sink a whole question after its research was paid for, or freeze the run: numeric percentiles repeated at an open lower bound, and confident multiple-choice answers with several 0% options. Neither had happened live by 2026-10-28; each would have cost a question every time it did. 0.3.5 fixes the freeze but not the failed aggregation, and moving the lock mid-season was judged riskier than the bot-side guards.
-  - **Why a mixture.** Language models' numeric ranges run too narrow: nominal 90% intervals cover about 79% of outcomes at best (QuantSightBench, 2026). The package's pointwise median keeps one forecast's width; the mean CDF widens exactly where the forecasts disagree, and under the log score never scores below their average. On the 3 resolved numeric and discrete questions with every forecaster's percentiles on 2026-10-28, it beat the median on all 3, by 0.03 nats on average, too few to show anything. A forecast far from the others is left out first, so a misread unit can't cost a third of the mass.
+  - **Why a mixture.** Language models' numeric ranges run too narrow: nominal 90% intervals cover about 79% of outcomes at best (QuantSightBench, 2026). The package's pointwise median keeps one forecast's width; the mean CDF widens exactly where the forecasts disagree, and under the log score the plain mean never scores below their average. On the 3 resolved numeric and discrete questions with every forecaster's percentiles on 2026-10-28, it beat the median on all 3, by 0.03 nats on average, too few to show anything. A forecast whose 10th-to-90th range doesn't overlap the others' at all is left out first, so a misread unit can't cost a third of the mass; ordinary disagreement stays in. Conditional questions' numeric legs still use the package's median (the bot tournaments ask none).
 
   — Claude's 2026-10-28 health review (each failure reproduced offline and confirmed by two skeptic reviewers); Rob's go-ahead that day, built in PR_LINK.
 - **Research asks for the resolution source and published forecasts.** In Metaculus's Spring 2026 bot survey, checking similar questions or markets (r=+0.34) and reading sources directly (r=+0.33) were the research habits most associated with better scores, while the choice of search provider made no clear difference. The tournament's rules allow "publicly available forecasts on questions found on other platforms or on Metaculus itself". The evidence is correlational.
