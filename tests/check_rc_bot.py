@@ -36,8 +36,13 @@ KEYS = (
     "EXA_API_KEY",
     "RESEARCHER",
     "FORECASTER_MODEL",
+    "FORECASTER_EFFORT",
+    "FORECASTER_TIMEOUT_S",
     "PARSER_MODEL",
     "SEARCH_MODEL",
+    "TRIAL_FORECASTER_MODEL",
+    "TRIAL_RESEARCHER_MODEL",
+    "TRIAL_PARSER_MODEL",
     "METACULUS_TOKEN",
     "BUDGET_TIER",
     "TEST_QUESTIONS",
@@ -72,6 +77,7 @@ with env():
     import budget  # noqa: E402
 
     budget.KEY_RETRY_WAIT = 0.0  # the second balance read, without the wait
+    alerts.REREAD_WAIT = 0.0  # the second issue-list read, without the wait
     import main  # noqa: E402  (import after clearing keys: dotenv must not leak real ones)
     import spend  # noqa: E402
     from forecasting_tools import (  # noqa: E402
@@ -114,12 +120,20 @@ def fixed_anthropic_prices():
     copy lacks these models, so a failed download must not fail an unrelated change."""
     import litellm
 
-    rows = {"claude-opus-5-5": (4e-06, 2e-05), "claude-sonnet-5": (2e-06, 1e-05), "claude-haiku-4-5": (1e-06, 5e-06)}  # fmt: skip
+    # input, output, cache read, cache write (5 minutes), per token
+    rows = {
+        "claude-opus-5-5": (4e-06, 2e-05, 2e-07, 5e-06),
+        "claude-sonnet-5": (2e-06, 1e-05, 2e-07, 2.5e-06),
+        "claude-sonnet-5-5": (2e-06, 1e-05, 2e-07, 2.5e-06),
+        "claude-haiku-4-5": (1e-06, 5e-06, 1e-07, 1.25e-06),
+        "claude-haiku-5-5": (1e-07, 5e-07, 1e-08, 1.25e-07),
+    }  # fmt: skip
     saved = {name: litellm.model_cost.get(name) for name in rows}
     litellm.register_model({
         name: {"input_cost_per_token": i, "output_cost_per_token": o,
+               "cache_read_input_token_cost": r, "cache_creation_input_token_cost": w,
                "litellm_provider": "anthropic", "mode": "chat"}
-        for name, (i, o) in rows.items()
+        for name, (i, o, r, w) in rows.items()
     })  # fmt: skip
     try:
         yield
@@ -138,15 +152,28 @@ def model_of(llm) -> str:
 def check_routing() -> None:
     with env(ANTHROPIC_API_KEY="x"):
         d = main.RcForecastBot._llm_config_defaults()
-        assert model_of(d["default"]) == "anthropic/claude-sonnet-5", d["default"]
+        assert model_of(d["default"]) == "anthropic/claude-sonnet-5-5", d["default"]
         assert d["default"].litellm_kwargs["temperature"] is None
-        # litellm's 4,096-token default for Anthropic would leave no room to think
-        assert d["default"].litellm_kwargs["max_tokens"] == main.ANTHROPIC_MAX_TOKENS
-        assert model_of(d["parser"]) == "anthropic/claude-haiku-4-5"
-        assert d["parser"].litellm_kwargs["temperature"] == 0
+        # litellm's 4,096-token default for Anthropic would leave no room to think, and
+        # the forecasters think at high effort, so they get the larger cap and timeout
+        assert d["default"].litellm_kwargs["max_tokens"] == main.ANTHROPIC_FORECAST_MAX_TOKENS
+        assert d["default"].litellm_kwargs["output_config"] == {"effort": "high"}
+        assert d["default"].litellm_kwargs["timeout"] == 480
+        # Haiku 5.5 parses: no temperature (it rejects any but the default), low effort,
+        # and a reply cap with room for its thinking
+        assert model_of(d["parser"]) == "anthropic/claude-haiku-5-5"
+        assert d["parser"].litellm_kwargs["temperature"] is None
+        assert d["parser"].litellm_kwargs["output_config"] == {"effort": "low"}
+        assert d["parser"].litellm_kwargs["max_tokens"] == main.ANTHROPIC_PARSER_MAX_TOKENS
+        assert d["summarizer"] is d["parser"]
         # no AskNews: Sonnet 5 with Anthropic's own web search is the one source
-        assert main.source_name(d["researcher"]) == "anthropic/claude-sonnet-5 + web search"
-        assert d["researcher"].litellm_kwargs["web_search_options"] == main.ANTHROPIC_WEB_SEARCH
+        assert main.source_name(d["researcher"]) == "anthropic/claude-sonnet-5-5 + web search"
+        assert isinstance(d["researcher"], main.AnthropicSearchLlm), d["researcher"]
+        # the dynamic-filtering tool, passed as a tool: web_search_options would send the
+        # older web_search_20250305
+        assert d["researcher"].litellm_kwargs["tools"] == [main.ANTHROPIC_SEARCH_TOOL]
+        assert d["researcher"].litellm_kwargs["tools"][0]["type"] == "web_search_20260209"
+        assert "web_search_options" not in d["researcher"].litellm_kwargs
         assert d["researcher"].litellm_kwargs["max_tokens"] == main.ANTHROPIC_MAX_TOKENS
         assert d["researcher_2"] is None
 
@@ -155,11 +182,12 @@ def check_routing() -> None:
         # donated credits run the stronger model
         assert model_of(d["default"]) == "openrouter/anthropic/claude-opus-5.5"
         assert d["default"].litellm_kwargs["temperature"] is None
-        assert model_of(d["parser"]) == "openrouter/anthropic/claude-haiku-4.5"
+        assert model_of(d["parser"]) == "openrouter/anthropic/claude-haiku-5.5"
+        assert d["parser"].litellm_kwargs["temperature"] is None
         assert d["researcher"] == main.ASKNEWS_RESEARCHER == "asknews"
         assert main.source_name(d["researcher"]) == "asknews/latest"  # the default strategy
         # Metaculus's OpenRouter credits cover Anthropic but not Perplexity
-        assert model_of(d["researcher_2"]) == "openrouter/anthropic/claude-sonnet-5:online"
+        assert model_of(d["researcher_2"]) == "openrouter/anthropic/claude-sonnet-5.5:online"
         assert d["researcher_2"].litellm_kwargs["temperature"] is None
 
     with env(ANTHROPIC_API_KEY="x", PERPLEXITY_API_KEY="x", FORECASTER_MODEL="anthropic/claude-opus-5"):
@@ -168,10 +196,15 @@ def check_routing() -> None:
         assert model_of(d["researcher"]) == "perplexity/sonar-pro"
         assert d["researcher_2"] is None
 
-    with env(ANTHROPIC_API_KEY="x", PARSER_MODEL="anthropic/claude-sonnet-5"):
+    with env(ANTHROPIC_API_KEY="x", PARSER_MODEL="anthropic/claude-sonnet-5-5"):
         d = main.RcForecastBot._llm_config_defaults()
         # a model that rejects sampling parameters gets none
         assert d["parser"].litellm_kwargs["temperature"] is None
+    with env(ANTHROPIC_API_KEY="x", PARSER_MODEL="anthropic/claude-haiku-4-5"):
+        d = main.RcForecastBot._llm_config_defaults()
+        # Haiku 4.5, still selectable: temperature 0 as before, and no effort (it errors)
+        assert d["parser"].litellm_kwargs["temperature"] == 0
+        assert "output_config" not in d["parser"].litellm_kwargs
 
     with env():  # no LLM key at all: forecasting-tools' own defaults stay in charge
         d = main.RcForecastBot._llm_config_defaults()
@@ -186,19 +219,20 @@ def check_routing() -> None:
         # the personal route (Metaculus Cup, and Rob's key once the credits run out) never
         # touches the OpenRouter key: its searcher calls Anthropic's web search itself
         d = main.build_llms("anthropic")
-        assert model_of(d["default"]) == "anthropic/claude-sonnet-5"
-        assert model_of(d["parser"]) == "anthropic/claude-haiku-4-5"
+        assert model_of(d["default"]) == "anthropic/claude-sonnet-5-5"
+        assert model_of(d["parser"]) == "anthropic/claude-haiku-5-5"
         assert d["researcher"] == main.ASKNEWS_RESEARCHER
-        assert main.source_name(d["researcher_2"]) == "anthropic/claude-sonnet-5 + web search"
-        # the OpenRouter route sends no reply cap and no web search options
+        assert main.source_name(d["researcher_2"]) == "anthropic/claude-sonnet-5-5 + web search"
+        # the OpenRouter route sends no reply cap and no search tool (:online searches)
         d = main.build_llms("openrouter")
         assert "max_tokens" not in d["default"].litellm_kwargs
-        assert "web_search_options" not in d["researcher_2"].litellm_kwargs
+        assert "tools" not in d["researcher_2"].litellm_kwargs
+        assert not isinstance(d["researcher_2"], main.AnthropicSearchLlm)
 
     # a pacing tier picks the forecaster on the donated credits
     with env(OPENROUTER_API_KEY="x", FORECASTER_MODEL="openrouter/some/other-model"):
         d = main.build_llms("openrouter", budget.TIERS["sonnet-3"])
-        assert model_of(d["default"]) == "openrouter/anthropic/claude-sonnet-5"
+        assert model_of(d["default"]) == "openrouter/anthropic/claude-sonnet-5.5"
         # FORECASTER_MODEL applies to a personal key only
         assert model_of(main.build_llms("openrouter")["default"]) == budget.OPUS
 
@@ -206,10 +240,53 @@ def check_routing() -> None:
     with env(ANTHROPIC_API_KEY="x", FORECASTER_MODEL="anthropic/some-other-model"):
         d = main.build_llms("anthropic", budget.TIERS["opus-3"])
         assert model_of(d["default"]) == "anthropic/claude-opus-5-5", d["default"]
-        assert d["default"].litellm_kwargs["max_tokens"] == main.ANTHROPIC_MAX_TOKENS
+        assert d["default"].litellm_kwargs["max_tokens"] == main.ANTHROPIC_FORECAST_MAX_TOKENS
+        assert d["default"].litellm_kwargs["output_config"] == {"effort": "high"}
         d = main.build_llms("anthropic", budget.TIERS["sonnet-1"])
-        assert model_of(d["default"]) == "anthropic/claude-sonnet-5"
+        assert model_of(d["default"]) == "anthropic/claude-sonnet-5-5"
     assert budget.on_route(budget.OPUS, "openrouter") == budget.OPUS
+
+    # the Test Bot's trial models replace the bot's own in their role, tier or not
+    trial = {
+        "TRIAL_FORECASTER_MODEL": "anthropic/claude-opus-9",
+        "TRIAL_RESEARCHER_MODEL": " anthropic/claude-sonnet-9 ",
+        "TRIAL_PARSER_MODEL": "anthropic/claude-haiku-9",
+    }
+    with env(ANTHROPIC_API_KEY="x", PARSER_MODEL="anthropic/claude-haiku-4-5", **trial):
+        d = main.build_llms("anthropic", budget.TIERS["opus-3"])
+        assert model_of(d["default"]) == "anthropic/claude-opus-9", d["default"]
+        assert d["default"].litellm_kwargs["output_config"] == {"effort": "high"}
+        assert model_of(d["researcher"]) == "anthropic/claude-sonnet-9"  # no AskNews here
+        assert isinstance(d["researcher"], main.AnthropicSearchLlm)
+        assert model_of(d["parser"]) == "anthropic/claude-haiku-9"
+    with env(OPENROUTER_API_KEY="x", TRIAL_RESEARCHER_MODEL="openrouter/anthropic/claude-sonnet-9:online"):
+        d = main.build_llms("openrouter", budget.TIERS["opus-3"])
+        assert model_of(d["researcher"]) == "openrouter/anthropic/claude-sonnet-9:online"
+        assert model_of(d["default"]) == budget.OPUS
+    # one source for the ids: model_watch.py reads budget.py's
+    assert main.SONNET_MODEL["anthropic"] == budget.ANTHROPIC_IDS[budget.SONNET]
+    assert main.HAIKU_MODEL == {"openrouter": budget.HAIKU, "anthropic": "anthropic/claude-haiku-5-5"}
+
+    # FORECASTER_EFFORT: another level, or "default" for the model's own; a mistyped one
+    # stops the run; never sent on OpenRouter, to the searcher, or to a Haiku 4.5 forecaster
+    with env(ANTHROPIC_API_KEY="x", FORECASTER_EFFORT=" Medium "):
+        assert main.build_llms("anthropic")["default"].litellm_kwargs["output_config"] == {"effort": "medium"}  # fmt: skip
+    with env(ANTHROPIC_API_KEY="x", FORECASTER_EFFORT="default"):
+        assert "output_config" not in main.build_llms("anthropic")["default"].litellm_kwargs
+    with env(ANTHROPIC_API_KEY="x", FORECASTER_EFFORT="xhigh"):
+        try:
+            main.forecaster_effort()
+        except SystemExit as e:
+            assert "FORECASTER_EFFORT" in str(e) and "'xhigh'" in str(e), e
+        else:
+            raise AssertionError("an effort litellm 1.80.10 rejects must stop the run")
+    with env(ANTHROPIC_API_KEY="x", OPENROUTER_API_KEY="y", FORECASTER_MODEL="anthropic/claude-haiku-4-5"):
+        assert "output_config" not in main.build_llms("openrouter")["default"].litellm_kwargs
+        d = main.build_llms("anthropic")
+        assert "output_config" not in d["default"].litellm_kwargs  # Haiku 4.5
+        # the parser keeps its own low effort, whatever FORECASTER_EFFORT says
+        assert d["parser"].litellm_kwargs["output_config"] == {"effort": "low"}
+        assert "output_config" not in d["researcher"].litellm_kwargs  # the searcher
     print("routing: ok")
 
 
@@ -374,7 +451,7 @@ def run_main(
     LAST.clear()
     LAST.update(alerts=[], key_checks=0)
 
-    def fake_alert(title, body, timeout=15):
+    def fake_alert(title, body, timeout=15, open_only=False):
         LAST["alerts"].append(title)
         return True
 
@@ -497,7 +574,7 @@ def check_run_loop() -> None:
     # the run page says what each tournament had and which research sources are set up
     assert "- FutureEval (`33121`): 3 open, 2 not yet forecast, 2 taken this run." in summary
     assert "- MiniBench (`minibench`): 2 open, 2 not yet forecast, 2 taken this run." in summary
-    assert "- Research sources: openrouter/anthropic/claude-sonnet-5:online." in summary, summary
+    assert "- Research sources: openrouter/anthropic/claude-sonnet-5.5:online." in summary, summary
     # both passes' searches reach the run page: one tally shared across the run
     assert "| fake-search | 4 | 4 | 0 |" in summary, summary
     # and each pass's spend by question and part of the work, with where the figures came from
@@ -520,7 +597,7 @@ def check_run_loop() -> None:
     assert "- MiniBench (`minibench`): 1 open, 0 not yet forecast, 0 taken this run." in summary
     assert (
         "- Research sources: asknews/latest+archive,"
-        " openrouter/anthropic/claude-sonnet-5:online." in summary
+        " openrouter/anthropic/claude-sonnet-5.5:online." in summary
     ), summary
     assert "| Research source |" not in summary  # no searches, no table
 
@@ -632,7 +709,7 @@ def check_run_loop() -> None:
     assert exited is None and reads == 0, (exited, reads)
     assert "OpenRouter credits" not in summary, summary
     assert "- Metaculus Cup (`33108`): 1 open, 1 taken this run (re-forecast)." in summary
-    assert calls == [("anthropic/claude-sonnet-5", 5, ["7"], False)], calls
+    assert calls == [("anthropic/claude-sonnet-5-5", 5, ["7"], False)], calls
 
     # a mistyped AskNews setting stops the run before anything is read or spent
     for bad in ({"ASKNEWS_STRATEGY": "archives"}, {"ASKNEWS_ARTICLES": "eight"}):
@@ -665,7 +742,7 @@ def check_own_key() -> None:
     assert "Metaculus's credits: $1.50 left. Spent on your key this run: $0.75." in summary
     assert "(Metaculus's credits are under the $2 floor)" in summary, summary
     assert "| FutureEval | opus-3 | 2 | 0 | $0.50 | $0.25 |" in summary, summary
-    assert "- Research sources: anthropic/claude-sonnet-5 + web search." in summary, summary
+    assert "- Research sources: anthropic/claude-sonnet-5-5 + web search." in summary, summary
     assert LAST["alerts"] == ["Metaculus's credits ran out (of the $100 limit)"], LAST
     assert "- Opened an issue to tell Rob about the credits." in summary, summary
 
@@ -811,7 +888,8 @@ def check_own_key() -> None:
     try:
         for error, expected in outcomes:
             def completion(error=error, **kwargs):
-                assert kwargs["model"] == "anthropic/claude-haiku-4-5" and kwargs["max_tokens"] == 1
+                assert kwargs["model"] == "anthropic/claude-haiku-5-5" and kwargs["max_tokens"] == 64
+                assert kwargs["output_config"] == {"effort": "low"} and "temperature" not in kwargs
                 if error is not None:
                     raise error
 
@@ -819,6 +897,26 @@ def check_own_key() -> None:
             assert main.own_key_check() == expected, (error, expected)
     finally:
         main.litellm = real_litellm
+
+    # the credits' balance can't be read (twice): Rob's key pays, rather than the run going
+    # back onto credits that ran out, uncapped
+    calls, summary, exited, reads = run_main("tournament", None, questions, **keys)
+    assert reads == 2 and exited is None, (reads, exited)
+    assert calls == [(opus_own, 3, ["2", "1"], True), (opus_own, 3, ["4"], True)], calls
+    assert LAST["key_checks"] == 1, LAST
+    assert "(Metaculus's credits couldn't be read)" in summary, summary
+    assert "Metaculus's credits: not read" in summary, summary
+
+    # no OpenRouter key at all: Rob's key at the pinned tier, checked, and pause still stops
+    # it (it used to fall through to the Metaculus Cup's unpaced Sonnet 5 x 5)
+    calls, summary, exited, reads = run_main("tournament", 100.0, questions, ANTHROPIC_API_KEY="x")
+    assert reads == 0 and exited is None, (reads, exited)
+    assert calls == [(opus_own, 3, ["2", "1"], True), (opus_own, 3, ["4"], True)], calls
+    assert LAST["key_checks"] == 1 and "(no OpenRouter key)" in summary, (LAST, summary)
+    calls, _, _, _ = run_main("tournament", 100.0, questions, ANTHROPIC_API_KEY="x", BUDGET_TIER="pause")
+    assert calls == [] and LAST["key_checks"] == 0, (calls, LAST)
+    calls, _, _, _ = run_main("tournament", 100.0, questions, ANTHROPIC_API_KEY="x", key_check="limit")
+    assert calls == [] and any("spend limit" in t for t in LAST["alerts"]), (calls, LAST)
 
     plan = budget.own_key_plan(None, "why")
     assert plan.futureeval == plan.minibench == budget.TIERS["opus-3"] and plan.remaining is None
@@ -873,9 +971,24 @@ def check_alerts() -> None:
             assert sent[0][2]["state"] == "all"  # a closed issue still counts as said
             sent.clear()
             assert alerts.raise_alert("New", "Body") is True
-            assert sent[1] == (
+            # read twice before opening: one read came back without #9 and #10 duplicated it
+            assert [s[0] for s in sent] == ["GET", "GET", "POST"], sent
+            assert sent[2] == (
                 "POST", "https://api.github.com/repos/o/r/issues", {"title": "New", "body": "@o Body"}
             ), sent
+            # the first read misses the issue, the second finds it: nothing opens
+            sent.clear()
+            reads = iter([[], issues])
+            alerts.requests.get = lambda url, headers, params, timeout: (  # type: ignore[assignment]
+                sent.append(("GET", url, params)) or FakeResponse(next(reads))
+            )
+            assert alerts.raise_alert("Already said", "Body") is False
+            assert [s[0] for s in sent] == ["GET", "GET"], sent
+            alerts.requests.get = fake_get  # type: ignore[assignment]
+            # Rob's key's alerts count an issue only while it's open
+            sent.clear()
+            assert alerts.raise_alert("Already said", "Body", open_only=True) is False
+            assert sent[0][2]["state"] == "open", sent
             alerts.requests.get = failing_get  # type: ignore[assignment]
             assert alerts.raise_alert("New", "Body") is False
     finally:
@@ -885,8 +998,11 @@ def check_alerts() -> None:
 
     # titles change only with what makes the event new: the limit, or the month
     titles: list[str] = []
+    open_only: list[bool] = []
     real = alerts.raise_alert
-    alerts.raise_alert = lambda title, body, timeout=15: titles.append(title) or True  # type: ignore[assignment]
+    alerts.raise_alert = lambda title, body, timeout=15, open_only_=False, **kw: (  # type: ignore[assignment]
+        titles.append(title) or open_only.append(kw.get("open_only", open_only_)) or True
+    )
     try:
         alerts.credits_low(14.2, 100.0, own_key=True)
         alerts.credits_low(9.0, 100.0, own_key=False)
@@ -899,7 +1015,205 @@ def check_alerts() -> None:
     assert titles[2] == "Metaculus's credits are below $15 (of the $250 limit)"
     assert titles[3] == "Metaculus's credits ran out"
     assert titles[4].startswith("Your Anthropic key reached its spend limit (20"), titles
+    # credit alerts count closed issues too (one per limit); Rob's key's, open ones only
+    assert open_only == [False, False, False, False, True], open_only
     print("alerts: ok")
+
+
+def check_watchdog() -> None:
+    """clock_watchdog.py: the backup clock's check that the Cloudflare clock still ticks."""
+    import clock_watchdog as watchdog
+
+    now = datetime(2026, 11, 20, 12, 0, tzinfo=timezone.utc)
+    runs: list[dict] = []
+    raised: list[tuple] = []
+
+    class FakeResponse:
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {"workflow_runs": runs}
+
+    def fake_get(url, headers, params, timeout):
+        assert url.endswith("/actions/workflows/run_bot_on_tournament.yaml/runs"), url
+        assert params["event"] == "workflow_dispatch", params
+        return FakeResponse()
+
+    def run(minutes_ago: int, source: str | None, actor: str = "robcam55") -> dict:
+        created = (now - timedelta(minutes=minutes_ago)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        title = "Forecast on new AI tournament questions" + (f" ({source})" if source else "")
+        return {"created_at": created, "display_title": title, "triggering_actor": {"login": actor}}
+
+    real_get, real_alert = watchdog.requests.get, watchdog.alerts.raise_alert
+    try:
+        watchdog.requests.get = fake_get  # type: ignore[assignment]
+        watchdog.alerts.raise_alert = lambda title, body, **kw: raised.append((title, kw)) or True  # type: ignore[assignment]
+        with env(GITHUB_TOKEN="ghs_fake", GITHUB_REPOSITORY="o/r"):
+            # ticking: the Worker's run 15 minutes ago, after the backup clock's own
+            runs[:] = [run(2, "backup", "github-actions[bot]"), run(15, "cloudflare")]
+            assert watchdog.check(now).startswith("Cloudflare clock: ticking"), raised
+            assert raised == []
+            # stopped: only the backup clock's runs and Rob's own for three hours (a run by
+            # hand doesn't hide a stopped Worker, though Rob's login starts both)
+            runs[:] = [run(5, "backup", "github-actions[bot]"), run(30, "manual"), run(200, "cloudflare")]
+            line = watchdog.check(now)
+            assert "stopped (its last run was 2026-11-20 08:40 UTC); opened an issue" in line, line
+            assert raised == [("The Cloudflare clock stopped", {"open_only": True})], raised
+            # runs from before the run-name: told apart by who started them
+            runs[:] = [run(5, None, "github-actions[bot]"), run(15, None)]
+            assert watchdog.check(now).startswith("Cloudflare clock: ticking")
+            runs[:] = []
+            assert "no run it started is listed" in watchdog.check(now)
+            # GitHub unreachable: noted, never raised, so the tick itself goes on
+            watchdog.requests.get = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("x"))  # type: ignore[assignment]
+            assert watchdog.check(now) == "Cloudflare clock: not checked (RuntimeError)."
+        with env():
+            assert "no GitHub token" in watchdog.check(now)
+    finally:
+        watchdog.requests.get, watchdog.alerts.raise_alert = real_get, real_alert  # type: ignore[assignment]
+    print("watchdog: ok")
+
+
+def check_model_watch() -> None:
+    """model_watch.py: the daily check for new Claude models and retired ones."""
+    import model_watch
+
+    pages: list[dict] = []
+    asked: list[dict] = []
+    raised: list[tuple] = []
+
+    class FakeResponse:
+        def __init__(self, page):
+            self.page = page
+
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return self.page
+
+    def fake_get(url, headers, params, timeout):
+        assert url == "https://api.anthropic.com/v1/models", url
+        assert headers["x-api-key"] == "sk-fake" and headers["anthropic-version"], headers
+        asked.append(dict(params))
+        return FakeResponse(pages[len(asked) - 1])
+
+    def model(model_id: str, released: str, name: str = "") -> dict:
+        return {"type": "model", "id": model_id, "display_name": name or model_id,
+                "created_at": f"{released}T00:00:00Z"}  # fmt: skip
+
+    in_use = [
+        model("claude-opus-5-5", "2026-08-12"),
+        model("claude-sonnet-5-5", "2026-09-30"),
+        model("claude-haiku-5-5", "2026-10-14"),
+        model("claude-fable-5-1", "2026-10-02"),
+        model("claude-opus-4-8", "1970-01-01"),  # an unknown release date reads as the epoch
+    ]
+    real_get, real_alert = model_watch.requests.get, model_watch.alerts.raise_alert
+    try:
+        model_watch.requests.get = fake_get  # type: ignore[assignment]
+        model_watch.alerts.raise_alert = lambda title, body, **kw: raised.append((title, body, kw)) or True  # type: ignore[assignment]
+        with env(ANTHROPIC_API_KEY="sk-fake"):
+            # nothing released since the review: no issue
+            pages[:] = [{"data": in_use, "has_more": False, "last_id": "claude-opus-4-8"}]
+            lines = model_watch.check()
+            assert lines == ["Claude models: nothing new since 2026-10-28 (5 listed)."], lines
+            assert raised == [] and asked == [{"limit": 1000}], (raised, asked)
+            # a new Opus on the second page, and a new line: one issue each, by role
+            asked.clear()
+            pages[:] = [
+                {"data": in_use[:3], "has_more": True, "last_id": "claude-haiku-5-5"},
+                {"data": [*in_use[3:], model("claude-opus-5-6", "2026-11-19", "Claude Opus 5.6"),
+                          model("claude-vellum-1", "2026-12-02")], "has_more": False},
+            ]  # fmt: skip
+            lines = model_watch.check()
+            assert asked[1] == {"limit": 1000, "after_id": "claude-haiku-5-5"}, asked
+            titles = [t for t, _, _ in raised]
+            assert titles == [
+                "New Claude model to evaluate: Claude Opus 5.6 (claude-opus-5-6)",
+                "New Claude model to evaluate: claude-vellum-1 (claude-vellum-1)",
+            ], titles
+            opus_body, other_body = raised[0][1], raised[1][1]
+            assert "runs for forecasts" in opus_body, opus_body
+            assert "`anthropic/claude-opus-5-6` as the forecaster model" in opus_body
+            assert "own-key" in opus_body and "never tournament questions" in opus_body
+            assert "weigh it against Opus 5.5" in other_body, other_body
+            assert all(kw == {} for _, _, kw in raised), raised  # once ever, closed or not
+            assert lines[0] == "Claude models: new, `claude-opus-5-6` (2026-11-19); opened an issue.", lines
+            # a model the bot runs drops off the list: an issue, before any new-model one
+            asked.clear()
+            raised.clear()
+            pages[:] = [{"data": [m for m in in_use if m["id"] != "claude-haiku-5-5"]}]
+            lines = model_watch.check()
+            assert [t for t, _, _ in raised] == ["Claude model no longer offered: claude-haiku-5-5"]
+            assert "parsing" in raised[0][1] and "fails" in raised[0][1], raised
+            assert lines == ["Claude models: `anthropic/claude-haiku-5-5` is no longer listed; opened an issue."], lines
+            # an empty or failed list is never read as every model gone
+            raised.clear()
+            asked.clear()
+            pages[:] = [{"data": []}]
+            assert model_watch.check() == ["Claude models: not checked (the list came back empty)."]
+            model_watch.requests.get = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("sk-fake"))  # type: ignore[assignment]
+            assert model_watch.check() == ["Claude models: not checked (RuntimeError)."]
+            assert raised == []
+        with env():
+            assert "no ANTHROPIC_API_KEY" in model_watch.check()[0]
+    finally:
+        model_watch.requests.get, model_watch.alerts.raise_alert = real_get, real_alert  # type: ignore[assignment]
+    # the roles cover every model the bot runs by default
+    assert set(model_watch.ROLES) == set(budget.ANTHROPIC_IDS.values()), model_watch.ROLES
+    print("model watch: ok")
+
+
+def check_scorecard() -> None:
+    """scorecard.py over a review.json shaped like bot-review's."""
+    import scorecard
+
+    def binary(p, outcome, score):
+        return {"question_type": "binary", "project_name": "MiniBench", "resolution": outcome,
+                "forecast": {"probability_yes": p}, "scores": {"spot_peer_score": score}}  # fmt: skip
+
+    numeric = {
+        "question_type": "numeric", "project_name": "MiniBench", "resolution": "42",
+        "forecast": {"median": 40}, "scores": {"spot_peer_score": -3.0},
+        "traces": [{"forecasters": [
+            {"prediction": "Probability distribution:\n- 10.00% chance of value below 30.0\n- 90.00% chance of value below 41.0"},
+            {"prediction": "Probability distribution:\n- 10.00% chance of value below 35.0\n- 90.00% chance of value below 50.0"},
+        ]}],
+    }  # fmt: skip
+    mc = {
+        "question_type": "multiple_choice", "project_name": "FutureEval", "resolution": "b",
+        "forecast": {"probabilities": {"a": 0.6, "b": 0.4}}, "scores": {"spot_peer_score": -10.0},
+    }  # fmt: skip
+    review = {"questions": [
+        binary(0.05, "no", 5.0), binary(0.8, "yes", 12.0), binary(0.3, "yes", -20.0),
+        binary(0.5, "annulled", None), numeric, mc,
+    ]}  # fmt: skip
+    text = "\n".join(scorecard.scorecard(review))
+    for expected in (
+        "| MiniBench | all types | 4 | -1.5 ± 6.9 | -6.0 |",
+        "| MiniBench | binary | 3 | -1.0 ± 9.7 | -3.0 |",
+        "| FutureEval | multiple_choice | 1 | -10.0 | -10.0 |",
+        "3 resolved: mean forecast 38%, resolved Yes 67% (± 27%), Brier 0.177.",
+        "| 0%–10% | 1 | 5% | 0% |",
+        "2 forecaster ranges: outcome below the 10th percentile 0%, between the 10th and 90th 50%, above the 90th 50%",
+        "1 resolved: mean probability on the winner 40%; the winner was the favourite 0% of the time.",
+    ):
+        assert expected in text, (expected, text)
+    # values in scientific notation, outcomes beyond an open bound, and the run that was
+    # scored rather than a later re-post
+    tiny = "Probability distribution:\n- 10.00% chance of value below 1e-05\n- 90.00% chance of value below 2.5e-05"
+    beyond = {**numeric, "resolution": "above_upper_bound", "spot_scoring_time": "2026-10-20T15:00:00Z",
+              "traces": [
+                  {"run_time": "2026-10-20T12:00:00Z", "forecasters": [{"prediction": tiny}]},
+                  {"run_time": "2026-10-21T12:00:00Z", "forecasters": [{"prediction": "unparseable 1e"}]},
+              ]}  # fmt: skip
+    text = "\n".join(scorecard.scorecard({"questions": [beyond]}))
+    assert "1 forecaster ranges: outcome below the 10th percentile 0%, between the 10th and 90th 0%, above the 90th 100%" in text, text
+    empty = "\n".join(scorecard.scorecard({"questions": []}))
+    assert "No resolved binary forecasts yet." in empty, empty
+    print("scorecard: ok")
 
 
 def binary_question() -> BinaryQuestion:
@@ -923,6 +1237,241 @@ def check_aggregation() -> None:
     got = asyncio.run(bot._aggregate_predictions(three, q))
     assert abs(got - 0.5) < 1e-12, got  # fewer than four: the package median
     print("aggregation: ok")
+
+
+class FakeLlm:
+    """A forecaster whose reply is fixed, for the prompt-to-forecast methods."""
+
+    def __init__(self, reply: str = "Reasoning...") -> None:
+        self.reply = reply
+
+    async def invoke(self, prompt, system_prompt=None):
+        return self.reply
+
+
+def check_guards() -> None:
+    """forecast_guards.py: the forecasting-tools 0.2.92 answers that sank a whole question
+    (reproduced offline on 2026-10-28), and the numeric mixture."""
+    import faulthandler
+
+    import forecast_guards as fg
+    from forecasting_tools import NumericDistribution, Percentile
+
+    heights = [0.1, 0.2, 0.4, 0.6, 0.8, 0.9]
+    q = NumericQuestion(
+        question_text="How many?", page_url="https://example.invalid/q/5", lower_bound=0,
+        upper_bound=100, open_lower_bound=True, open_upper_bound=True, zero_point=None,
+        cdf_size=201,
+    )  # fmt: skip
+
+    def pcts(values):
+        return [Percentile(percentile=h, value=v) for h, v in zip(heights, values)]
+
+    def dist(values, question=q):
+        return NumericDistribution.from_question(pcts(values), question)
+
+    # P10 = P20 at an open lower bound with a concentrated middle: 0.2.92's CDF loop never
+    # ended and froze the run. Bounded, it raises (a watchdog kills the check if not)
+    faulthandler.dump_traceback_later(60, exit=True)
+    try:
+        dist([0, 0, 5, 5.2, 20, 30]).get_cdf()
+    except ValueError as e:
+        assert "Could not standardize CDF" in str(e), e
+    else:
+        raise AssertionError("a CDF that isn't increasing must raise")
+    finally:
+        faulthandler.cancel_dump_traceback_later()
+
+    # spreading the repeat keeps the CDF increasing, so that answer forecasts normally
+    spread = fg.spread_repeats(pcts([0, 0, 5, 5.2, 20, 30]), q)
+    assert all(close(p.value, v) for p, v in zip(spread, [0, 1e-4, 5, 5.2, 20, 30])), spread
+    cdf = NumericDistribution.from_question(spread, q).get_cdf()
+    assert all(b.percentile > a.percentile for a, b in zip(cdf, cdf[1:]))
+    below = fg.spread_repeats(pcts([-5, -5, -5, 3, 9, 12]), q)
+    assert all(close(p.value, v) for p, v in zip(below, [-5, -5 + 1e-4, -5 + 2e-4])), below
+    # repeats inside the range, and repeats at a closed bound, are the package's to handle
+    # log-scaled, 1 to 1e9: a step in log space, so the repeat stays below the next value
+    log = NumericQuestion(**{**q.model_dump(), "lower_bound": 1, "upper_bound": 1e9, "zero_point": 0})
+    logged = fg.spread_repeats(pcts([1, 1, 3, 10, 100, 1000]), log)
+    assert 1 < logged[1].value < 1.0001 and logged[2].value == 3, logged
+    assert NumericDistribution.from_question(logged, log).get_cdf()
+    inside = pcts([10, 10, 20, 30, 40, 50])
+    assert fg.spread_repeats(inside, q) == inside
+    closed = q.model_copy(update={"open_lower_bound": False})
+    assert fg.spread_repeats(pcts([0, 0, 5, 9, 20, 30]), closed) == pcts([0, 0, 5, 9, 20, 30])
+
+    # through the bot: the answer that used to fail now forecasts, and an answer that still
+    # can't make a CDF fails only its own forecast (the CDF is built before aggregation)
+    with env(ANTHROPIC_API_KEY="x"):
+        bot = main.RcForecastBot(publish_reports_to_metaculus=False)
+    bot.get_llm = lambda name, kind="llm": FakeLlm()  # type: ignore[method-assign]
+    parsed: list = []
+
+    async def fake_parse(*args, **kwargs):
+        return parsed[0]
+
+    real_parse = main.parse
+    try:
+        main.parse = fake_parse
+        parsed[:] = [pcts([0, 0, 5, 5.2, 20, 30])]
+        got = asyncio.run(bot._numeric_prompt_to_forecast(q, "prompt"))
+        assert got.prediction_value.get_cdf(), got
+
+        # three forecasts: the mixture is their mean CDF, wider than the median where they
+        # disagree; a misread outlier is left out
+        wide = NumericQuestion(**{**q.model_dump(), "upper_bound": 1000})
+        a, b, c = (dist(v, wide) for v in ([10, 20, 30, 40, 50, 60], [20, 30, 40, 50, 60, 70], [30, 40, 50, 60, 70, 80]))  # fmt: skip
+        mixed = asyncio.run(bot._aggregate_predictions([a, b, c], wide))
+        mean = [sum(t) / 3 for t in zip(*([p.percentile for p in d.get_cdf()] for d in (a, b, c)))]
+        # (the declared CDF; posting standardises it again, as it does the package's median)
+        assert all(abs(m.percentile - x) < 1e-6 for m, x in zip(mixed.declared_percentiles, mean))
+        # ordinary disagreement, ranges that overlap, stays in
+        d = dist([45, 60, 70, 80, 90, 100], wide)
+        mixed = asyncio.run(bot._aggregate_predictions([a, b, d], wide))
+        three = [sum(t) / 3 for t in zip(*([p.percentile for p in x.get_cdf()] for x in (a, b, d)))]
+        assert all(abs(m.percentile - x) < 1e-6 for m, x in zip(mixed.declared_percentiles, three))
+        far = dist([600, 700, 750, 800, 850, 900], wide)  # the same forecast in the wrong unit
+        mixed = asyncio.run(bot._aggregate_predictions([a, b, far], wide))
+        both = [sum(t) / 2 for t in zip(*([p.percentile for p in d.get_cdf()] for d in (a, b)))]
+        assert all(abs(m.percentile - x) < 1e-6 for m, x in zip(mixed.declared_percentiles, both))
+        # two forecasts: nothing to judge an outlier by, so both count
+        mixed = asyncio.run(bot._aggregate_predictions([a, far], wide))
+        assert mixed.declared_percentiles[100].percentile < a.get_cdf()[100].percentile
+
+        # multiple choice: a confident answer with six options at 0%, which 0.2.92's
+        # validator rejected on every retry, now posts with each long shot at 1%
+        options = ["Alpha", "Bravo", "Charlie", "Delta", "Echo", "Foxtrot", "Golf", "Hotel"]
+        mc = MultipleChoiceQuestion(question_text="Which?", options=options)
+        sharp = [0.92, 0.08] + [0.0] * 6
+        parsed[:] = [[fg.OptionGuess(option_name=o, probability=p) for o, p in zip(options, sharp)]]
+        got = asyncio.run(bot._multiple_choice_prompt_to_forecast(mc, "prompt"))
+        probs = got.prediction_value.to_dict()
+        assert list(probs) == options and abs(sum(probs.values()) - 1) < 1e-9, probs
+        assert all(abs(probs[o] - 0.01) < 1e-9 for o in options[2:]), probs
+        assert abs(probs["Alpha"] - 0.92 * 0.94) < 1e-9, probs
+    finally:
+        main.parse = real_parse
+
+    def guesses(pairs):
+        return [fg.OptionGuess(option_name=n, probability=p) for n, p in pairs]
+
+    two = ["Yes, before May", "No"]
+    # names as forecasters write them; percentages; a sum a little off
+    got = fg.option_list(guesses([(" yes,  before MAY ", 61), ("Option: No.", 41)]), two).to_dict()
+    assert abs(got["Yes, before May"] - 61 / 102) < 1e-9 and abs(got["No"] - 41 / 102) < 1e-9
+    for bad, needle in (
+        (guesses([("No", 1.0)]), "no probability for option"),
+        (guesses([("Yes, before May", 0.9), ("No", 0.6)]), "sum to 150%"),
+    ):
+        try:
+            fg.option_list(bad, two)
+        except ValueError as e:
+            assert needle in str(e), e
+        else:
+            raise AssertionError(f"{bad} must fail its forecast")
+    print("guards: ok")
+
+
+def anthropic_search_reply(stop_reason: str = "end_turn") -> dict:
+    """A web-search reply as Anthropic's API sends it: narration, a search, cited text."""
+    url = "https://www.reuters.com/world/example-2026-10-27/"
+    return {
+        "id": "msg_fake", "type": "message", "role": "assistant", "model": "claude-sonnet-5-5",
+        "content": [
+            {"type": "text", "text": "I'll search for this."},
+            {"type": "server_tool_use", "id": "s1", "name": "web_search", "input": {"query": "q"}},
+            {"type": "web_search_tool_result", "tool_use_id": "s1", "content": [
+                {"type": "web_search_result", "url": url, "title": "Reuters", "encrypted_content": "e"}]},
+            {"type": "text", "text": " The ministry announced the delay on 2026-10-27.", "citations": [
+                {"type": "web_search_result_location", "url": url, "title": "Reuters",
+                 "encrypted_index": "i", "cited_text": "delay"}]},
+        ],
+        "stop_reason": stop_reason, "stop_sequence": None,
+        "usage": {"input_tokens": 3000, "cache_read_input_tokens": 40000,
+                  "cache_creation_input_tokens": 20000, "output_tokens": 2000,
+                  "server_tool_use": {"web_search_requests": 4}},
+    }  # fmt: skip
+
+
+def check_own_key_research() -> None:
+    """Research on Rob's key through litellm 1.80.10 with only its HTTP layer faked: the
+    request carries the dynamic-filtering search tool and one cache marker; the reply's
+    sources reach the research; a reply cut short fails; cached tokens are priced as such."""
+    import json
+
+    import httpx
+
+    sent: list[dict] = []
+    replies: list[dict] = []
+
+    async def fake_send(self, request, *args, **kwargs):
+        assert "api.anthropic.com" in str(request.url), request.url
+        sent.append({"headers": dict(request.headers), "body": json.loads(request.content)})
+        return httpx.Response(200, request=request, json=replies.pop(0))
+
+    real_send = httpx.AsyncClient.send
+    try:
+        httpx.AsyncClient.send = fake_send  # type: ignore[method-assign]
+        with env(ANTHROPIC_API_KEY="sk-ant-fake"):
+            llm = main.build_llms("anthropic")["researcher"]
+            llm.allowed_tries = 1  # no retry backoff in the check
+            replies.append(anthropic_search_reply())
+            with spend.collecting() as ledger:
+                text = asyncio.run(llm.invoke("Research this question."))
+            body = sent[0]["body"]
+            assert body["tools"] == [{"type": "web_search_20260209", "name": "web_search", "max_uses": 5}], body["tools"]  # fmt: skip
+            assert body["messages"] == [{"role": "user", "content": [
+                {"type": "text", "text": "Research this question.", "cache_control": {"type": "ephemeral"}}]}], body["messages"]  # fmt: skip
+            assert "temperature" not in body and "thinking" not in body, body
+            # the cited source survives as a Sources footer (it used to be dropped)
+            assert "The ministry announced the delay on 2026-10-27." in text, text
+            assert "https://www.reuters.com/world/example-2026-10-27/" in text, text
+            # tokens at their cached prices plus $0.01 a search
+            call = ledger.calls[0]
+            assert (call.cache_reads, call.cache_writes, call.searches) == (40000, 20000, 4), call
+            expected = 3000 * 2e-6 + 40000 * 2e-7 + 20000 * 2.5e-6 + 2000 * 1e-5 + 4 * 0.01
+            assert abs(call.cost - expected) < 1e-9, (call.cost, expected)
+
+            # a reply whose server-side search loop paused, ran out of tokens or was refused
+            # holds only narration: it comes back empty (run_research counts that as no
+            # research) and is not retried, since a retry reruns the whole search
+            llm.allowed_tries = 2
+            for stop in ("pause_turn", "max_tokens", "refusal"):
+                sent.clear()
+                replies[:] = [anthropic_search_reply(stop), anthropic_search_reply()]
+                assert asyncio.run(llm.invoke("Research this question.")) == "", stop
+                assert len(sent) == 1, (stop, len(sent))
+            replies.clear()
+            llm.allowed_tries = 1
+
+            # nothing cited (searches run inside code under dynamic filtering): the pages
+            # the searches returned stand in as the sources
+            uncited = anthropic_search_reply()
+            uncited["content"][-1].pop("citations")
+            replies.append(uncited)
+            text = asyncio.run(llm.invoke("Research this question."))
+            assert "https://www.reuters.com/world/example-2026-10-27/" in text, text
+
+            # an Opus 5.5 forecast: effort high in output_config, the larger reply cap, no
+            # thinking budget or sampling parameters (Opus 5.5 rejects both)
+            sent.clear()
+            replies.append({
+                "id": "msg_fake", "type": "message", "role": "assistant", "model": "claude-opus-5-5",
+                "content": [{"type": "thinking", "thinking": "", "signature": "sig"},
+                            {"type": "text", "text": "Probability: 35%"}],
+                "stop_reason": "end_turn", "stop_sequence": None,
+                "usage": {"input_tokens": 5000, "output_tokens": 3000},
+            })  # fmt: skip
+            forecaster = main.build_llms("anthropic", budget.TIERS["opus-3"])["default"]
+            assert asyncio.run(forecaster.invoke("Forecast this.")) == "Probability: 35%"
+            body = sent[0]["body"]
+            assert body["model"] == "claude-opus-5-5" and body["output_config"] == {"effort": "high"}, body  # fmt: skip
+            assert body["max_tokens"] == main.ANTHROPIC_FORECAST_MAX_TOKENS, body
+            for absent in ("thinking", "temperature", "top_p", "reasoning_effort"):
+                assert absent not in body, (absent, body)
+    finally:
+        httpx.AsyncClient.send = real_send  # type: ignore[method-assign]
+    print("own-key research: ok")
 
 
 def check_research_survives_one_failure() -> None:
@@ -1033,6 +1582,14 @@ def check_prompts() -> None:
     ):
         assert expected in research_prompt, (expected, research_prompt)
     assert "None given." in bot._research_prompt(bare)  # no background: no "None"
+    # the source the criteria name, and forecasts elsewhere; the outcome by question type
+    for expected in ("give its latest value or status", "Polymarket, Kalshi, Manifold", "whether the question would resolve Yes or No"):  # fmt: skip
+        assert expected in research_prompt, (expected, research_prompt)
+    mc_prompt = bot._research_prompt(timed_question("mc"))
+    assert "which option the question would resolve to" in mc_prompt, mc_prompt
+    assert "The options are: ['a', 'b']" in mc_prompt and "Yes or No" not in mc_prompt, mc_prompt
+    assert "what the question would resolve to" in bot._research_prompt(timed_question("numeric"))
+    assert not research_prompt.startswith(" "), research_prompt  # indents still cleaned
 
     prompts: dict[str, str] = {}
 
@@ -1099,7 +1656,7 @@ def _research_policy() -> None:
     health = bot.research_health
     assert health.without_research == ["https://example.invalid/q/77"], health
     asknews, online = health.sources["asknews/latest"], health.sources[
-        "openrouter/anthropic/claude-sonnet-5:online"
+        "openrouter/anthropic/claude-sonnet-5.5:online"
     ]
     assert (asknews.searches, asknews.worked, dict(asknews.failures)) == (
         3, 0, {"RuntimeError": 3}
@@ -1298,14 +1855,22 @@ def check_asknews() -> None:
 
     calls: list[dict] = []
     sleeps: list[float] = []
+    # what each search strategy finds: one article by default
+    found: dict[str, list] = {}
+    article = types.SimpleNamespace(
+        eng_title="Ministry delays the vote", summary="The vote moves to November.",
+        language="en", pub_date=datetime(2026, 10, 27, 9, 0, tzinfo=timezone.utc),
+        source_id="Reuters", article_url="https://www.reuters.com/x",
+    )  # fmt: skip
 
     class FakeResponse:
-        as_dicts: list = []
+        def __init__(self, strategy):
+            self.as_dicts = found.get(strategy, [article])
 
     class FakeNews:
         async def search_news(self, **kwargs):
             calls.append(kwargs)
-            return FakeResponse()
+            return FakeResponse(kwargs["strategy"])
 
     class FakeSDK:
         def __init__(self, **kwargs):
@@ -1336,7 +1901,10 @@ def check_asknews() -> None:
         assert [(c["strategy"], c["n_articles"]) for c in calls] == [("latest news", 8)], calls
         assert calls[0]["query"] == "Will it happen?"
         assert sleeps == [], sleeps
-        assert text.startswith("Latest news") and "No articles were found" in text, text
+        assert text.startswith("Latest news") and "Ministry delays the vote" in text, text
+        # nothing found is no research: empty, so it reads as "returned nothing"
+        found["latest news"] = []
+        assert search() == "", search()
 
         text = search(ASKNEWS_STRATEGY="archive", ASKNEWS_ARTICLES="12")
         assert [(c["strategy"], c["n_articles"]) for c in calls] == [("news knowledge", 12)], calls
@@ -1347,6 +1915,8 @@ def check_asknews() -> None:
         assert [c["strategy"] for c in calls] == ["latest news", "news knowledge"], calls
         assert len(sleeps) == 1 and sleeps[0] >= 10, sleeps
         assert text.index("Latest news") < text.index("Earlier news"), text
+        # one of the two searches empty: the other's articles still count
+        assert "No articles were found" in text and "Ministry delays the vote" in text, text
     finally:
         asknews_sdk.AsyncAskNewsSDK = real_sdk  # type: ignore[misc]
         main.asyncio.sleep = real_sleep  # type: ignore[assignment]
@@ -1648,7 +2218,7 @@ def _spend_through_the_bot() -> None:
     from collections import Counter
 
     assert Counter(c.part for c in ledger.calls) == {
-        "research: openrouter/anthropic/claude-sonnet-5:online": 1,
+        "research: openrouter/anthropic/claude-sonnet-5.5:online": 1,
         "summary": 1,
         "forecast 1": 1,
         "forecast 2": 1,
@@ -1657,10 +2227,10 @@ def _spend_through_the_bot() -> None:
     }, [c.part for c in ledger.calls]
     assert {c.question for c in ledger.calls} == {"https://example.invalid/q/77"}
     assert models == {
-        "research": {"openrouter/anthropic/claude-sonnet-5:online"},
+        "research": {"openrouter/anthropic/claude-sonnet-5.5:online"},
         "forecast": {budget.OPUS},
-        "parsing": {"openrouter/anthropic/claude-haiku-4.5"},
-        "summary": {"openrouter/anthropic/claude-haiku-4.5"},
+        "parsing": {"openrouter/anthropic/claude-haiku-5.5"},
+        "summary": {"openrouter/anthropic/claude-haiku-5.5"},
     }, models
     assert close(ledger.total(), 0.40 + 3 * 0.05 + 6 * 0.002 + 0.004), ledger.total()
 
@@ -1668,7 +2238,7 @@ def _spend_through_the_bot() -> None:
         spend.breakdown("FutureEval", ledger, main.question_statuses([q], results, publish=False))
     )
     for expected in (
-        "| Question | Status | Research: openrouter/anthropic/claude-sonnet-5:online"
+        "| Question | Status | Research: openrouter/anthropic/claude-sonnet-5.5:online"
         " | Forecast 1 | Forecast 2 | Forecast 3 | Parsing and summary | Total |",
         "| [77](https://example.invalid/q/77) | dry run | $0.400 | $0.050 | $0.050 | $0.050"
         " | $0.016 | $0.566 |",
@@ -1686,7 +2256,11 @@ if __name__ == "__main__":
     check_run_loop()
     check_own_key()
     check_alerts()
+    check_watchdog()
+    check_model_watch()
+    check_scorecard()
     check_aggregation()
+    check_guards()
     check_research_survives_one_failure()
     check_prompts()
     check_research_policy()
@@ -1695,4 +2269,5 @@ if __name__ == "__main__":
     check_asknews()
     with fixed_anthropic_prices():
         check_spend()
+        check_own_key_research()
     print("all checks passed")

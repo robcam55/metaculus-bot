@@ -1,0 +1,58 @@
+name: Backup clock
+
+# The tournament workflow's backup clock, in a workflow of its own. GitHub disables a
+# scheduled workflow in a public repository after 60 days without a commit, and a disabled
+# workflow refuses every trigger. While this schedule lived in run_bot_on_tournament.yaml,
+# the disable would have stopped the Cloudflare Worker's runs too (about Dec 23 this
+# season, two weeks before it ends). Now only this backup can lapse; the forecasting
+# workflow has no schedule. GitHub fires this about every four hours, not every 20
+# minutes. Each tick starts the tournament workflow, then checks that the Cloudflare clock
+# is still starting it too (clock_watchdog.py), and opens an issue if it isn't. This
+# workflow and the weekly review are the only ones that can lapse: a commit within 60
+# days keeps them, and Actions -> Backup clock -> Enable workflow brings this one back.
+on:
+  schedule:
+    - cron: "7,27,47 * * * *" # offset off the hour, like the Worker
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+
+jobs:
+  tick:
+    # Off until BOT_ENABLED, like the runs it starts
+    if: vars.BOT_ENABLED == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      actions: write # start the tournament workflow, and read its runs
+      contents: read
+      issues: write # the watchdog's alert
+    steps:
+      # Started with this workflow's own token, which may start workflow_dispatch runs.
+      # A failure here still lets the watchdog run
+      - name: Start the tournament workflow
+        continue-on-error: true
+        run: gh workflow run run_bot_on_tournament.yaml --ref main -f source=backup
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+      - name: Check out repository
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.11"
+      - name: Install poetry
+        uses: snok/install-poetry@a783c322200f0519c7926aa6faa857c4e23e9263 # v1.4.2
+        with:
+          version: 2.5.1
+          virtualenvs-create: true
+          virtualenvs-in-project: true
+          installer-parallel: true
+      - name: Install dependencies
+        run: poetry install --no-interaction --no-root
+      - name: Check the Cloudflare clock
+        run: poetry run python clock_watchdog.py
+        env:
+          GITHUB_TOKEN: ${{ github.token }} # reads the runs, opens the alert issue

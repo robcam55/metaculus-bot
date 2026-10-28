@@ -13,6 +13,17 @@ on:
       questions:
         description: "How many bot-testing-area questions (empty: the TEST_QUESTIONS variable, or 3)"
         default: ""
+      # Trying a new model before a switch (model_watch.py opens an issue for each release).
+      # Empty runs the bot's own. On your key, Anthropic's ids: anthropic/claude-...
+      forecaster:
+        description: "Forecaster model to try (empty: the bot's own)"
+        default: ""
+      researcher:
+        description: "Research model to try, with web search (empty: the bot's own)"
+        default: ""
+      parser:
+        description: "Parsing model to try (empty: the bot's own)"
+        default: ""
 
 # Add concurrency group to prevent parallel runs
 concurrency:
@@ -34,6 +45,8 @@ jobs:
       - name: Install poetry
         uses: snok/install-poetry@a783c322200f0519c7926aa6faa857c4e23e9263 # v1.4.2
         with:
+          # pinned like the actions: the version every run has installed since Oct 2026
+          version: 2.5.1
           virtualenvs-create: true
           virtualenvs-in-project: true
           installer-parallel: true
@@ -66,9 +79,14 @@ jobs:
           BUDGET_TIER: ${{ vars.BUDGET_TIER }}
           TEST_QUESTIONS: ${{ inputs.questions || vars.TEST_QUESTIONS }}
           FORECASTER_MODEL: ${{ vars.FORECASTER_MODEL }}
+          FORECASTER_EFFORT: ${{ vars.FORECASTER_EFFORT }}
           PARSER_MODEL: ${{ vars.PARSER_MODEL }}
           ASKNEWS_STRATEGY: ${{ vars.ASKNEWS_STRATEGY }}
           ASKNEWS_ARTICLES: ${{ vars.ASKNEWS_ARTICLES }}
           SEARCH_MODEL: ${{ vars.SEARCH_MODEL }}
           RESEARCH_REPORTS: ${{ vars.RESEARCH_REPORTS }}
           PREDICTIONS_PER_REPORT: ${{ vars.PREDICTIONS_PER_REPORT }}
+          # This workflow's inputs only, never repository variables: no other run tries them
+          TRIAL_FORECASTER_MODEL: ${{ inputs.forecaster }}
+          TRIAL_RESEARCHER_MODEL: ${{ inputs.researcher }}
+          TRIAL_PARSER_MODEL: ${{ inputs.parser }}

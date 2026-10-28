@@ -31,6 +31,8 @@ jobs:
       - name: Install poetry
         uses: snok/install-poetry@a783c322200f0519c7926aa6faa857c4e23e9263 # v1.4.2
         with:
+          # pinned like the actions: the version every run has installed since Oct 2026
+          version: 2.5.1
           virtualenvs-create: true
           virtualenvs-in-project: true
           installer-parallel: true
@@ -44,6 +46,11 @@ jobs:
             --summary review.md
         env:
           METACULUS_TOKEN: ${{ secrets.METACULUS_TOKEN }}
+      - name: Add the calibration scorecard
+        continue-on-error: true # never at the cost of bot-review's summary or the artifact
+        run: |
+          echo >> review.md
+          poetry run python scorecard.py review.json >> review.md
       - name: Show the summary in the run page
         run: cat review.md >> $GITHUB_STEP_SUMMARY
       - name: Keep the review
