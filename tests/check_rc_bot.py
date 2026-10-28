@@ -981,6 +981,56 @@ def check_alerts() -> None:
     print("alerts: ok")
 
 
+def check_watchdog() -> None:
+    """watchdog.py: the backup clock's check that the Cloudflare clock still ticks."""
+    import watchdog
+
+    now = datetime(2026, 11, 20, 12, 0, tzinfo=timezone.utc)
+    runs: list[dict] = []
+    raised: list[tuple] = []
+
+    class FakeResponse:
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {"workflow_runs": runs}
+
+    def fake_get(url, headers, params, timeout):
+        assert url.endswith("/actions/workflows/run_bot_on_tournament.yaml/runs"), url
+        assert params["event"] == "workflow_dispatch", params
+        return FakeResponse()
+
+    def run(minutes_ago: int, actor: str) -> dict:
+        created = (now - timedelta(minutes=minutes_ago)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        return {"created_at": created, "triggering_actor": {"login": actor}}
+
+    real_get, real_alert = watchdog.requests.get, watchdog.alerts.raise_alert
+    try:
+        watchdog.requests.get = fake_get  # type: ignore[assignment]
+        watchdog.alerts.raise_alert = lambda title, body, **kw: raised.append((title, kw)) or True  # type: ignore[assignment]
+        with env(GITHUB_TOKEN="ghs_fake", GITHUB_REPOSITORY="o/r"):
+            # ticking: the Worker's run 15 minutes ago, after the backup clock's own
+            runs[:] = [run(2, "github-actions[bot]"), run(15, "robcam55")]
+            assert watchdog.check(now).startswith("Cloudflare clock: ticking"), raised
+            assert raised == []
+            # stopped: only the backup clock's runs for three hours, or none at all
+            runs[:] = [run(5, "github-actions[bot]"), run(200, "robcam55")]
+            line = watchdog.check(now)
+            assert "stopped (its last run was 2026-11-20 08:40 UTC)" in line, line
+            assert raised == [("The Cloudflare clock stopped", {"open_only": True})], raised
+            runs[:] = []
+            assert "no run it started is listed" in watchdog.check(now)
+            # GitHub unreachable: noted, never raised, so the tick itself goes on
+            watchdog.requests.get = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("x"))  # type: ignore[assignment]
+            assert watchdog.check(now) == "Cloudflare clock: not checked (RuntimeError)."
+        with env():
+            assert "no GitHub token" in watchdog.check(now)
+    finally:
+        watchdog.requests.get, watchdog.alerts.raise_alert = real_get, real_alert  # type: ignore[assignment]
+    print("watchdog: ok")
+
+
 def binary_question() -> BinaryQuestion:
     return BinaryQuestion(
         question_text="Will it happen?",
@@ -2001,6 +2051,7 @@ if __name__ == "__main__":
     check_run_loop()
     check_own_key()
     check_alerts()
+    check_watchdog()
     check_aggregation()
     check_guards()
     check_research_survives_one_failure()
