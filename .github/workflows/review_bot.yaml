@@ -46,6 +46,10 @@ jobs:
             --summary review.md
         env:
           METACULUS_TOKEN: ${{ secrets.METACULUS_TOKEN }}
+      - name: Add the calibration scorecard
+        run: |
+          echo >> review.md
+          poetry run python scorecard.py review.json >> review.md
       - name: Show the summary in the run page
         run: cat review.md >> $GITHUB_STEP_SUMMARY
       - name: Keep the review

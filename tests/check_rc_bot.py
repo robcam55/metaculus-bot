@@ -1031,6 +1031,46 @@ def check_watchdog() -> None:
     print("watchdog: ok")
 
 
+def check_scorecard() -> None:
+    """scorecard.py over a review.json shaped like bot-review's."""
+    import scorecard
+
+    def binary(p, outcome, score):
+        return {"question_type": "binary", "project_name": "MiniBench", "resolution": outcome,
+                "forecast": {"probability_yes": p}, "scores": {"spot_peer_score": score}}  # fmt: skip
+
+    numeric = {
+        "question_type": "numeric", "project_name": "MiniBench", "resolution": "42",
+        "forecast": {"median": 40}, "scores": {"spot_peer_score": -3.0},
+        "traces": [{"forecasters": [
+            {"prediction": "Probability distribution:\n- 10.00% chance of value below 30.0\n- 90.00% chance of value below 41.0"},
+            {"prediction": "Probability distribution:\n- 10.00% chance of value below 35.0\n- 90.00% chance of value below 50.0"},
+        ]}],
+    }  # fmt: skip
+    mc = {
+        "question_type": "multiple_choice", "project_name": "FutureEval", "resolution": "b",
+        "forecast": {"probabilities": {"a": 0.6, "b": 0.4}}, "scores": {"spot_peer_score": -10.0},
+    }  # fmt: skip
+    review = {"questions": [
+        binary(0.05, "no", 5.0), binary(0.8, "yes", 12.0), binary(0.3, "yes", -20.0),
+        binary(0.5, "annulled", None), numeric, mc,
+    ]}  # fmt: skip
+    text = "\n".join(scorecard.scorecard(review))
+    for expected in (
+        "| MiniBench | all types | 4 | -1.5 ± 6.9 | -6.0 |",
+        "| MiniBench | binary | 3 | -1.0 ± 9.7 | -3.0 |",
+        "| FutureEval | multiple_choice | 1 | -10.0 | -10.0 |",
+        "3 resolved: mean forecast 38%, resolved Yes 67% (± 27%), Brier 0.177.",
+        "| 0%–10% | 1 | 5% | 0% |",
+        "2 forecaster ranges: outcome below the 10th percentile 0%, between the 10th and 90th 50%, above the 90th 50%",
+        "1 resolved: mean probability on the winner 40%; the winner was the favourite 0% of the time.",
+    ):
+        assert expected in text, (expected, text)
+    empty = "\n".join(scorecard.scorecard({"questions": []}))
+    assert "No resolved binary forecasts yet." in empty, empty
+    print("scorecard: ok")
+
+
 def binary_question() -> BinaryQuestion:
     return BinaryQuestion(
         question_text="Will it happen?",
@@ -2052,6 +2092,7 @@ if __name__ == "__main__":
     check_own_key()
     check_alerts()
     check_watchdog()
+    check_scorecard()
     check_aggregation()
     check_guards()
     check_research_survives_one_failure()
