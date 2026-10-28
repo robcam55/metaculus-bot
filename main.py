@@ -22,6 +22,9 @@ import spend
 # GitHub issues that tell Rob when the credits run low or his own key stops.
 import alerts
 
+# Numeric and multiple-choice answers that would otherwise sink a whole question.
+import forecast_guards
+
 # Runtime helpers (env validation, banners, dependency-warning suppression).
 from bot_helpers import (
     check_environment,
@@ -66,6 +69,9 @@ logger = logging.getLogger(__name__)
 # Every model call, forecasting-tools' own included, goes through general_llm's acompletion:
 # metering it records what each call cost (see spend.py). It changes no request.
 spend.install(general_llm)
+# 0.2.92's CDF standardisation can loop forever on a CDF that isn't increasing, freezing
+# the whole run; this bounds it as forecasting-tools 0.3.5 does (see forecast_guards.py)
+forecast_guards.install()
 
 # AskNews's free tournament tier allows 1,000 calls a month. The template's
 # "news-summaries" makes 6 per question (latest news = 1, archive = 5); a season plus
@@ -109,9 +115,15 @@ MAX_QUESTIONS_PER_RUN = 25
 # litellm caps an Anthropic reply at 4,096 tokens unless told otherwise, and Opus 5.5 and
 # Sonnet 5 think on every request, inside that cap. OpenRouter sets its own.
 ANTHROPIC_MAX_TOKENS = 16000
-# Anthropic's own web search for the search-backed model on Rob's key: litellm sends it
-# as web_search_20250305 with up to five searches ("medium"), $10 per 1,000 searches.
-ANTHROPIC_WEB_SEARCH = {"search_context_size": "medium"}
+# Anthropic's own web search for the search-backed model on Rob's key, up to five searches
+# a question at $10 per 1,000. It is passed as a tool, not litellm's web_search_options,
+# which litellm 1.80.10 always sends as the older web_search_20250305: this version
+# filters results before they enter the context (dynamic filtering, no extra fee), so
+# fewer of them are billed as input.
+ANTHROPIC_SEARCH_TOOL = {"type": "web_search_20260209", "name": "web_search", "max_uses": 5}
+# Stop reasons (as litellm reports them) for a research reply that ended before its
+# answer: a server-side search loop paused, or the reply ran out of tokens
+CUT_SHORT = ("pause_turn", "length")
 
 # What Anthropic says when a key can't spend: a workspace or organization spend limit
 # (400 invalid_request_error, or 429 enforced_spend_limit_reached), prepaid credit gone,
@@ -215,6 +227,7 @@ class ConfiguredAskNewsSearcher(AskNewsSearcher):
         from asknews_sdk import AsyncAskNewsSDK
 
         sections: list[str] = []
+        any_found = False
         async with AsyncAskNewsSDK(
             client_id=self.client_id,
             client_secret=self.client_secret,
@@ -239,7 +252,11 @@ class ConfiguredAskNewsSearcher(AskNewsSearcher):
                     else "No articles were found.\n\n"
                 )
                 sections.append(f"{self.HEADINGS[search]}:\n\n{found}")
-        formatted = "".join(sections)
+                any_found = any_found or bool(articles)
+        # No articles from any search is no research: returned empty, it counts as such
+        # (the run page's "returned nothing"), so when the other source fails too the
+        # question waits for the next run instead of being forecast blind
+        formatted = "".join(sections) if any_found else ""
         self.cache.set(cache_key, formatted)
         return formatted
 
@@ -319,7 +336,10 @@ async def parse(*args, **kwargs):
 
 def source_name(source: GeneralLlm | str) -> str:
     if isinstance(source, GeneralLlm):
-        if source.litellm_kwargs.get("web_search_options"):
+        tools = source.litellm_kwargs.get("tools") or []
+        if source.litellm_kwargs.get("web_search_options") or any(
+            isinstance(t, dict) and t.get("name") == "web_search" for t in tools
+        ):
             return f"{source.model} + web search"
         return source.model
     if source == ASKNEWS_RESEARCHER:
@@ -371,6 +391,50 @@ def _has_asknews() -> bool:
         (os.getenv("ASKNEWS_CLIENT_ID") and os.getenv("ASKNEWS_SECRET"))
         or os.getenv("ASKNEWS_API_KEY")
     )
+
+
+class ResearchCutShort(RuntimeError):
+    """A research reply that stopped before its answer: what came back is narration."""
+
+
+class AnthropicSearchLlm(GeneralLlm):
+    """Sonnet 5 with Anthropic's web search, on Rob's own key. Three things GeneralLlm
+    doesn't do on this route:
+    - Keep the sources. litellm 1.80.10 keeps Anthropic's citations in the message's
+      provider_specific_fields, which GeneralLlm never reads, so until 2026-10-28 the
+      research reached the forecasters (and the posted comment) with every URL dropped.
+    - Cache the search loop. One cache marker on the prompt is enough for Anthropic to
+      cache each round of search results for the next search in the same request, read
+      at a tenth of the input price, instead of billing every round again in full. The
+      prompt itself is too short to cache.
+    - Turn away a reply that stopped early (CUT_SHORT). GeneralLlm accepts any text, so
+      a reply holding only "I'll search for this." counted as research.
+    The researcher is always invoked with a plain prompt, which model_input_to_message
+    turns into one user message."""
+
+    def model_input_to_message(self, user_input, system_prompt=None):
+        messages = super().model_input_to_message(user_input, system_prompt)
+        last = messages[-1]
+        if last.get("role") == "user" and isinstance(last.get("content"), str):
+            block = {"type": "text", "text": last["content"], "cache_control": {"type": "ephemeral"}}
+            messages[-1] = {**last, "content": [block]}  # type: ignore[dict-item]
+        return messages
+
+    @staticmethod
+    def _extract_citations(response, choices) -> list[str]:
+        # The one hook GeneralLlm gives on the raw response, so the stop reason is
+        # checked here too, before the text is taken as research
+        reason = getattr(choices[0], "finish_reason", None)
+        if reason in CUT_SHORT:
+            raise ResearchCutShort(f"The research reply stopped early ({reason})")
+        fields = getattr(choices[0].message, "provider_specific_fields", None) or {}
+        urls: list[str] = []
+        for group in fields.get("citations") or []:
+            for citation in group or []:
+                url = citation.get("url") if isinstance(citation, dict) else None
+                if url and url not in urls:
+                    urls.append(url)
+        return urls or GeneralLlm._extract_citations(response, choices)
 
 
 def llm_route() -> str | None:
@@ -440,12 +504,12 @@ def build_llms(
             allowed_tries=2,
         )
     else:
-        search_llm = GeneralLlm(
+        search_llm = AnthropicSearchLlm(
             model=f"{prefix}claude-sonnet-5",
             temperature=None,
             timeout=300,
             allowed_tries=2,
-            web_search_options=ANTHROPIC_WEB_SEARCH,
+            tools=[dict(ANTHROPIC_SEARCH_TOOL)],
             **room,
         )
     if os.getenv("RESEARCHER"):
@@ -706,19 +770,35 @@ class RcForecastBot(ForecastBot):
         return source_name(source)
 
     def _research_prompt(self, question: MetaculusQuestion) -> str:
+        """The research brief. Besides the news, it asks for the two things the
+        Spring 2026 bot survey found most associated with better scores: the current
+        reading of the source the criteria name, and forecasts on the question or close
+        ones elsewhere. Using published forecasts, Metaculus's own included, is within the
+        tournament's rules."""
+        if isinstance(question, MultipleChoiceQuestion):
+            outcome = "which option the question would resolve to"
+            options = f"\nThe options are: {question.options}\n"
+        elif isinstance(question, (NumericQuestion, DateQuestion)):
+            outcome = "what the question would resolve to"
+            options = ""
+        else:
+            outcome = "whether the question would resolve Yes or No"
+            options = ""
         return clean_indents(
             f"""
             You are an assistant to a superforecaster.
             The superforecaster will give you a question they intend to forecast on.
-            To be a great assistant, you generate a concise but detailed rundown of the most relevant news, including if the question would resolve Yes or No based on current information.
+            To be a great assistant, you generate a concise but detailed rundown of the most relevant news, including {outcome} based on current information.
             Include dates for every fact, relevant base rates or historical frequencies if you know them, and any scheduled events before the question resolves.
+            If the resolution criteria name a source (an official page, a data series, a report), give its latest value or status and when it was published.
+            If a prediction market (Polymarket, Kalshi, Manifold) or Metaculus has a forecast on this question or a closely related one, give it with its date and a link, and say how closely that question matches this one's criteria.
             You do not produce forecasts yourself.
 
             {timeline(question)}
 
             Question:
             {question.question_text}
-
+            {options}
             Background:
             {question.background_info or "None given."}
 
@@ -770,11 +850,15 @@ class RcForecastBot(ForecastBot):
         question: MetaculusQuestion,
     ) -> PredictionTypes:
         """Binary: trimmed mean (drop the single highest and lowest) once there are at
-        least four predictions; it beat the median in Halawi et al. (2024). Other types
-        keep forecasting-tools' aggregation."""
+        least four predictions; it beat the median in Halawi et al. (2024). Numeric,
+        discrete and date: the mixture of the forecasts (their mean CDF), less any far
+        from the others, in place of the package's pointwise median (forecast_guards.py).
+        Multiple choice keeps forecasting-tools' mean per option."""
         if isinstance(question, BinaryQuestion) and len(predictions) >= 4:
             values = sorted(float(p) for p in predictions)  # type: ignore[arg-type]
             return float(statistics.mean(values[1:-1]))  # type: ignore[return-value]
+        if isinstance(question, (NumericQuestion, DateQuestion)) and len(predictions) >= 2:
+            return forecast_guards.mixture(predictions, question)  # type: ignore[arg-type,return-value]
         return await super()._aggregate_predictions(predictions, question)
 
     ##################################### BINARY QUESTIONS #####################################
@@ -875,6 +959,8 @@ class RcForecastBot(ForecastBot):
             {self._get_conditional_disclaimer_if_necessary(question)}
             You write your rationale remembering that (1) good forecasters put extra weight on the status quo outcome since the world changes slowly most of the time, and (2) good forecasters leave some moderate probability on most options to account for unexpected outcomes.
 
+            Your probabilities must add up to 100%.
+
             The last thing you write is your final probabilities for the N options in this order {question.options} as:
             Option_A: Probability_A
             Option_B: Probability_B
@@ -900,13 +986,17 @@ class RcForecastBot(ForecastBot):
         )
         reasoning = await self.get_llm("default", "llm").invoke(prompt)
         logger.info(f"Reasoning for URL {question.page_url}: {reasoning}")
-        predicted_option_list: PredictedOptionList = await parse(
+        # Parsed without the package's validator, which rejects a confident answer with
+        # several 0% options and would do so again on every retry; option_list floors
+        # and renormalises instead (forecast_guards.py)
+        guesses: list[forecast_guards.OptionGuess] = await parse(
             text_to_structure=reasoning,
-            output_type=PredictedOptionList,
+            output_type=list[forecast_guards.OptionGuess],
             model=self.get_llm("parser", "llm"),
             num_validation_samples=self._structure_output_validation_samples,
             additional_instructions=parsing_instructions,
         )
+        predicted_option_list = forecast_guards.option_list(guesses, question.options)
 
         logger.info(
             f"Forecasted URL {question.page_url} with prediction: {predicted_option_list}."
@@ -1003,7 +1093,12 @@ class RcForecastBot(ForecastBot):
             additional_instructions=parsing_instructions,
             num_validation_samples=self._structure_output_validation_samples,
         )
-        prediction = NumericDistribution.from_question(percentile_list, question)
+        prediction = NumericDistribution.from_question(
+            forecast_guards.spread_repeats(percentile_list, question), question
+        )
+        # Build the CDF now, so an answer that can't make one fails only this forecast,
+        # not the whole question at aggregation after every forecast is paid for
+        prediction.get_cdf()
         logger.info(
             f"Forecasted URL {question.page_url} with prediction: {prediction.declared_percentiles}."
         )
@@ -1101,7 +1196,10 @@ class RcForecastBot(ForecastBot):
             )
             for percentile in date_percentile_list
         ]
-        prediction = NumericDistribution.from_question(percentile_list, question)
+        prediction = NumericDistribution.from_question(
+            forecast_guards.spread_repeats(percentile_list, question), question
+        )
+        prediction.get_cdf()  # see _numeric_prompt_to_forecast
         logger.info(
             f"Forecasted URL {question.page_url} with prediction: {prediction.declared_percentiles}."
         )

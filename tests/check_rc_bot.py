@@ -114,12 +114,18 @@ def fixed_anthropic_prices():
     copy lacks these models, so a failed download must not fail an unrelated change."""
     import litellm
 
-    rows = {"claude-opus-5-5": (4e-06, 2e-05), "claude-sonnet-5": (2e-06, 1e-05), "claude-haiku-4-5": (1e-06, 5e-06)}  # fmt: skip
+    # input, output, cache read, cache write (5 minutes), per token
+    rows = {
+        "claude-opus-5-5": (4e-06, 2e-05, 2e-07, 5e-06),
+        "claude-sonnet-5": (2e-06, 1e-05, 2e-07, 2.5e-06),
+        "claude-haiku-4-5": (1e-06, 5e-06, 1e-07, 1.25e-06),
+    }  # fmt: skip
     saved = {name: litellm.model_cost.get(name) for name in rows}
     litellm.register_model({
         name: {"input_cost_per_token": i, "output_cost_per_token": o,
+               "cache_read_input_token_cost": r, "cache_creation_input_token_cost": w,
                "litellm_provider": "anthropic", "mode": "chat"}
-        for name, (i, o) in rows.items()
+        for name, (i, o, r, w) in rows.items()
     })  # fmt: skip
     try:
         yield
@@ -146,7 +152,12 @@ def check_routing() -> None:
         assert d["parser"].litellm_kwargs["temperature"] == 0
         # no AskNews: Sonnet 5 with Anthropic's own web search is the one source
         assert main.source_name(d["researcher"]) == "anthropic/claude-sonnet-5 + web search"
-        assert d["researcher"].litellm_kwargs["web_search_options"] == main.ANTHROPIC_WEB_SEARCH
+        assert isinstance(d["researcher"], main.AnthropicSearchLlm), d["researcher"]
+        # the dynamic-filtering tool, passed as a tool: web_search_options would send the
+        # older web_search_20250305
+        assert d["researcher"].litellm_kwargs["tools"] == [main.ANTHROPIC_SEARCH_TOOL]
+        assert d["researcher"].litellm_kwargs["tools"][0]["type"] == "web_search_20260209"
+        assert "web_search_options" not in d["researcher"].litellm_kwargs
         assert d["researcher"].litellm_kwargs["max_tokens"] == main.ANTHROPIC_MAX_TOKENS
         assert d["researcher_2"] is None
 
@@ -190,10 +201,11 @@ def check_routing() -> None:
         assert model_of(d["parser"]) == "anthropic/claude-haiku-4-5"
         assert d["researcher"] == main.ASKNEWS_RESEARCHER
         assert main.source_name(d["researcher_2"]) == "anthropic/claude-sonnet-5 + web search"
-        # the OpenRouter route sends no reply cap and no web search options
+        # the OpenRouter route sends no reply cap and no search tool (:online searches)
         d = main.build_llms("openrouter")
         assert "max_tokens" not in d["default"].litellm_kwargs
-        assert "web_search_options" not in d["researcher_2"].litellm_kwargs
+        assert "tools" not in d["researcher_2"].litellm_kwargs
+        assert not isinstance(d["researcher_2"], main.AnthropicSearchLlm)
 
     # a pacing tier picks the forecaster on the donated credits
     with env(OPENROUTER_API_KEY="x", FORECASTER_MODEL="openrouter/some/other-model"):
@@ -925,6 +937,203 @@ def check_aggregation() -> None:
     print("aggregation: ok")
 
 
+class FakeLlm:
+    """A forecaster whose reply is fixed, for the prompt-to-forecast methods."""
+
+    def __init__(self, reply: str = "Reasoning...") -> None:
+        self.reply = reply
+
+    async def invoke(self, prompt, system_prompt=None):
+        return self.reply
+
+
+def check_guards() -> None:
+    """forecast_guards.py: the forecasting-tools 0.2.92 answers that sank a whole question
+    (reproduced offline on 2026-10-28), and the numeric mixture."""
+    import faulthandler
+
+    import forecast_guards as fg
+    from forecasting_tools import NumericDistribution, Percentile
+
+    heights = [0.1, 0.2, 0.4, 0.6, 0.8, 0.9]
+    q = NumericQuestion(
+        question_text="How many?", page_url="https://example.invalid/q/5", lower_bound=0,
+        upper_bound=100, open_lower_bound=True, open_upper_bound=True, zero_point=None,
+        cdf_size=201,
+    )  # fmt: skip
+
+    def pcts(values):
+        return [Percentile(percentile=h, value=v) for h, v in zip(heights, values)]
+
+    def dist(values, question=q):
+        return NumericDistribution.from_question(pcts(values), question)
+
+    # P10 = P20 at an open lower bound with a concentrated middle: 0.2.92's CDF loop never
+    # ended and froze the run. Bounded, it raises (a watchdog kills the check if not)
+    faulthandler.dump_traceback_later(60, exit=True)
+    try:
+        dist([0, 0, 5, 5.2, 20, 30]).get_cdf()
+    except ValueError as e:
+        assert "Could not standardize CDF" in str(e), e
+    else:
+        raise AssertionError("a CDF that isn't increasing must raise")
+    finally:
+        faulthandler.cancel_dump_traceback_later()
+
+    # spreading the repeat keeps the CDF increasing, so that answer forecasts normally
+    spread = fg.spread_repeats(pcts([0, 0, 5, 5.2, 20, 30]), q)
+    assert all(close(p.value, v) for p, v in zip(spread, [0, 1e-4, 5, 5.2, 20, 30])), spread
+    cdf = NumericDistribution.from_question(spread, q).get_cdf()
+    assert all(b.percentile > a.percentile for a, b in zip(cdf, cdf[1:]))
+    below = fg.spread_repeats(pcts([-5, -5, -5, 3, 9, 12]), q)
+    assert all(close(p.value, v) for p, v in zip(below, [-5, -5 + 1e-4, -5 + 2e-4])), below
+    # repeats inside the range, and repeats at a closed bound, are the package's to handle
+    inside = pcts([10, 10, 20, 30, 40, 50])
+    assert fg.spread_repeats(inside, q) == inside
+    closed = q.model_copy(update={"open_lower_bound": False})
+    assert fg.spread_repeats(pcts([0, 0, 5, 9, 20, 30]), closed) == pcts([0, 0, 5, 9, 20, 30])
+
+    # through the bot: the answer that used to fail now forecasts, and an answer that still
+    # can't make a CDF fails only its own forecast (the CDF is built before aggregation)
+    with env(ANTHROPIC_API_KEY="x"):
+        bot = main.RcForecastBot(publish_reports_to_metaculus=False)
+    bot.get_llm = lambda name, kind="llm": FakeLlm()  # type: ignore[method-assign]
+    parsed: list = []
+
+    async def fake_parse(*args, **kwargs):
+        return parsed[0]
+
+    real_parse = main.parse
+    try:
+        main.parse = fake_parse
+        parsed[:] = [pcts([0, 0, 5, 5.2, 20, 30])]
+        got = asyncio.run(bot._numeric_prompt_to_forecast(q, "prompt"))
+        assert got.prediction_value.get_cdf(), got
+
+        # three forecasts: the mixture is their mean CDF, wider than the median where they
+        # disagree; a misread outlier is left out
+        wide = NumericQuestion(**{**q.model_dump(), "upper_bound": 1000})
+        a, b, c = (dist(v, wide) for v in ([10, 20, 30, 40, 50, 60], [20, 30, 40, 50, 60, 70], [30, 40, 50, 60, 70, 80]))  # fmt: skip
+        mixed = asyncio.run(bot._aggregate_predictions([a, b, c], wide))
+        mean = [sum(t) / 3 for t in zip(*([p.percentile for p in d.get_cdf()] for d in (a, b, c)))]
+        # (the declared CDF; posting standardises it again, as it does the package's median)
+        assert all(abs(m.percentile - x) < 1e-6 for m, x in zip(mixed.declared_percentiles, mean))
+        far = dist([600, 700, 750, 800, 850, 900], wide)  # the same forecast in the wrong unit
+        mixed = asyncio.run(bot._aggregate_predictions([a, b, far], wide))
+        both = [sum(t) / 2 for t in zip(*([p.percentile for p in d.get_cdf()] for d in (a, b)))]
+        assert all(abs(m.percentile - x) < 1e-6 for m, x in zip(mixed.declared_percentiles, both))
+        # two forecasts: nothing to judge an outlier by, so both count
+        mixed = asyncio.run(bot._aggregate_predictions([a, far], wide))
+        assert mixed.declared_percentiles[100].percentile < a.get_cdf()[100].percentile
+
+        # multiple choice: a confident answer with six options at 0%, which 0.2.92's
+        # validator rejected on every retry, now posts with each long shot at 1%
+        options = ["Alpha", "Bravo", "Charlie", "Delta", "Echo", "Foxtrot", "Golf", "Hotel"]
+        mc = MultipleChoiceQuestion(question_text="Which?", options=options)
+        sharp = [0.92, 0.08] + [0.0] * 6
+        parsed[:] = [[fg.OptionGuess(option_name=o, probability=p) for o, p in zip(options, sharp)]]
+        got = asyncio.run(bot._multiple_choice_prompt_to_forecast(mc, "prompt"))
+        probs = got.prediction_value.to_dict()
+        assert list(probs) == options and abs(sum(probs.values()) - 1) < 1e-9, probs
+        assert all(abs(probs[o] - 0.01) < 1e-9 for o in options[2:]), probs
+        assert abs(probs["Alpha"] - 0.92 * 0.94) < 1e-9, probs
+    finally:
+        main.parse = real_parse
+
+    def guesses(pairs):
+        return [fg.OptionGuess(option_name=n, probability=p) for n, p in pairs]
+
+    two = ["Yes, before May", "No"]
+    # names as forecasters write them; percentages; a sum a little off
+    got = fg.option_list(guesses([(" yes,  before MAY ", 61), ("Option: No.", 41)]), two).to_dict()
+    assert abs(got["Yes, before May"] - 61 / 102) < 1e-9 and abs(got["No"] - 41 / 102) < 1e-9
+    for bad, needle in (
+        (guesses([("No", 1.0)]), "no probability for option"),
+        (guesses([("Yes, before May", 0.9), ("No", 0.6)]), "sum to 150%"),
+    ):
+        try:
+            fg.option_list(bad, two)
+        except ValueError as e:
+            assert needle in str(e), e
+        else:
+            raise AssertionError(f"{bad} must fail its forecast")
+    print("guards: ok")
+
+
+def anthropic_search_reply(stop_reason: str = "end_turn") -> dict:
+    """A web-search reply as Anthropic's API sends it: narration, a search, cited text."""
+    url = "https://www.reuters.com/world/example-2026-10-27/"
+    return {
+        "id": "msg_fake", "type": "message", "role": "assistant", "model": "claude-sonnet-5",
+        "content": [
+            {"type": "text", "text": "I'll search for this."},
+            {"type": "server_tool_use", "id": "s1", "name": "web_search", "input": {"query": "q"}},
+            {"type": "web_search_tool_result", "tool_use_id": "s1", "content": [
+                {"type": "web_search_result", "url": url, "title": "Reuters", "encrypted_content": "e"}]},
+            {"type": "text", "text": " The ministry announced the delay on 2026-10-27.", "citations": [
+                {"type": "web_search_result_location", "url": url, "title": "Reuters",
+                 "encrypted_index": "i", "cited_text": "delay"}]},
+        ],
+        "stop_reason": stop_reason, "stop_sequence": None,
+        "usage": {"input_tokens": 3000, "cache_read_input_tokens": 40000,
+                  "cache_creation_input_tokens": 20000, "output_tokens": 2000,
+                  "server_tool_use": {"web_search_requests": 4}},
+    }  # fmt: skip
+
+
+def check_own_key_research() -> None:
+    """Research on Rob's key through litellm 1.80.10 with only its HTTP layer faked: the
+    request carries the dynamic-filtering search tool and one cache marker; the reply's
+    sources reach the research; a reply cut short fails; cached tokens are priced as such."""
+    import json
+
+    import httpx
+
+    sent: list[dict] = []
+    replies: list[dict] = []
+
+    async def fake_send(self, request, *args, **kwargs):
+        assert "api.anthropic.com" in str(request.url), request.url
+        sent.append({"headers": dict(request.headers), "body": json.loads(request.content)})
+        return httpx.Response(200, request=request, json=replies.pop(0))
+
+    real_send = httpx.AsyncClient.send
+    try:
+        httpx.AsyncClient.send = fake_send  # type: ignore[method-assign]
+        with env(ANTHROPIC_API_KEY="sk-ant-fake"):
+            llm = main.build_llms("anthropic")["researcher"]
+            llm.allowed_tries = 1  # no retry backoff in the check
+            replies.append(anthropic_search_reply())
+            with spend.collecting() as ledger:
+                text = asyncio.run(llm.invoke("Research this question."))
+            body = sent[0]["body"]
+            assert body["tools"] == [{"type": "web_search_20260209", "name": "web_search", "max_uses": 5}], body["tools"]  # fmt: skip
+            assert body["messages"] == [{"role": "user", "content": [
+                {"type": "text", "text": "Research this question.", "cache_control": {"type": "ephemeral"}}]}], body["messages"]  # fmt: skip
+            assert "temperature" not in body and "thinking" not in body, body
+            # the cited source survives as a Sources footer (it used to be dropped)
+            assert "The ministry announced the delay on 2026-10-27." in text, text
+            assert "https://www.reuters.com/world/example-2026-10-27/" in text, text
+            # tokens at their cached prices plus $0.01 a search
+            call = ledger.calls[0]
+            assert (call.cache_reads, call.cache_writes, call.searches) == (40000, 20000, 4), call
+            expected = 3000 * 2e-6 + 40000 * 2e-7 + 20000 * 2.5e-6 + 2000 * 1e-5 + 4 * 0.01
+            assert abs(call.cost - expected) < 1e-9, (call.cost, expected)
+
+            # a reply whose server-side search loop paused holds only narration: it fails,
+            # so the research counts as missing rather than as "I'll search for this."
+            replies.append(anthropic_search_reply("pause_turn"))
+            try:
+                asyncio.run(llm.invoke("Research this question."))
+            except Exception as e:
+                assert "stopped early (pause_turn)" in repr(e), repr(e)
+            else:
+                raise AssertionError("a reply cut short must not count as research")
+    finally:
+        httpx.AsyncClient.send = real_send  # type: ignore[method-assign]
+    print("own-key research: ok")
+
+
 def check_research_survives_one_failure() -> None:
     # Source labels such as "asknews/latest" are read from the environment as research
     # runs, so the whole check runs inside env(): an exported ASKNEWS_STRATEGY can't leak in
@@ -1033,6 +1242,14 @@ def check_prompts() -> None:
     ):
         assert expected in research_prompt, (expected, research_prompt)
     assert "None given." in bot._research_prompt(bare)  # no background: no "None"
+    # the source the criteria name, and forecasts elsewhere; the outcome by question type
+    for expected in ("give its latest value or status", "Polymarket, Kalshi, Manifold", "whether the question would resolve Yes or No"):  # fmt: skip
+        assert expected in research_prompt, (expected, research_prompt)
+    mc_prompt = bot._research_prompt(timed_question("mc"))
+    assert "which option the question would resolve to" in mc_prompt, mc_prompt
+    assert "The options are: ['a', 'b']" in mc_prompt and "Yes or No" not in mc_prompt, mc_prompt
+    assert "what the question would resolve to" in bot._research_prompt(timed_question("numeric"))
+    assert not research_prompt.startswith(" "), research_prompt  # indents still cleaned
 
     prompts: dict[str, str] = {}
 
@@ -1298,14 +1515,22 @@ def check_asknews() -> None:
 
     calls: list[dict] = []
     sleeps: list[float] = []
+    # what each search strategy finds: one article by default
+    found: dict[str, list] = {}
+    article = types.SimpleNamespace(
+        eng_title="Ministry delays the vote", summary="The vote moves to November.",
+        language="en", pub_date=datetime(2026, 10, 27, 9, 0, tzinfo=timezone.utc),
+        source_id="Reuters", article_url="https://www.reuters.com/x",
+    )  # fmt: skip
 
     class FakeResponse:
-        as_dicts: list = []
+        def __init__(self, strategy):
+            self.as_dicts = found.get(strategy, [article])
 
     class FakeNews:
         async def search_news(self, **kwargs):
             calls.append(kwargs)
-            return FakeResponse()
+            return FakeResponse(kwargs["strategy"])
 
     class FakeSDK:
         def __init__(self, **kwargs):
@@ -1336,7 +1561,10 @@ def check_asknews() -> None:
         assert [(c["strategy"], c["n_articles"]) for c in calls] == [("latest news", 8)], calls
         assert calls[0]["query"] == "Will it happen?"
         assert sleeps == [], sleeps
-        assert text.startswith("Latest news") and "No articles were found" in text, text
+        assert text.startswith("Latest news") and "Ministry delays the vote" in text, text
+        # nothing found is no research: empty, so it reads as "returned nothing"
+        found["latest news"] = []
+        assert search() == "", search()
 
         text = search(ASKNEWS_STRATEGY="archive", ASKNEWS_ARTICLES="12")
         assert [(c["strategy"], c["n_articles"]) for c in calls] == [("news knowledge", 12)], calls
@@ -1347,6 +1575,8 @@ def check_asknews() -> None:
         assert [c["strategy"] for c in calls] == ["latest news", "news knowledge"], calls
         assert len(sleeps) == 1 and sleeps[0] >= 10, sleeps
         assert text.index("Latest news") < text.index("Earlier news"), text
+        # one of the two searches empty: the other's articles still count
+        assert "No articles were found" in text and "Ministry delays the vote" in text, text
     finally:
         asknews_sdk.AsyncAskNewsSDK = real_sdk  # type: ignore[misc]
         main.asyncio.sleep = real_sleep  # type: ignore[assignment]
@@ -1687,6 +1917,7 @@ if __name__ == "__main__":
     check_own_key()
     check_alerts()
     check_aggregation()
+    check_guards()
     check_research_survives_one_failure()
     check_prompts()
     check_research_policy()
@@ -1695,4 +1926,5 @@ if __name__ == "__main__":
     check_asknews()
     with fixed_anthropic_prices():
         check_spend()
+        check_own_key_research()
     print("all checks passed")
