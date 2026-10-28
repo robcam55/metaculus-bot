@@ -113,8 +113,8 @@ FALL_2026_METACULUS_CUP_ID = 33108  # https://www.metaculus.com/tournament/metac
 # minutes and pick up the rest.
 MAX_QUESTIONS_PER_RUN = 25
 
-# litellm caps an Anthropic reply at 4,096 tokens unless told otherwise, and Opus 5.5 and
-# Sonnet 5 think on every request, inside that cap. OpenRouter sets its own.
+# litellm caps an Anthropic reply at 4,096 tokens unless told otherwise, and Opus 5.5,
+# Sonnet 5.5 and Haiku 5.5 think on every request, inside that cap. OpenRouter sets its own.
 ANTHROPIC_MAX_TOKENS = 16000
 # The forecasters on Rob's key think at "high" effort (FORECASTER_EFFORT), so they get
 # more room: a reply that spends the whole cap thinking comes back empty and is retried
@@ -127,6 +127,17 @@ ANTHROPIC_FORECAST_MAX_TOKENS = 32000
 # send a thinking budget, which Opus 5.5 rejects.
 FORECASTER_EFFORTS = ("low", "medium", "high")
 DEFAULT_FORECASTER_EFFORT = "high"
+# The models on each route: the newest Sonnet and Haiku (2026-10), with Opus 5.5 from the
+# pacing tiers (budget.py). Haiku 5.5 parses at a tenth of Haiku 4.5's price, at low
+# effort: thinking counts against its reply cap, and copying numbers out of a forecast
+# needs little of it. It rejects a temperature other than the default, which Haiku 4.5
+# (PARSER_MODEL can still pick it) ran at 0.
+SONNET_MODEL = {"openrouter": "openrouter/anthropic/claude-sonnet-5.5", "anthropic": "anthropic/claude-sonnet-5-5"}  # fmt: skip
+HAIKU_MODEL = {"openrouter": "openrouter/anthropic/claude-haiku-5.5", "anthropic": "anthropic/claude-haiku-5-5"}  # fmt: skip
+PARSER_EFFORT = "low"
+ANTHROPIC_PARSER_MAX_TOKENS = 8000
+# Models that take no effort setting and accept a temperature: Haiku 4.5 and older
+_OLDER_HAIKU = re.compile(r"haiku-[34]")
 # Anthropic's own web search for the search-backed model on Rob's key, up to five searches
 # a question at $10 per 1,000. It is passed as a tool, not litellm's web_search_options,
 # which litellm 1.80.10 always sends as the older web_search_20250305: this version
@@ -170,15 +181,17 @@ def key_rejected(error: BaseException) -> bool:
 
 
 def own_key_check() -> str | None:
-    """One tiny request on Rob's own key (about $0.00002) before a run spends AskNews calls
-    and research on questions the key can't pay for. None when the key works or the
-    failure looks passing (an overload, a timeout); otherwise "limit" (a spend limit or no
-    credit) or "rejected: " and the error type (a bad or revoked key)."""
+    """One tiny request on Rob's own key (a few millionths of a dollar) before a run spends
+    AskNews calls and research on questions the key can't pay for. None when the key works
+    or the failure looks passing (an overload, a timeout); otherwise "limit" (a spend limit
+    or no credit) or "rejected: " and the error type (a bad or revoked key)."""
     try:
         litellm.completion(
-            model="anthropic/claude-haiku-4-5",
+            model=HAIKU_MODEL["anthropic"],
             messages=[{"role": "user", "content": "Reply with OK."}],
-            max_tokens=1,
+            # room for a little thinking, which Haiku 5.5 does by default
+            max_tokens=64,
+            output_config={"effort": "low"},
             timeout=60,
         )
     except Exception as e:  # never log the message: keep request details out of logs
@@ -425,7 +438,7 @@ class ResearchCutShort(RuntimeError):
 
 
 class AnthropicSearchLlm(GeneralLlm):
-    """Sonnet 5 with Anthropic's web search, on Rob's own key. Three things GeneralLlm
+    """Sonnet 5.5 with Anthropic's web search, on Rob's own key. Three things GeneralLlm
     doesn't do on this route:
     - Keep the sources. litellm 1.80.10 keeps Anthropic's citations in the message's
       provider_specific_fields, which GeneralLlm never reads, so until 2026-10-28 the
@@ -505,7 +518,7 @@ def build_llms(
     """The bot's models on one route. A pacing tier picks the forecaster on either route:
     on Metaculus's OpenRouter credits (Opus 5.5 without one), and on Rob's own Anthropic
     key once the credits run out. Without a tier (the Metaculus Cup) a personal key runs
-    Sonnet 5, or FORECASTER_MODEL. Haiku 4.5 parses on both; PARSER_MODEL overrides it."""
+    Sonnet 5.5, or FORECASTER_MODEL. Haiku 5.5 parses on both; PARSER_MODEL overrides it."""
     defaults = dict(ForecastBot._llm_config_defaults())
     if route is None:
         defaults["researcher_2"] = None
@@ -513,24 +526,23 @@ def build_llms(
     # Anthropic's API through litellm needs a reply cap that leaves room for thinking
     room = {"max_tokens": ANTHROPIC_MAX_TOKENS} if route == "anthropic" else {}
     if route == "openrouter":
-        prefix, haiku = "openrouter/anthropic/", "claude-haiku-4.5"
         forecaster = tier.forecaster if tier and tier.forecaster else budget.OPUS
     else:
-        prefix, haiku = "anthropic/", "claude-haiku-4-5"
         if tier and tier.forecaster:
             forecaster = budget.on_route(tier.forecaster, route)
         else:
-            forecaster = os.getenv("FORECASTER_MODEL") or f"{prefix}claude-sonnet-5"
-    parser = os.getenv("PARSER_MODEL") or f"{prefix}{haiku}"
+            forecaster = os.getenv("FORECASTER_MODEL") or SONNET_MODEL[route]
+    parser = os.getenv("PARSER_MODEL") or HAIKU_MODEL[route]
+    older_parser = bool(_OLDER_HAIKU.search(parser))
     thinking: dict = {}
     if route == "anthropic":
         thinking["max_tokens"] = ANTHROPIC_FORECAST_MAX_TOKENS
         effort = forecaster_effort()
-        if effort and "haiku" not in forecaster:  # Haiku 4.5 takes no effort setting
+        if effort and not _OLDER_HAIKU.search(forecaster):  # Haiku 4.5 takes no effort
             thinking["output_config"] = {"effort": effort}
     defaults["default"] = GeneralLlm(
         model=forecaster,
-        # Sonnet 5, Opus 5 and newer reject sampling parameters: send none
+        # Opus 5.5, Sonnet 5.5 and Haiku 5.5 reject sampling parameters: send none
         temperature=None,
         # more thinking takes longer: up to 8 minutes on Anthropic's API, not streamed.
         # Kept short of 10 so a dropped connection and its one retry stay well inside the
@@ -539,11 +551,18 @@ def build_llms(
         allowed_tries=2,
         **thinking,
     )
+    parser_extra: dict = {}
+    if route == "anthropic" and not older_parser:
+        parser_extra = {
+            "max_tokens": ANTHROPIC_PARSER_MAX_TOKENS,
+            "output_config": {"effort": PARSER_EFFORT},
+        }
     parser_llm = GeneralLlm(
         model=parser,
-        temperature=0 if "haiku" in parser else None,
+        temperature=0 if older_parser else None,
         timeout=120,
         allowed_tries=3,
+        **parser_extra,
     )
     defaults["parser"] = parser_llm
     defaults["summarizer"] = parser_llm
@@ -551,22 +570,22 @@ def build_llms(
     # Two independent research sources: AskNews (free for tournament bots) and a
     # search-backed model. Either may be missing; research then uses what exists.
     # Metaculus's OpenRouter credits cover only OpenAI, Anthropic and Google models,
-    # so the searcher there is Sonnet 5 with ":online" (the provider's own web
+    # so the searcher there is Sonnet 5.5 with ":online" (the provider's own web
     # search; OpenRouter's Exa fallback is not covered). A personal-key run never
-    # touches the OpenRouter key: there Sonnet 5 calls Anthropic's web search tool itself.
+    # touches the OpenRouter key: there Sonnet 5.5 calls Anthropic's web search tool itself.
     search_llm: GeneralLlm | None = None
     if os.getenv("PERPLEXITY_API_KEY"):
         search_llm = GeneralLlm(model="perplexity/sonar-pro", temperature=0.1)
     elif route == "openrouter":
         search_llm = GeneralLlm(
-            model=os.getenv("SEARCH_MODEL") or "openrouter/anthropic/claude-sonnet-5:online",
+            model=os.getenv("SEARCH_MODEL") or f"{SONNET_MODEL['openrouter']}:online",
             temperature=None,
             timeout=300,
             allowed_tries=2,
         )
     else:
         search_llm = AnthropicSearchLlm(
-            model=f"{prefix}claude-sonnet-5",
+            model=SONNET_MODEL["anthropic"],
             temperature=None,
             timeout=300,
             allowed_tries=2,
@@ -596,13 +615,13 @@ class RcForecastBot(ForecastBot):
     Metaculus's template bot. Changes from the template:
     - Claude models, paid by Metaculus's donated credits (OPENROUTER_API_KEY) before a
       personal key (ANTHROPIC_API_KEY). On the donated credits, budget.py paces spending:
-      each run reads the key's balance and picks Opus 5.5 or Sonnet 5 and the number of
+      each run reads the key's balance and picks Opus 5.5 or Sonnet 5.5 and the number of
       predictions per tournament, MiniBench never below FutureEval. Rob's own key runs
       the same tiers once the credits can't pay, or with no OpenRouter key; only the
-      Metaculus Cup's runs Sonnet 5 unpaced. Haiku 4.5 parses; PARSER_MODEL overrides it.
+      Metaculus Cup's runs Sonnet 5.5 unpaced. Haiku 5.5 parses; PARSER_MODEL overrides it.
     - Two independent research sources per report: AskNews news search (one latest-news
       call by default, to stay inside the free tier; ASKNEWS_STRATEGY and ASKNEWS_ARTICLES
-      change it) and a search-backed model (Sonnet 5 with ":online" through OpenRouter, or
+      change it) and a search-backed model (Sonnet 5.5 with ":online" through OpenRouter, or
       Perplexity with its own key). A single search's luck was the largest source of
       night-to-night noise in rc_trader's own forecasts. When every source fails, the
       question waits for the next run unless it closes first; each run's page on GitHub
@@ -1697,7 +1716,7 @@ def main() -> None:
     elif route == "anthropic" and run_mode != "metaculus_cup":
         # No OpenRouter key at all (say Metaculus's is removed now that it's spent): Rob's
         # key pays as it does after the credits, at the pinned tier, with its key check
-        # and BUDGET_TIER=pause, rather than the Metaculus Cup's unpaced Sonnet 5 x 5
+        # and BUDGET_TIER=pause, rather than the Metaculus Cup's unpaced Sonnet 5.5 x 5
         own_key = OwnKey()
         meter = budget.OwnKeyMeter(None)
         plan = budget.own_key_plan(budget.pinned_tier(), "no OpenRouter key")

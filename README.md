@@ -15,8 +15,8 @@ The changes are in `main.py` (`RcForecastBot`), `budget.py`, `spend.py`, `alerts
     `ANTHROPIC_API_KEY`.
   - They never pay for the Metaculus Cup, because Metaculus gives them for FutureEval and
     MiniBench only.
-  - On the credits, the pacing tier below picks Opus 5.5 or Sonnet 5. The Cup's personal
-    key runs Sonnet 5.
+  - On the credits, the pacing tier below picks Opus 5.5 or Sonnet 5.5. The Cup's personal
+    key runs Sonnet 5.5.
   - **Your own key takes over when the credits run out.** Once they can't pay for another
     question above the $2 reserve (at most $2.65 left at `opus-3`; at measured costs the
     last credits run usually ends a little under $2), and if `ANTHROPIC_API_KEY` is set,
@@ -28,11 +28,11 @@ The changes are in `main.py` (`RcForecastBot`), `budget.py`, `spend.py`, `alerts
     the bot back onto the credits at the next run. A run that can't read the credits'
     balance, or has no OpenRouter key at all, also runs on your key, the same way.
 
-  Haiku 4.5 parses in every case. These models reject sampling parameters, so none are
-  sent. On Anthropic's own API the forecasters think at `high` effort (`FORECASTER_EFFORT`;
-  Opus 5.5 defaults to `medium`), and each reply may run to 32,000 tokens (research
-  16,000), where litellm's default of 4,096 would leave Opus 5.5 and Sonnet 5, which always
-  think, too little room.
+  Haiku 5.5 parses in every case, at low effort. These models reject sampling parameters,
+  so none are sent. On Anthropic's own API the forecasters think at `high` effort
+  (`FORECASTER_EFFORT`; Opus 5.5 defaults to `medium`), and each reply may run to 32,000
+  tokens (research 16,000, parsing 8,000), where litellm's default of 4,096 would leave
+  Opus 5.5, Sonnet 5.5 and Haiku 5.5, which always think, too little room.
 - **Paced spending (`budget.py`).** Metaculus funds the key in steps:
   - about $100 to start;
   - more automatically after above-average MiniBench results;
@@ -46,8 +46,8 @@ The changes are in `main.py` (`RcForecastBot`), `budget.py`, `spend.py`, `alerts
   |---|---|---|
   | `opus-5` | 5 × Opus 5.5 | $0.40 |
   | `opus-3` | 3 × Opus 5.5 | $0.30 |
-  | `sonnet-3` | 3 × Sonnet 5 | $0.23 |
-  | `sonnet-1` | 1 × Sonnet 5, the last resort | $0.18 |
+  | `sonnet-3` | 3 × Sonnet 5.5 | $0.23 |
+  | `sonnet-1` | 1 × Sonnet 5.5, the last resort | $0.18 |
 
   The estimates are about 40% above the first live test (2026-10-02): `opus-3` cost $0.13
   to $0.35 a question, $0.21 on average, and web-search research was most of it.
@@ -90,8 +90,8 @@ The changes are in `main.py` (`RcForecastBot`), `budget.py`, `spend.py`, `alerts
   - AskNews news search: by default one latest-news call per question, to fit the free
     tier's 1,000 calls a month. The template's version uses six. `ASKNEWS_STRATEGY` and
     `ASKNEWS_ARTICLES` change this without a code change.
-  - A search-backed model: Sonnet 5 with OpenRouter's `:online` (Anthropic's own web search,
-    which Metaculus's credits cover). On your own key, Sonnet 5 calls Anthropic's web
+  - A search-backed model: Sonnet 5.5 with OpenRouter's `:online` (Anthropic's own web search,
+    which Metaculus's credits cover). On your own key, Sonnet 5.5 calls Anthropic's web
     search tool directly (`web_search_20260209`, which filters results before they enter
     the context), up to five searches a question, with each round of results cached for
     the next search and its sources kept. Or Perplexity, with its own key. Its prompt
@@ -258,7 +258,7 @@ newer local litellm once hid a call that crashes on the pinned one.
    4. Test it: `Actions → Test Bot → Run workflow` with "Who pays" set to `own-key`. It
       forecasts three bot-testing-area questions on your key, for about $2. The run
       page's "Your Anthropic key" section shows the spend, and the research table should
-      show `anthropic/claude-sonnet-5 + web search` working. The log's `Spend:` lines show
+      show `anthropic/claude-sonnet-5-5 + web search` working. The log's `Spend:` lines show
       the research calls' cache reads.
 
    The Metaculus Cup workflow uses this key too, but only when you run it by hand.
@@ -272,10 +272,10 @@ Other optional repository variables (empty means the default):
 | `AIB_TOURNAMENT_ID` | `33121`, the Fall 2026 FutureEval |
 | `MINIBENCH_ID` | The package's current MiniBench (`minibench`) |
 | `METACULUS_CUP_ID` | `33108`, the Fall 2026 Cup (personal key only) |
-| `PARSER_MODEL` | Claude Haiku 4.5 through the same route |
-| `SEARCH_MODEL` | `openrouter/anthropic/claude-sonnet-5:online` (OpenRouter route only) |
-| `FORECASTER_MODEL` | `anthropic/claude-sonnet-5` (Metaculus Cup only; on the credits, and on your own key after them, the tier picks) |
-| `FORECASTER_EFFORT` | `high` (Anthropic's own API only). `low` or `medium` sets that level; `default` sends none, which is `medium` on Opus 5.5 and `high` on Sonnet 5. |
+| `PARSER_MODEL` | Claude Haiku 5.5 through the same route. `anthropic/claude-haiku-4-5` brings back the old parser (at temperature 0). |
+| `SEARCH_MODEL` | `openrouter/anthropic/claude-sonnet-5.5:online` (OpenRouter route only) |
+| `FORECASTER_MODEL` | `anthropic/claude-sonnet-5-5` (Metaculus Cup only; on the credits, and on your own key after them, the tier picks) |
+| `FORECASTER_EFFORT` | `high` (Anthropic's own API only). `low` or `medium` sets that level; `default` sends none, which is `medium` on Opus 5.5 and `high` on Sonnet 5.5. |
 | `PREDICTIONS_PER_REPORT` | 5 (Metaculus Cup only) |
 | `ASKNEWS_STRATEGY` | `latest`: one latest-news search per question, covering the past day or two. `archive` searches the AskNews archive (about two months) instead; `both` does both, 12 seconds apart. Archive searches may count as several calls against AskNews's quota: confirm with AskNews first. |
 | `ASKNEWS_ARTICLES` | 8 articles per AskNews search |
@@ -298,7 +298,7 @@ The main architectural choices and the reasons behind them. Each links to where 
   - **Why a watchdog.** When GitHub turns the Worker away, the error shows only in Cloudflare's logs and the bot drops to the backup clock, every four hours or so, missing a third to two thirds of FutureEval questions with every run green. `clock_watchdog.py` opens an issue when no Worker run is under two hours old.
 
   — [rc_trader's 2026-09-23 audit](https://github.com/robcam55/rc_trader/blob/main/docs/audit/2026-09-23-AUDIT.md) (§8, Rob's hosting choice, 2026-09-23). The Cloudflare clock is Rob's choice of 2026-10-02, built in [#3](https://github.com/robcam55/metaculus-bot/pull/3). The question windows are from [Metaculus's resources page](https://www.metaculus.com/notebooks/38928/ai-benchmark-resources/), and the `BOT_ENABLED` gate from [the workflow](.github/workflows/run_bot_on_tournament.yaml). No storage is *inferred*. The backup clock's own workflow and the watchdog came from Claude's health review of 2026-10-28, with Rob's go-ahead that day, in [#13](https://github.com/robcam55/metaculus-bot/pull/13).
-- **Claude models: Opus 5.5 on Metaculus's credits and on Rob's key after them, Sonnet 5 on the Cup's personal key.** The bot is the external check on rc_trader's forecasting engine, which runs on Claude, and Metaculus's credits cover Anthropic models. — [rc_trader's 2026-09-23 audit](https://github.com/robcam55/rc_trader/blob/main/docs/audit/2026-09-23-AUDIT.md) (§8, D-14: "upgrade it as the §4 engine lands"). The switch to Opus 5.5 was Claude's, in [f4dfc32](https://github.com/robcam55/metaculus-bot/commit/f4dfc32), and Rob's credit application of 2026-09-24 described it.
+- **Claude models: Opus 5.5 on Metaculus's credits and on Rob's key after them, Sonnet 5.5 on the Cup's personal key; Sonnet 5.5 searches and Haiku 5.5 parses.** The bot is the external check on rc_trader's forecasting engine, which runs on Claude, and Metaculus's credits cover Anthropic models. — [rc_trader's 2026-09-23 audit](https://github.com/robcam55/rc_trader/blob/main/docs/audit/2026-09-23-AUDIT.md) (§8, D-14: "upgrade it as the §4 engine lands"). The switch to Opus 5.5 was Claude's, in [f4dfc32](https://github.com/robcam55/metaculus-bot/commit/f4dfc32), and Rob's credit application of 2026-09-24 described it. Sonnet 5.5 (same price as Sonnet 5) and Haiku 5.5 (a tenth of Haiku 4.5's price) replaced Sonnet 5 and Haiku 4.5 on 2026-10-28, at Rob's request to run the newest version of each model, in [#13](https://github.com/robcam55/metaculus-bot/pull/13). Opus 5.5 was already the newest Opus. Claude Fable 5.1, a tier above Opus at 2.5 times its price, was left as Rob's call.
 - **Metaculus's credits pay first, and never for the Metaculus Cup.**
   - **Cup on a personal key.** Metaculus gives the credits for FutureEval and MiniBench only, so the Cup, and any experiment run there, needs a personal key.
   - **Credits before a personal key.** The personal key was meant as a stopgap until the credits arrived, so when both are set the credits win.
@@ -333,7 +333,7 @@ The main architectural choices and the reasons behind them. Each links to where 
 
   — Rob approved a low-credit warning in chat on 2026-10-11. Claude proposed failing the run; the issue form replaced that on finding the email stream it would cause, in [#6](https://github.com/robcam55/metaculus-bot/pull/6); not otherwise ratified. The open-only rule and the second read are from Claude's 2026-10-28 health review, with Rob's go-ahead that day, in [#13](https://github.com/robcam55/metaculus-bot/pull/13).
 - **Two independent research sources, several forecasts, a trimmed mean.**
-  - **Two sources.** Search luck drove most of the night-to-night noise in rc_trader's own forecasts. So each question gets AskNews latest news and Sonnet 5 with native web search, and if one source fails, the other still feeds the forecast.
+  - **Two sources.** Search luck drove most of the night-to-night noise in rc_trader's own forecasts. So each question gets AskNews latest news and Sonnet 5.5 with native web search, and if one source fails, the other still feeds the forecast.
   - **One AskNews call by default.** AskNews's free tier allows 1,000 calls a month, so it gets one latest-news call per question. `ASKNEWS_STRATEGY` and `ASKNEWS_ARTICLES` raise that without a code change once AskNews confirms its quota.
   - **A trimmed mean.** Several forecasts from one report are combined with a trimmed mean, which beat the median in Halawi et al. (2024).
 

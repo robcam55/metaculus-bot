@@ -121,7 +121,9 @@ def fixed_anthropic_prices():
     rows = {
         "claude-opus-5-5": (4e-06, 2e-05, 2e-07, 5e-06),
         "claude-sonnet-5": (2e-06, 1e-05, 2e-07, 2.5e-06),
+        "claude-sonnet-5-5": (2e-06, 1e-05, 2e-07, 2.5e-06),
         "claude-haiku-4-5": (1e-06, 5e-06, 1e-07, 1.25e-06),
+        "claude-haiku-5-5": (1e-07, 5e-07, 1e-08, 1.25e-07),
     }  # fmt: skip
     saved = {name: litellm.model_cost.get(name) for name in rows}
     litellm.register_model({
@@ -147,17 +149,22 @@ def model_of(llm) -> str:
 def check_routing() -> None:
     with env(ANTHROPIC_API_KEY="x"):
         d = main.RcForecastBot._llm_config_defaults()
-        assert model_of(d["default"]) == "anthropic/claude-sonnet-5", d["default"]
+        assert model_of(d["default"]) == "anthropic/claude-sonnet-5-5", d["default"]
         assert d["default"].litellm_kwargs["temperature"] is None
         # litellm's 4,096-token default for Anthropic would leave no room to think, and
         # the forecasters think at high effort, so they get the larger cap and timeout
         assert d["default"].litellm_kwargs["max_tokens"] == main.ANTHROPIC_FORECAST_MAX_TOKENS
         assert d["default"].litellm_kwargs["output_config"] == {"effort": "high"}
         assert d["default"].litellm_kwargs["timeout"] == 480
-        assert model_of(d["parser"]) == "anthropic/claude-haiku-4-5"
-        assert d["parser"].litellm_kwargs["temperature"] == 0
+        # Haiku 5.5 parses: no temperature (it rejects any but the default), low effort,
+        # and a reply cap with room for its thinking
+        assert model_of(d["parser"]) == "anthropic/claude-haiku-5-5"
+        assert d["parser"].litellm_kwargs["temperature"] is None
+        assert d["parser"].litellm_kwargs["output_config"] == {"effort": "low"}
+        assert d["parser"].litellm_kwargs["max_tokens"] == main.ANTHROPIC_PARSER_MAX_TOKENS
+        assert d["summarizer"] is d["parser"]
         # no AskNews: Sonnet 5 with Anthropic's own web search is the one source
-        assert main.source_name(d["researcher"]) == "anthropic/claude-sonnet-5 + web search"
+        assert main.source_name(d["researcher"]) == "anthropic/claude-sonnet-5-5 + web search"
         assert isinstance(d["researcher"], main.AnthropicSearchLlm), d["researcher"]
         # the dynamic-filtering tool, passed as a tool: web_search_options would send the
         # older web_search_20250305
@@ -172,11 +179,12 @@ def check_routing() -> None:
         # donated credits run the stronger model
         assert model_of(d["default"]) == "openrouter/anthropic/claude-opus-5.5"
         assert d["default"].litellm_kwargs["temperature"] is None
-        assert model_of(d["parser"]) == "openrouter/anthropic/claude-haiku-4.5"
+        assert model_of(d["parser"]) == "openrouter/anthropic/claude-haiku-5.5"
+        assert d["parser"].litellm_kwargs["temperature"] is None
         assert d["researcher"] == main.ASKNEWS_RESEARCHER == "asknews"
         assert main.source_name(d["researcher"]) == "asknews/latest"  # the default strategy
         # Metaculus's OpenRouter credits cover Anthropic but not Perplexity
-        assert model_of(d["researcher_2"]) == "openrouter/anthropic/claude-sonnet-5:online"
+        assert model_of(d["researcher_2"]) == "openrouter/anthropic/claude-sonnet-5.5:online"
         assert d["researcher_2"].litellm_kwargs["temperature"] is None
 
     with env(ANTHROPIC_API_KEY="x", PERPLEXITY_API_KEY="x", FORECASTER_MODEL="anthropic/claude-opus-5"):
@@ -185,10 +193,15 @@ def check_routing() -> None:
         assert model_of(d["researcher"]) == "perplexity/sonar-pro"
         assert d["researcher_2"] is None
 
-    with env(ANTHROPIC_API_KEY="x", PARSER_MODEL="anthropic/claude-sonnet-5"):
+    with env(ANTHROPIC_API_KEY="x", PARSER_MODEL="anthropic/claude-sonnet-5-5"):
         d = main.RcForecastBot._llm_config_defaults()
         # a model that rejects sampling parameters gets none
         assert d["parser"].litellm_kwargs["temperature"] is None
+    with env(ANTHROPIC_API_KEY="x", PARSER_MODEL="anthropic/claude-haiku-4-5"):
+        d = main.RcForecastBot._llm_config_defaults()
+        # Haiku 4.5, still selectable: temperature 0 as before, and no effort (it errors)
+        assert d["parser"].litellm_kwargs["temperature"] == 0
+        assert "output_config" not in d["parser"].litellm_kwargs
 
     with env():  # no LLM key at all: forecasting-tools' own defaults stay in charge
         d = main.RcForecastBot._llm_config_defaults()
@@ -203,10 +216,10 @@ def check_routing() -> None:
         # the personal route (Metaculus Cup, and Rob's key once the credits run out) never
         # touches the OpenRouter key: its searcher calls Anthropic's web search itself
         d = main.build_llms("anthropic")
-        assert model_of(d["default"]) == "anthropic/claude-sonnet-5"
-        assert model_of(d["parser"]) == "anthropic/claude-haiku-4-5"
+        assert model_of(d["default"]) == "anthropic/claude-sonnet-5-5"
+        assert model_of(d["parser"]) == "anthropic/claude-haiku-5-5"
         assert d["researcher"] == main.ASKNEWS_RESEARCHER
-        assert main.source_name(d["researcher_2"]) == "anthropic/claude-sonnet-5 + web search"
+        assert main.source_name(d["researcher_2"]) == "anthropic/claude-sonnet-5-5 + web search"
         # the OpenRouter route sends no reply cap and no search tool (:online searches)
         d = main.build_llms("openrouter")
         assert "max_tokens" not in d["default"].litellm_kwargs
@@ -216,7 +229,7 @@ def check_routing() -> None:
     # a pacing tier picks the forecaster on the donated credits
     with env(OPENROUTER_API_KEY="x", FORECASTER_MODEL="openrouter/some/other-model"):
         d = main.build_llms("openrouter", budget.TIERS["sonnet-3"])
-        assert model_of(d["default"]) == "openrouter/anthropic/claude-sonnet-5"
+        assert model_of(d["default"]) == "openrouter/anthropic/claude-sonnet-5.5"
         # FORECASTER_MODEL applies to a personal key only
         assert model_of(main.build_llms("openrouter")["default"]) == budget.OPUS
 
@@ -227,11 +240,11 @@ def check_routing() -> None:
         assert d["default"].litellm_kwargs["max_tokens"] == main.ANTHROPIC_FORECAST_MAX_TOKENS
         assert d["default"].litellm_kwargs["output_config"] == {"effort": "high"}
         d = main.build_llms("anthropic", budget.TIERS["sonnet-1"])
-        assert model_of(d["default"]) == "anthropic/claude-sonnet-5"
+        assert model_of(d["default"]) == "anthropic/claude-sonnet-5-5"
     assert budget.on_route(budget.OPUS, "openrouter") == budget.OPUS
 
     # FORECASTER_EFFORT: another level, or "default" for the model's own; a mistyped one
-    # stops the run; never sent on OpenRouter, to the parser, or to a Haiku forecaster
+    # stops the run; never sent on OpenRouter, to the searcher, or to a Haiku 4.5 forecaster
     with env(ANTHROPIC_API_KEY="x", FORECASTER_EFFORT=" Medium "):
         assert main.build_llms("anthropic")["default"].litellm_kwargs["output_config"] == {"effort": "medium"}  # fmt: skip
     with env(ANTHROPIC_API_KEY="x", FORECASTER_EFFORT="default"):
@@ -247,7 +260,8 @@ def check_routing() -> None:
         assert "output_config" not in main.build_llms("openrouter")["default"].litellm_kwargs
         d = main.build_llms("anthropic")
         assert "output_config" not in d["default"].litellm_kwargs  # Haiku 4.5
-        assert "output_config" not in d["parser"].litellm_kwargs
+        # the parser keeps its own low effort, whatever FORECASTER_EFFORT says
+        assert d["parser"].litellm_kwargs["output_config"] == {"effort": "low"}
         assert "output_config" not in d["researcher"].litellm_kwargs  # the searcher
     print("routing: ok")
 
@@ -536,7 +550,7 @@ def check_run_loop() -> None:
     # the run page says what each tournament had and which research sources are set up
     assert "- FutureEval (`33121`): 3 open, 2 not yet forecast, 2 taken this run." in summary
     assert "- MiniBench (`minibench`): 2 open, 2 not yet forecast, 2 taken this run." in summary
-    assert "- Research sources: openrouter/anthropic/claude-sonnet-5:online." in summary, summary
+    assert "- Research sources: openrouter/anthropic/claude-sonnet-5.5:online." in summary, summary
     # both passes' searches reach the run page: one tally shared across the run
     assert "| fake-search | 4 | 4 | 0 |" in summary, summary
     # and each pass's spend by question and part of the work, with where the figures came from
@@ -559,7 +573,7 @@ def check_run_loop() -> None:
     assert "- MiniBench (`minibench`): 1 open, 0 not yet forecast, 0 taken this run." in summary
     assert (
         "- Research sources: asknews/latest+archive,"
-        " openrouter/anthropic/claude-sonnet-5:online." in summary
+        " openrouter/anthropic/claude-sonnet-5.5:online." in summary
     ), summary
     assert "| Research source |" not in summary  # no searches, no table
 
@@ -671,7 +685,7 @@ def check_run_loop() -> None:
     assert exited is None and reads == 0, (exited, reads)
     assert "OpenRouter credits" not in summary, summary
     assert "- Metaculus Cup (`33108`): 1 open, 1 taken this run (re-forecast)." in summary
-    assert calls == [("anthropic/claude-sonnet-5", 5, ["7"], False)], calls
+    assert calls == [("anthropic/claude-sonnet-5-5", 5, ["7"], False)], calls
 
     # a mistyped AskNews setting stops the run before anything is read or spent
     for bad in ({"ASKNEWS_STRATEGY": "archives"}, {"ASKNEWS_ARTICLES": "eight"}):
@@ -704,7 +718,7 @@ def check_own_key() -> None:
     assert "Metaculus's credits: $1.50 left. Spent on your key this run: $0.75." in summary
     assert "(Metaculus's credits are under the $2 floor)" in summary, summary
     assert "| FutureEval | opus-3 | 2 | 0 | $0.50 | $0.25 |" in summary, summary
-    assert "- Research sources: anthropic/claude-sonnet-5 + web search." in summary, summary
+    assert "- Research sources: anthropic/claude-sonnet-5-5 + web search." in summary, summary
     assert LAST["alerts"] == ["Metaculus's credits ran out (of the $100 limit)"], LAST
     assert "- Opened an issue to tell Rob about the credits." in summary, summary
 
@@ -850,7 +864,8 @@ def check_own_key() -> None:
     try:
         for error, expected in outcomes:
             def completion(error=error, **kwargs):
-                assert kwargs["model"] == "anthropic/claude-haiku-4-5" and kwargs["max_tokens"] == 1
+                assert kwargs["model"] == "anthropic/claude-haiku-5-5" and kwargs["max_tokens"] == 64
+                assert kwargs["output_config"] == {"effort": "low"} and "temperature" not in kwargs
                 if error is not None:
                     raise error
 
@@ -1246,7 +1261,7 @@ def anthropic_search_reply(stop_reason: str = "end_turn") -> dict:
     """A web-search reply as Anthropic's API sends it: narration, a search, cited text."""
     url = "https://www.reuters.com/world/example-2026-10-27/"
     return {
-        "id": "msg_fake", "type": "message", "role": "assistant", "model": "claude-sonnet-5",
+        "id": "msg_fake", "type": "message", "role": "assistant", "model": "claude-sonnet-5-5",
         "content": [
             {"type": "text", "text": "I'll search for this."},
             {"type": "server_tool_use", "id": "s1", "name": "web_search", "input": {"query": "q"}},
@@ -1526,7 +1541,7 @@ def _research_policy() -> None:
     health = bot.research_health
     assert health.without_research == ["https://example.invalid/q/77"], health
     asknews, online = health.sources["asknews/latest"], health.sources[
-        "openrouter/anthropic/claude-sonnet-5:online"
+        "openrouter/anthropic/claude-sonnet-5.5:online"
     ]
     assert (asknews.searches, asknews.worked, dict(asknews.failures)) == (
         3, 0, {"RuntimeError": 3}
@@ -2088,7 +2103,7 @@ def _spend_through_the_bot() -> None:
     from collections import Counter
 
     assert Counter(c.part for c in ledger.calls) == {
-        "research: openrouter/anthropic/claude-sonnet-5:online": 1,
+        "research: openrouter/anthropic/claude-sonnet-5.5:online": 1,
         "summary": 1,
         "forecast 1": 1,
         "forecast 2": 1,
@@ -2097,10 +2112,10 @@ def _spend_through_the_bot() -> None:
     }, [c.part for c in ledger.calls]
     assert {c.question for c in ledger.calls} == {"https://example.invalid/q/77"}
     assert models == {
-        "research": {"openrouter/anthropic/claude-sonnet-5:online"},
+        "research": {"openrouter/anthropic/claude-sonnet-5.5:online"},
         "forecast": {budget.OPUS},
-        "parsing": {"openrouter/anthropic/claude-haiku-4.5"},
-        "summary": {"openrouter/anthropic/claude-haiku-4.5"},
+        "parsing": {"openrouter/anthropic/claude-haiku-5.5"},
+        "summary": {"openrouter/anthropic/claude-haiku-5.5"},
     }, models
     assert close(ledger.total(), 0.40 + 3 * 0.05 + 6 * 0.002 + 0.004), ledger.total()
 
@@ -2108,7 +2123,7 @@ def _spend_through_the_bot() -> None:
         spend.breakdown("FutureEval", ledger, main.question_statuses([q], results, publish=False))
     )
     for expected in (
-        "| Question | Status | Research: openrouter/anthropic/claude-sonnet-5:online"
+        "| Question | Status | Research: openrouter/anthropic/claude-sonnet-5.5:online"
         " | Forecast 1 | Forecast 2 | Forecast 3 | Parsing and summary | Total |",
         "| [77](https://example.invalid/q/77) | dry run | $0.400 | $0.050 | $0.050 | $0.050"
         " | $0.016 | $0.566 |",
