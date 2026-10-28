@@ -4,8 +4,9 @@ Alerts that reach Rob as GitHub issues.
 The workflow runs every 20 minutes, so a run that fails to get attention would email Rob
 every 20 minutes for as long as the cause lasts. An alert instead opens one issue the first
 time its event happens, mentioning the repository's owner. Later runs find an issue with
-the same title, open or closed, and open nothing. Each title names what makes the event
-new: a new credit limit after a Metaculus top-up, or a new month for Rob's own key.
+the same title, open or closed (for Rob's own key, open), and open nothing. Each title
+names what makes the event new: a new credit limit after a Metaculus top-up, or a new
+month for Rob's own key.
 
 No forecasting-tools import here, so the offline checks can exercise it directly.
 """
@@ -14,6 +15,7 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 from datetime import datetime, timezone
 
 import requests
@@ -25,10 +27,15 @@ logger = logging.getLogger(__name__)
 API = "https://api.github.com"
 # Issues opened with the workflow's GITHUB_TOKEN are authored by this account
 BOT_LOGIN = "github-actions[bot]"
+# Seconds before the issue list is read a second time. On 2026-10-22 one read in about 590
+# came back without an existing issue (#9), and a duplicate (#10) opened
+REREAD_WAIT = 3.0
 
 
-def raise_alert(title: str, body: str, timeout: float = 15) -> bool:
-    """Opens an issue titled `title` unless one exists; True if it opened one. Without
+def raise_alert(title: str, body: str, timeout: float = 15, open_only: bool = False) -> bool:
+    """Opens an issue titled `title` unless one exists; True if it opened one. An issue
+    counts whether open or closed, or with `open_only` only while open, so closing it
+    lets the event alert again. The list is read twice before an issue opens. Without
     GITHUB_TOKEN and GITHUB_REPOSITORY (any run outside the tournament workflow) the
     alert is only logged."""
     token, repo = os.getenv("GITHUB_TOKEN"), os.getenv("GITHUB_REPOSITORY")
@@ -37,15 +44,22 @@ def raise_alert(title: str, body: str, timeout: float = 15) -> bool:
         return False
     headers = {"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json"}
     try:
-        response = requests.get(
-            f"{API}/repos/{repo}/issues",
-            headers=headers,
-            params={"state": "all", "creator": BOT_LOGIN, "per_page": 100},
-            timeout=timeout,
-        )
-        response.raise_for_status()
-        if any(issue.get("title") == title for issue in response.json()):
-            return False
+        for read in range(2):
+            if read:
+                time.sleep(REREAD_WAIT)
+            response = requests.get(
+                f"{API}/repos/{repo}/issues",
+                headers=headers,
+                params={
+                    "state": "open" if open_only else "all",
+                    "creator": BOT_LOGIN,
+                    "per_page": 100,
+                },
+                timeout=timeout,
+            )
+            response.raise_for_status()
+            if any(issue.get("title") == title for issue in response.json()):
+                return False
         owner = os.getenv("GITHUB_REPOSITORY_OWNER")
         response = requests.post(
             f"{API}/repos/{repo}/issues",
@@ -100,6 +114,13 @@ def credits_out(left: float, limit: float | None, own_key: bool) -> bool:
     )
 
 
+# Rob's key's alerts count only while their issue is open: after he raises the limit or
+# replaces the key and closes the issue, a second stop the same month alerts again
+REOPEN_NOTE = (
+    " Close this issue once that's done: if it happens again this month, a new issue opens."
+)
+
+
 def own_key_limit() -> bool:
     return raise_alert(
         f"Your Anthropic key reached its spend limit ({_month()})",
@@ -108,7 +129,8 @@ def own_key_limit() -> bool:
         " resets on the 1st of next month, or until you raise it in the Claude Console"
         " (Settings, Workspaces). If your account is prepaid and out of credit instead, buy"
         " credit or turn on auto-reload (Settings, Billing); the bot resumes at the next run"
-        " either way.",
+        " either way." + REOPEN_NOTE,
+        open_only=True,
     )
 
 
@@ -116,5 +138,6 @@ def own_key_rejected(error: str) -> bool:
     return raise_alert(
         f"Anthropic rejected the bot's key ({_month()})",
         f"Anthropic rejected `ANTHROPIC_API_KEY` ({error}), so the bot is paused. Replace"
-        " the repository secret with a working key from the Claude Console.",
+        " the repository secret with a working key from the Claude Console." + REOPEN_NOTE,
+        open_only=True,
     )

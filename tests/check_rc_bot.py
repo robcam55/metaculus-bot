@@ -74,6 +74,7 @@ with env():
     import budget  # noqa: E402
 
     budget.KEY_RETRY_WAIT = 0.0  # the second balance read, without the wait
+    alerts.REREAD_WAIT = 0.0  # the second issue-list read, without the wait
     import main  # noqa: E402  (import after clearing keys: dotenv must not leak real ones)
     import spend  # noqa: E402
     from forecasting_tools import (  # noqa: E402
@@ -412,7 +413,7 @@ def run_main(
     LAST.clear()
     LAST.update(alerts=[], key_checks=0)
 
-    def fake_alert(title, body, timeout=15):
+    def fake_alert(title, body, timeout=15, open_only=False):
         LAST["alerts"].append(title)
         return True
 
@@ -858,6 +859,26 @@ def check_own_key() -> None:
     finally:
         main.litellm = real_litellm
 
+    # the credits' balance can't be read (twice): Rob's key pays, rather than the run going
+    # back onto credits that ran out, uncapped
+    calls, summary, exited, reads = run_main("tournament", None, questions, **keys)
+    assert reads == 2 and exited is None, (reads, exited)
+    assert calls == [(opus_own, 3, ["2", "1"], True), (opus_own, 3, ["4"], True)], calls
+    assert LAST["key_checks"] == 1, LAST
+    assert "(Metaculus's credits couldn't be read)" in summary, summary
+    assert "Metaculus's credits: not read" in summary, summary
+
+    # no OpenRouter key at all: Rob's key at the pinned tier, checked, and pause still stops
+    # it (it used to fall through to the Metaculus Cup's unpaced Sonnet 5 x 5)
+    calls, summary, exited, reads = run_main("tournament", 100.0, questions, ANTHROPIC_API_KEY="x")
+    assert reads == 0 and exited is None, (reads, exited)
+    assert calls == [(opus_own, 3, ["2", "1"], True), (opus_own, 3, ["4"], True)], calls
+    assert LAST["key_checks"] == 1 and "(no OpenRouter key)" in summary, (LAST, summary)
+    calls, _, _, _ = run_main("tournament", 100.0, questions, ANTHROPIC_API_KEY="x", BUDGET_TIER="pause")
+    assert calls == [] and LAST["key_checks"] == 0, (calls, LAST)
+    calls, _, _, _ = run_main("tournament", 100.0, questions, ANTHROPIC_API_KEY="x", key_check="limit")
+    assert calls == [] and any("spend limit" in t for t in LAST["alerts"]), (calls, LAST)
+
     plan = budget.own_key_plan(None, "why")
     assert plan.futureeval == plan.minibench == budget.TIERS["opus-3"] and plan.remaining is None
     assert budget.own_key_plan(budget.TIERS["sonnet-3"], "why").minibench.name == "sonnet-3"
@@ -911,9 +932,24 @@ def check_alerts() -> None:
             assert sent[0][2]["state"] == "all"  # a closed issue still counts as said
             sent.clear()
             assert alerts.raise_alert("New", "Body") is True
-            assert sent[1] == (
+            # read twice before opening: one read came back without #9 and #10 duplicated it
+            assert [s[0] for s in sent] == ["GET", "GET", "POST"], sent
+            assert sent[2] == (
                 "POST", "https://api.github.com/repos/o/r/issues", {"title": "New", "body": "@o Body"}
             ), sent
+            # the first read misses the issue, the second finds it: nothing opens
+            sent.clear()
+            reads = iter([[], issues])
+            alerts.requests.get = lambda url, headers, params, timeout: (  # type: ignore[assignment]
+                sent.append(("GET", url, params)) or FakeResponse(next(reads))
+            )
+            assert alerts.raise_alert("Already said", "Body") is False
+            assert [s[0] for s in sent] == ["GET", "GET"], sent
+            alerts.requests.get = fake_get  # type: ignore[assignment]
+            # Rob's key's alerts count an issue only while it's open
+            sent.clear()
+            assert alerts.raise_alert("Already said", "Body", open_only=True) is False
+            assert sent[0][2]["state"] == "open", sent
             alerts.requests.get = failing_get  # type: ignore[assignment]
             assert alerts.raise_alert("New", "Body") is False
     finally:
@@ -923,8 +959,11 @@ def check_alerts() -> None:
 
     # titles change only with what makes the event new: the limit, or the month
     titles: list[str] = []
+    open_only: list[bool] = []
     real = alerts.raise_alert
-    alerts.raise_alert = lambda title, body, timeout=15: titles.append(title) or True  # type: ignore[assignment]
+    alerts.raise_alert = lambda title, body, timeout=15, open_only_=False, **kw: (  # type: ignore[assignment]
+        titles.append(title) or open_only.append(kw.get("open_only", open_only_)) or True
+    )
     try:
         alerts.credits_low(14.2, 100.0, own_key=True)
         alerts.credits_low(9.0, 100.0, own_key=False)
@@ -937,6 +976,8 @@ def check_alerts() -> None:
     assert titles[2] == "Metaculus's credits are below $15 (of the $250 limit)"
     assert titles[3] == "Metaculus's credits ran out"
     assert titles[4].startswith("Your Anthropic key reached its spend limit (20"), titles
+    # credit alerts count closed issues too (one per limit); Rob's key's, open ones only
+    assert open_only == [False, False, False, False, True], open_only
     print("alerts: ok")
 
 

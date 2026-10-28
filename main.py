@@ -1546,6 +1546,11 @@ def own_key_reason(credits_left: float | None, plan: budget.Plan) -> str | None:
         return None
     if pay_with() == "own-key":
         return "PAY_WITH=own-key"
+    if credits_left is None:
+        # Since the credits ran out, a run that can't read their balance (an OpenRouter
+        # outage, or a key Metaculus has disabled) would go back onto them, uncapped, and
+        # fail every question there; PR #8's second read covers only a brief failure
+        return "Metaculus's credits couldn't be read"
     return credits_spent(credits_left, plan)
 
 
@@ -1659,6 +1664,17 @@ def main() -> None:
             # the rest" while nothing can pay
             pause = budget.TIERS["pause"]
             plan = budget.Plan(pause, pause, meter.remaining(), f"{spent}: paused")
+    elif route == "anthropic" and run_mode != "metaculus_cup":
+        # No OpenRouter key at all (say Metaculus's is removed now that it's spent): Rob's
+        # key pays as it does after the credits, at the pinned tier, with its key check
+        # and BUDGET_TIER=pause, rather than the Metaculus Cup's unpaced Sonnet 5 x 5
+        own_key = OwnKey()
+        meter = budget.OwnKeyMeter(None)
+        plan = budget.own_key_plan(budget.pinned_tier(), "no OpenRouter key")
+        logger.info(
+            f"Your Anthropic key pays this run (no OpenRouter key). FutureEval runs"
+            f" {plan.futureeval.name}, MiniBench {plan.minibench.name}."
+        )
 
     client = MetaculusClient()
     tournament_id = _tournament_id(os.getenv("AIB_TOURNAMENT_ID"), FALL_2026_FUTUREEVAL_ID)

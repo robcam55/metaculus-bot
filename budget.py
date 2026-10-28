@@ -299,10 +299,15 @@ class OwnKeyMeter(SpendMeter):
         self.rows = []
 
     def summary(self, plan: Plan) -> list[str]:
+        credits = (
+            f"{dollars(remaining_of(self.credits))} left"
+            if self.credits is not None
+            else "not read (no OpenRouter key, or its balance couldn't be read)"
+        )
         lines = [
             "### Your Anthropic key",
             "",
-            f"- Metaculus's credits: {dollars(remaining_of(self.credits))} left."
+            f"- Metaculus's credits: {credits}."
             f" Spent on your key this run: {dollars(self.spent)}. Its cap is the monthly"
             " spend limit on its workspace in the Claude Console.",
             f"- Tiers: FutureEval {plan.futureeval.name}, MiniBench {plan.minibench.name}"
