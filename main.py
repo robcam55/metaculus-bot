@@ -246,7 +246,8 @@ def own_key_check() -> str | None:
 
 def forecaster_effort() -> str | None:
     """FORECASTER_EFFORT (a repository variable): the forecasters' effort on Anthropic's
-    own API, high by default; "default" sends none, leaving the model's own."""
+    own API and the extra forecasters' (OpenRouter's reasoning effort), high by default;
+    "default" sends none, leaving the model's own."""
     value = os.getenv("FORECASTER_EFFORT", "").strip().lower() or DEFAULT_FORECASTER_EFFORT
     if value == "default":
         return None
@@ -637,35 +638,41 @@ def trial_model(role: str) -> str:
 # are set; the Test Bot's "extra" input tries a list for one run.
 OWN_OPENROUTER_KEY = "OPENROUTER_OWN_API_KEY"
 MAX_EXTRA_FORECASTS = 5
-_EXTRA_ITEM = re.compile(r"^(?P<model>.+?)(?::(?P<count>\d+))?$")
+# An OpenRouter id, with an optional variant (":online") and an optional count (":2")
+_EXTRA_ITEM = re.compile(
+    r"^(?P<model>openrouter/[\w.-]+/[\w.-]+(?::[a-z]+)?)(?::(?P<count>\d+))?$"
+)
 # The extra forecaster for the forecast being made, set per forecast in _make_prediction
 _EXTRA_FORECASTER: ContextVar[GeneralLlm | None] = ContextVar("extra_forecaster", default=None)
+# The question being forecast, for the success bar (_handle_errors_in__run_individual_question)
+_QUESTION: ContextVar[str | None] = ContextVar("question", default=None)
+
+
+def requested_extras() -> str:
+    """The extra forecasters asked for: the Test Bot's input, else EXTRA_FORECASTERS."""
+    return trial_model("extra") or os.getenv("EXTRA_FORECASTERS", "").strip()
 
 
 def extra_forecaster_models() -> list[str]:
-    """One model id per extra forecast, in order; [] when off. A mistyped list stops the
-    run at startup; a list without the key only warns, and the run goes on without it."""
-    spec = trial_model("extra") or os.getenv("EXTRA_FORECASTERS", "").strip()
+    """One model id per extra forecast, in order; [] when off or without the key. A
+    mistyped list stops the run at startup. Items are separated by commas, semicolons,
+    spaces or new lines."""
+    spec = requested_extras()
     if not spec:
         return []
     models: list[str] = []
-    for item in (part.strip() for part in spec.split(",")):
-        if not item:
-            continue
+    for item in (part for part in re.split(r"[,;\s]+", spec) if part):
         found = _EXTRA_ITEM.match(item)
-        model, count = found.group("model"), int(found.group("count") or 1)  # type: ignore[union-attr]
-        if not model.startswith("openrouter/") or count < 1:
+        count = int(found.group("count") or 1) if found else 0
+        if not found or count < 1:
             raise SystemExit(
-                "EXTRA_FORECASTERS lists OpenRouter models with an optional count, like"
-                f" openrouter/openai/gpt-6.1-sol:2; got {item!r}"
+                "EXTRA_FORECASTERS lists OpenRouter models, comma-separated, each with an"
+                f" optional count, like openrouter/openai/gpt-6.1-sol:2; got {item!r}"
             )
-        models += [model] * count
+        models += [found.group("model")] * count
     if len(models) > MAX_EXTRA_FORECASTS:
         raise SystemExit(f"EXTRA_FORECASTERS adds {len(models)} forecasts; at most {MAX_EXTRA_FORECASTS}")
-    if models and not os.getenv(OWN_OPENROUTER_KEY):
-        logger.warning(f"EXTRA_FORECASTERS is set but {OWN_OPENROUTER_KEY} isn't: no extra forecasters")
-        return []
-    return models
+    return models if os.getenv(OWN_OPENROUTER_KEY) else []
 
 
 def build_extra_forecasters() -> list[GeneralLlm]:
@@ -682,6 +689,8 @@ def build_extra_forecasters() -> list[GeneralLlm]:
             temperature=None,
             timeout=_env_int("FORECASTER_TIMEOUT_S", 480),
             allowed_tries=2,
+            # caps one call's cost, and what OpenRouter reserves against the key's balance
+            max_tokens=ANTHROPIC_FORECAST_MAX_TOKENS,
             **({"reasoning": {"effort": effort}} if effort else {}),
         )
     return [built[model] for model in models]
@@ -931,6 +940,8 @@ class RcForecastBot(ForecastBot):
         # The last forecasts of each research report go to these, in order (make_bot adds
         # their number to predictions_per_research_report)
         self.extra_forecasters = list(extra_forecasters or [])
+        # Per question: forecasts by the bot's own model that succeeded (the success bar)
+        self._own_succeeded: Counter[str] = Counter()
         # Per question: research reports tried so far, and questions any report found
         # research for (RESEARCH_REPORTS can run several reports for one question)
         self._reports_tried: Counter[str] = Counter()
@@ -1029,8 +1040,40 @@ class RcForecastBot(ForecastBot):
     async def _run_individual_question(self, question: MetaculusQuestion) -> ForecastReport:
         """The template's, unchanged; every model call it makes counts toward this
         question in the run page's spend breakdown."""
-        with spend.tagged(question=question_key(question)):
-            return await super()._run_individual_question(question)
+        token = _QUESTION.set(question_key(question))
+        try:
+            with spend.tagged(question=question_key(question)):
+                return await super()._run_individual_question(question)
+        finally:
+            _QUESTION.reset(token)
+
+    async def _handle_errors_in__run_individual_question(
+        self, all_predictions, research_errors, all_errors, exception_group
+    ) -> None:
+        """The package's check that enough forecasts succeeded (half by default), counting
+        the bot's own model only once there are extra forecasters: an extra that fails
+        (no OpenRouter credit, say) only thins the question, and the extras can't carry a
+        question on their own when the bot's own model fails (its key at its spend limit)."""
+        if not self.extra_forecasters:
+            return await super()._handle_errors_in__run_individual_question(
+                all_predictions, research_errors, all_errors, exception_group
+            )
+        if research_errors:
+            logger.warning(f"Encountered errors while researching: {research_errors}")
+        own = self._own_succeeded[_QUESTION.get() or ""]
+        own_expected = self.research_reports_per_question * (
+            self.predictions_per_research_report - len(self.extra_forecasters)
+        )
+        needed = own_expected * self.required_successful_predictions
+        if own == 0 and exception_group is not None:
+            self._reraise_exception_with_prepended_message(
+                exception_group, "Every forecast by the bot's own model failed"
+            )
+        if own < needed:
+            raise ValueError(
+                f"Expected at least {needed} successful predictions from the bot's own model,"
+                f" but only got {own}. Errors encountered: {all_errors}"
+            )
 
     async def _make_prediction(
         self, question: MetaculusQuestion, research: str
@@ -1038,6 +1081,10 @@ class RcForecastBot(ForecastBot):
         """The template's, made by the forecast's own model (see _forecaster); its calls
         count as forecast 1, 2, 3... of the question in the spend breakdown (its parsing
         calls as parsing, see parse)."""
+        if getattr(question, "conditional_type", None) is not None:
+            # a leg of a conditional question: its member's slot and model, set by the
+            # outer call, carry over, so all four legs of one member use one model
+            return await super()._make_prediction(question, research)
         key = question_key(question)
         self._forecasts_started[key] += 1
         slot = self._forecasts_started[key]
@@ -1054,6 +1101,8 @@ class RcForecastBot(ForecastBot):
             _EXTRA_FORECASTER.reset(token)
         if extra is not None:
             self.research_health.record_forecast(extra.model)
+        else:
+            self._own_succeeded[key] += 1
         return prediction
 
     def _extra_for(self, slot: int) -> GeneralLlm | None:
@@ -1763,7 +1812,9 @@ def make_bot(
     else:
         reports = _env_int("RESEARCH_REPORTS", 1)
         predictions = _env_int("PREDICTIONS_PER_REPORT", 5)
-    extras = build_extra_forecasters()
+    # never more extras than the bot's own forecasts, so with fewer than four members the
+    # median can't leave the bot's own model out (one own forecast: one extra, a mean)
+    extras = build_extra_forecasters()[:predictions]
     return RcForecastBot(
         research_reports_per_question=reports,
         predictions_per_research_report=predictions + len(extras),
@@ -2001,6 +2052,9 @@ def main() -> None:
         for variable in TRIAL_MODELS.values():
             os.environ.pop(variable, None)
     extras = extra_forecaster_models()  # a mistyped EXTRA_FORECASTERS stops the run here
+    extras_without_key = bool(requested_extras()) and not extras
+    if extras_without_key and trials["extra"]:
+        sys.exit(f"The Test Bot's extra forecasters need the {OWN_OPENROUTER_KEY} secret (Setup, step 11)")
     # PUBLISH=false gives a dry run: full research and forecasts, nothing posted
     publish = _env_flag("PUBLISH", True)
     print_startup_banner(run_mode, will_publish=publish)
@@ -2073,6 +2127,7 @@ def main() -> None:
     passes: list[str] = []
     breakdowns: list[str] = []
     own_openrouter_spent = [0.0]  # the extra forecasters' spend on Rob's OpenRouter key
+    own_openrouter_raised = [0]  # and their calls that raised (OpenRouter may still bill them)
 
     def run_pass(
         label: str,
@@ -2099,8 +2154,10 @@ def main() -> None:
             spend.breakdown(label, ledger, question_statuses(questions, results, publish))
         )
         # The extra forecasters bill Rob's own OpenRouter key, not the key the meter tracks
-        extra_spent = spend_on(ledger.calls, {llm.model for llm in bot.extra_forecasters})
+        extra_models = {llm.model for llm in bot.extra_forecasters}
+        extra_spent = spend_on(ledger.calls, extra_models)
         own_openrouter_spent[0] += extra_spent
+        own_openrouter_raised[0] += sum(n for m, n in ledger.raised_models.items() if m in extra_models)
         if meter is not None and tier is not None:
             failed = sum(isinstance(r, BaseException) for r in results)
             meter.record(label, tier, len(results) - failed, failed, ledger.total() - extra_spent)
@@ -2178,7 +2235,7 @@ def main() -> None:
                 describe_pass("bot-testing-area", "bot-testing-area", len(testing), len(questions))
             )
             reports += run_pass("bot-testing-area", questions, tier, skip_previous=False)
-        trying = [f"{role} `{model}`" for role, model in trials.items() if model]
+        trying = [f"{role} `{model}`" for role, model in trials.items() if model and (role != "extra" or extras)]
         if trying:
             notes.append(f"- On trial (Test Bot inputs): {', '.join(trying)}.")
 
@@ -2212,10 +2269,20 @@ def main() -> None:
     if extras:
         counts = Counter(extras)
         names = ", ".join(f"{m} ×{n}" if n > 1 else m for m, n in counts.items())
+        raised = own_openrouter_raised[0]
+        unbilled = (
+            f" {raised} of their calls raised (a timeout, say); OpenRouter may still bill"
+            " those, and their cost isn't counted."
+            if raised
+            else ""
+        )
         notes.append(
             f"- Extra forecasters: {names}. Spent on your own OpenRouter key this run:"
-            f" ${own_openrouter_spent[0]:.2f}."
+            f" ${own_openrouter_spent[0]:.2f}.{unbilled}"
         )
+    elif extras_without_key:
+        notes.append(f"- Extra forecasters off: EXTRA_FORECASTERS is set but {OWN_OPENROUTER_KEY} isn't.")
+        print(f"::warning title=Extra forecasters off::EXTRA_FORECASTERS is set but {OWN_OPENROUTER_KEY} isn't")
     if notes:
         lines += ["", *notes]
     print("\n".join(lines) + "\n")
