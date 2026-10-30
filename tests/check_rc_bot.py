@@ -1255,14 +1255,15 @@ def check_extra_forecasters() -> None:
     own = {"OPENROUTER_OWN_API_KEY": "sk-or-own-fake"}
     with env(ANTHROPIC_API_KEY="x"):
         assert main.extra_forecaster_models() == [] and main.build_extra_forecasters() == []
-    # a count per model; an OpenRouter suffix such as :online is part of the id
-    with env(EXTRA_FORECASTERS=f" {sol}:2, {argon} ,openrouter/x/y:online", **own):
-        assert main.extra_forecaster_models() == [sol, sol, argon, "openrouter/x/y:online"]
-    # without the key: a warning, and none (the run goes on with Opus alone)
+    # a count per model; a variant such as :online is part of the id; commas, semicolons,
+    # spaces or new lines between items
+    with env(EXTRA_FORECASTERS=f" {sol}:2, {argon} ;openrouter/x/y:online\nopenrouter/x/z:online:1", **own):
+        assert main.extra_forecaster_models() == [sol, sol, argon, "openrouter/x/y:online", "openrouter/x/z:online"]
+    # without the key: none (main() then notes and annotates it, or stops a Test Bot trial)
     with env(EXTRA_FORECASTERS=f"{sol}:2"):
-        assert main.extra_forecaster_models() == []
+        assert main.extra_forecaster_models() == [] and main.requested_extras() == f"{sol}:2"
     # mistyped: the run stops at startup
-    for bad in ("anthropic/claude-opus-5-5:2", f"{sol}:0", f"{sol}:6"):
+    for bad in ("anthropic/claude-opus-5-5:2", f"{sol}:0", f"{sol}:6", f"{sol}: 2", f"{sol} x2", "openrouter/sol"):
         with env(EXTRA_FORECASTERS=bad, **own):
             try:
                 main.extra_forecaster_models()
@@ -1282,9 +1283,13 @@ def check_extra_forecasters() -> None:
         assert built[0].litellm_kwargs["api_key"] == "sk-or-own-fake"
         assert built[2].litellm_kwargs["reasoning"] == {"effort": "high"}
         assert built[0].litellm_kwargs["timeout"] == 480
+        assert built[0].litellm_kwargs["max_tokens"] == main.ANTHROPIC_FORECAST_MAX_TOKENS
         # three Opus forecasts plus three extras
         bot = main.make_bot("anthropic", budget.TIERS["opus-3"], publish=False)
         assert bot.predictions_per_research_report == 6 and len(bot.extra_forecasters) == 3
+        # never more extras than the bot's own forecasts: one Sonnet, one extra
+        bot = main.make_bot("anthropic", budget.TIERS["sonnet-1"], publish=False)
+        assert bot.predictions_per_research_report == 2 and [b.model for b in bot.extra_forecasters] == [sol]
     with env(EXTRA_FORECASTERS=sol, FORECASTER_EFFORT="default", **own):
         assert "reasoning" not in main.build_extra_forecasters()[0].litellm_kwargs
 
@@ -1331,6 +1336,80 @@ def check_extra_forecasters() -> None:
     finally:
         main.parse = real_parse
 
+    # whole questions: the success bar counts the bot's own forecasts only. Extras that all
+    # fail (no OpenRouter credit) thin a question but don't fail it, even with one Opus
+    # forecast failing too; extras alone never carry a question
+    def question_bot(own_replies, extras):
+        with env(ANTHROPIC_API_KEY="x"):
+            b = main.RcForecastBot(
+                publish_reports_to_metaculus=False, skip_previously_forecasted_questions=False,
+                predictions_per_research_report=len(own_replies) + len(extras), extra_forecasters=extras,
+            )  # fmt: skip
+        replies = iter(own_replies)
+
+        def default(name, kind="llm"):
+            if name != "default":
+                return FakeLlm("parsed", model="anthropic/claude-haiku-5-5")
+            llm = FakeLlm(model=opus)
+
+            async def answer(prompt, system_prompt=None):
+                reply = next(replies)
+                if reply is None:
+                    raise TimeoutError("opus timed out")
+                return reply
+
+            llm.invoke = answer  # type: ignore[method-assign]
+            return llm
+
+        async def research(question):
+            return "notes"
+
+        async def summary(question, research):
+            return "summary"
+
+        b.get_llm = default  # type: ignore[method-assign]
+        b.run_research = research  # type: ignore[method-assign]
+        b.summarize_research = summary  # type: ignore[method-assign]
+        return b
+
+    def dead(model):
+        llm = FakeLlm(model=model)
+
+        async def refuse(prompt, system_prompt=None):
+            raise RuntimeError("402 This request requires more credits")
+
+        llm.invoke = refuse  # type: ignore[method-assign]
+        return llm
+
+    real_parse = main.parse
+    try:
+        main.parse = fake_parse
+        q = binary_question().model_copy(update={"page_url": "https://example.invalid/q/21"})
+        for own_replies, extras in (
+            (["Probability: 30%"] * 3, [dead(sol)] * 4),  # four dead extras: 3 of 7 succeed
+            (["Probability: 30%", "Probability: 30%", None], [dead(sol)] * 2),  # and an Opus timeout
+            (["Probability: 30%"], [dead(sol)]),  # one forecast and its one extra
+        ):
+            b = question_bot(own_replies, extras)
+            [report] = asyncio.run(b.forecast_questions([q], return_exceptions=True))
+            assert not isinstance(report, BaseException) and abs(report.prediction - 0.3) < 1e-9, report
+        # the bot's own model fails (its key at its spend limit): no forecast from extras alone
+        alive = FakeLlm("Probability: 60%", model=sol)
+        b = question_bot([None, None, None], [alive, alive])
+        [report] = asyncio.run(b.forecast_questions([q], return_exceptions=True))
+        assert isinstance(report, BaseException) and "opus timed out" in str(report), report
+        # two research reports: each report's last forecasts go to the extras
+        b = question_bot(["x"] * 3, [alive, alive])
+        assert [b._extra_for(slot) is alive for slot in range(1, 11)] == [False] * 3 + [True] * 2 + [False] * 3 + [True] * 2
+        # a leg of a conditional question keeps its member's slot: no new slot, no tally
+        leg = binary_question().model_copy(update={"conditional_type": "parent"})
+        b = question_bot(["Probability: 30%"], [])
+        b._note_pads.append(asyncio.run(b._initialize_notepad(leg)))
+        asyncio.run(b._make_prediction(leg, "notes"))
+        assert not b._forecasts_started and not b._own_succeeded, b._forecasts_started
+    finally:
+        main.parse = real_parse
+
     # the request: OpenRouter, Rob's own key, reasoning effort; OpenRouter's billed cost is
     # the call's cost, and spend_on keeps it apart from the Anthropic key's spend
     import httpx
@@ -1356,6 +1435,7 @@ def check_extra_forecasters() -> None:
     assert sent[0]["url"] == "https://openrouter.ai/api/v1/chat/completions", sent
     assert sent[0]["auth"] == "Bearer sk-or-own-fake", sent[0]["auth"]
     assert sent[0]["body"]["reasoning"] == {"effort": "high"} and "reasoning_effort" not in sent[0]["body"], sent
+    assert sent[0]["body"]["max_tokens"] == main.ANTHROPIC_FORECAST_MAX_TOKENS, sent
     assert sent[0]["body"]["model"] == "google/gemini-4-argon", sent
     assert [(c.model, c.cost) for c in ledger.calls] == [(argon, 0.0012)], ledger.calls
     assert main.spend_on(ledger.calls, {argon}) == 0.0012 and main.spend_on(ledger.calls, {sol}) == 0.0
