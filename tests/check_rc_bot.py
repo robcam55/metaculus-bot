@@ -1959,6 +1959,21 @@ def check_run_report() -> None:
     print("run report: ok")
 
 
+def check_health_warnings() -> None:
+    """A research source that fails leaves the run green; it is annotated instead."""
+    health = main.ResearchHealth()
+    health.record("asknews/latest")
+    health.record("anthropic/claude-sonnet-5-5 + web search and fetch", "BadRequestError")
+    health.record("anthropic/claude-sonnet-5-5 + web search and fetch", "BadRequestError")
+    health.record("anthropic/claude-sonnet-5-5 + web search and fetch")
+    assert main.health_warnings(health) == [
+        "::warning title=Research source failed::anthropic/claude-sonnet-5-5 + web search and fetch"
+        " failed 2 of 3 searches (BadRequestError x2)"
+    ], main.health_warnings(health)
+    assert main.health_warnings(main.ResearchHealth()) == []
+    print("health warnings: ok")
+
+
 def check_comment_sections() -> None:
     """The posted comment keeps exactly its three top-level sections when a research source
     or the summary brings its own "# " headings (both happened on 2026-10-05)."""
@@ -2428,6 +2443,7 @@ if __name__ == "__main__":
     check_prompts()
     check_research_policy()
     check_run_report()
+    check_health_warnings()
     check_comment_sections()
     check_asknews()
     with fixed_anthropic_prices():

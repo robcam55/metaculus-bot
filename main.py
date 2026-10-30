@@ -1612,6 +1612,23 @@ def describe_pass(
     return f"- {label} (`{tournament}`): {', '.join(counts)}" + (f" ({note})." if note else ".")
 
 
+def health_warnings(health: ResearchHealth) -> list[str]:
+    """A GitHub warning annotation for each research source that failed this run. A source
+    that fails while the other still feeds the question leaves the run green, so without
+    this it shows only in the run page's table; an annotation shows on the run's summary
+    and in GitHub's API."""
+    warnings = []
+    for name, tally in health.sources.items():
+        failed = tally.searches - tally.worked
+        if failed:
+            reasons = ", ".join(f"{r} x{n}" for r, n in tally.failures.most_common())
+            warnings.append(
+                f"::warning title=Research source failed::{name} failed {failed} of"
+                f" {tally.searches} searches ({reasons})"
+            )
+    return warnings
+
+
 def run_report(
     passes: list[str],
     configured: list[str],
@@ -1992,6 +2009,8 @@ def main() -> None:
         lines += ["", *notes]
     print("\n".join(lines) + "\n")
     budget.write_step_summary(lines)
+    for warning in health_warnings(health):
+        print(warning)
     failed = len(failures) - limited
     if failed:
         # a failed question turns the Actions run red; one that waits for research too,
