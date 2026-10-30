@@ -53,6 +53,9 @@ jobs:
           FORECASTER_MODEL: ${{ vars.FORECASTER_MODEL }}
           FORECASTER_EFFORT: ${{ vars.FORECASTER_EFFORT }}
           RESEARCH_WEB_FETCH: ${{ vars.RESEARCH_WEB_FETCH }}
+          # A second model family, on Rob's own OpenRouter key (off unless both are set)
+          OPENROUTER_OWN_API_KEY: ${{ secrets.OPENROUTER_OWN_API_KEY }}
+          EXTRA_FORECASTERS: ${{ vars.EXTRA_FORECASTERS }}
           PARSER_MODEL: ${{ vars.PARSER_MODEL }}
           ASKNEWS_STRATEGY: ${{ vars.ASKNEWS_STRATEGY }}
           ASKNEWS_ARTICLES: ${{ vars.ASKNEWS_ARTICLES }}

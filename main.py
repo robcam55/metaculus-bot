@@ -8,6 +8,7 @@ import re
 import statistics
 import sys
 from collections import Counter
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Literal
@@ -370,9 +371,19 @@ class ResearchHealth:
     sources: dict[str, SourceTally] = field(default_factory=dict)
     # Questions (by question_key) whose forecast went ahead with no research
     without_research: list[str] = field(default_factory=list)
+    # The extra forecasters' forecasts, by model: a failed one only thins the question's
+    # members, so it would otherwise show nowhere but the log
+    forecasters: dict[str, SourceTally] = field(default_factory=dict)
 
     def record(self, source: str, error: str | None = None) -> None:
-        tally = self.sources.setdefault(source, SourceTally())
+        self._count(self.sources, source, error)
+
+    def record_forecast(self, model: str, error: str | None = None) -> None:
+        self._count(self.forecasters, model, error)
+
+    @staticmethod
+    def _count(tallies: dict[str, SourceTally], name: str, error: str | None) -> None:
+        tally = tallies.setdefault(name, SourceTally())
         tally.searches += 1
         if error is None:
             tally.worked += 1
@@ -606,12 +617,79 @@ TRIAL_MODELS = {
     "forecaster": "TRIAL_FORECASTER_MODEL",
     "researcher": "TRIAL_RESEARCHER_MODEL",
     "parser": "TRIAL_PARSER_MODEL",
+    "extra": "TRIAL_EXTRA_FORECASTERS",
 }
 
 
 def trial_model(role: str) -> str:
     """The model the Test Bot is trying for `role`, or "" for the bot's own."""
     return os.getenv(TRIAL_MODELS[role], "").strip()
+
+
+# A second model family beside the Opus forecasts, paid by Rob's own OpenRouter key. In
+# Metaculus's same-setup house bots OpenAI's models led most seasons, while no Claude model
+# has; a second family hedges that choice and makes the members' errors less alike
+# (2026-10-30 research). EXTRA_FORECASTERS lists OpenRouter models, each with how many
+# forecasts it adds: "openrouter/openai/gpt-6.1-sol:2". They read the same research and
+# prompts, and the usual aggregation takes every member: with three Opus forecasts and two
+# others, yes/no questions use the trimmed mean. The key goes in OPENROUTER_OWN_API_KEY,
+# never OPENROUTER_API_KEY, which llm_route reads as Metaculus's credits. Off unless both
+# are set; the Test Bot's "extra" input tries a list for one run.
+OWN_OPENROUTER_KEY = "OPENROUTER_OWN_API_KEY"
+MAX_EXTRA_FORECASTS = 5
+_EXTRA_ITEM = re.compile(r"^(?P<model>.+?)(?::(?P<count>\d+))?$")
+# The extra forecaster for the forecast being made, set per forecast in _make_prediction
+_EXTRA_FORECASTER: ContextVar[GeneralLlm | None] = ContextVar("extra_forecaster", default=None)
+
+
+def extra_forecaster_models() -> list[str]:
+    """One model id per extra forecast, in order; [] when off. A mistyped list stops the
+    run at startup; a list without the key only warns, and the run goes on without it."""
+    spec = trial_model("extra") or os.getenv("EXTRA_FORECASTERS", "").strip()
+    if not spec:
+        return []
+    models: list[str] = []
+    for item in (part.strip() for part in spec.split(",")):
+        if not item:
+            continue
+        found = _EXTRA_ITEM.match(item)
+        model, count = found.group("model"), int(found.group("count") or 1)  # type: ignore[union-attr]
+        if not model.startswith("openrouter/") or count < 1:
+            raise SystemExit(
+                "EXTRA_FORECASTERS lists OpenRouter models with an optional count, like"
+                f" openrouter/openai/gpt-6.1-sol:2; got {item!r}"
+            )
+        models += [model] * count
+    if len(models) > MAX_EXTRA_FORECASTS:
+        raise SystemExit(f"EXTRA_FORECASTERS adds {len(models)} forecasts; at most {MAX_EXTRA_FORECASTS}")
+    if models and not os.getenv(OWN_OPENROUTER_KEY):
+        logger.warning(f"EXTRA_FORECASTERS is set but {OWN_OPENROUTER_KEY} isn't: no extra forecasters")
+        return []
+    return models
+
+
+def build_extra_forecasters() -> list[GeneralLlm]:
+    """The extra forecasters, one per forecast, on Rob's own OpenRouter key. Effort goes as
+    OpenRouter's own reasoning setting: litellm 1.80.10 refuses reasoning_effort for models
+    it doesn't know to reason, Gemini 4 Argon among them."""
+    models = extra_forecaster_models()
+    effort = forecaster_effort()
+    built: dict[str, GeneralLlm] = {}
+    for model in dict.fromkeys(models):
+        built[model] = GeneralLlm(
+            model=model,
+            api_key=os.getenv(OWN_OPENROUTER_KEY),  # never the credits' key from the environment
+            temperature=None,
+            timeout=_env_int("FORECASTER_TIMEOUT_S", 480),
+            allowed_tries=2,
+            **({"reasoning": {"effort": effort}} if effort else {}),
+        )
+    return [built[model] for model in models]
+
+
+def spend_on(calls: list, models: set[str]) -> float:
+    """What the calls to these models cost."""
+    return sum(c.cost or 0.0 for c in calls if c.model in models)
 
 
 def llm_route() -> str | None:
@@ -839,13 +917,20 @@ class RcForecastBot(ForecastBot):
     _structure_output_validation_samples = 2
 
     def __init__(
-        self, *args, research_health: ResearchHealth | None = None, **kwargs
+        self,
+        *args,
+        research_health: ResearchHealth | None = None,
+        extra_forecasters: list[GeneralLlm] | None = None,
+        **kwargs,
     ) -> None:
         super().__init__(*args, **kwargs)
         # Shared across a run's passes, so the run page counts every search
         self.research_health = (
             research_health if research_health is not None else ResearchHealth()
         )
+        # The last forecasts of each research report go to these, in order (make_bot adds
+        # their number to predictions_per_research_report)
+        self.extra_forecasters = list(extra_forecasters or [])
         # Per question: research reports tried so far, and questions any report found
         # research for (RESEARCH_REPORTS can run several reports for one question)
         self._reports_tried: Counter[str] = Counter()
@@ -950,12 +1035,40 @@ class RcForecastBot(ForecastBot):
     async def _make_prediction(
         self, question: MetaculusQuestion, research: str
     ) -> ReasonedPrediction[PredictionTypes]:
-        """The template's, unchanged; its calls count as forecast 1, 2, 3... of the
-        question in the spend breakdown (its parsing calls as parsing, see parse)."""
+        """The template's, made by the forecast's own model (see _forecaster); its calls
+        count as forecast 1, 2, 3... of the question in the spend breakdown (its parsing
+        calls as parsing, see parse)."""
         key = question_key(question)
         self._forecasts_started[key] += 1
-        with spend.tagged(part=f"forecast {self._forecasts_started[key]}"):
-            return await super()._make_prediction(question, research)
+        slot = self._forecasts_started[key]
+        extra = self._extra_for(slot)
+        token = _EXTRA_FORECASTER.set(extra)
+        try:
+            with spend.tagged(part=f"forecast {slot}"):
+                prediction = await super()._make_prediction(question, research)
+        except Exception as e:
+            if extra is not None:
+                self.research_health.record_forecast(extra.model, type(e).__name__)
+            raise
+        finally:
+            _EXTRA_FORECASTER.reset(token)
+        if extra is not None:
+            self.research_health.record_forecast(extra.model)
+        return prediction
+
+    def _extra_for(self, slot: int) -> GeneralLlm | None:
+        """The extra forecaster for a question's forecast number `slot`, or None for the
+        default model: in each research report the last ones go to the extras, in order."""
+        if not self.extra_forecasters:
+            return None
+        per_report = self.predictions_per_research_report
+        index = (slot - 1) % per_report
+        first = per_report - len(self.extra_forecasters)
+        return self.extra_forecasters[index - first] if first >= 0 and index >= first else None
+
+    def _forecaster(self) -> GeneralLlm:
+        """The model for the forecast being made: its extra forecaster, else the default."""
+        return _EXTRA_FORECASTER.get() or self.get_llm("default", "llm")
 
     @classmethod
     def _format_and_expand_research_summary(
@@ -1156,7 +1269,7 @@ class RcForecastBot(ForecastBot):
         question: BinaryQuestion,
         prompt: str,
     ) -> ReasonedPrediction[float]:
-        forecaster = self.get_llm("default", "llm")
+        forecaster = self._forecaster()
         reasoning = await forecaster.invoke(prompt)
         logger.info(f"Reasoning for URL {question.page_url}: {reasoning}")
         binary_prediction: BinaryPrediction = await parse(
@@ -1237,7 +1350,7 @@ class RcForecastBot(ForecastBot):
             Additionally, you may sometimes need to parse a 0% probability. Please do not skip options with 0% but rather make it an entry in your final list with 0% probability.
             """
         )
-        forecaster = self.get_llm("default", "llm")
+        forecaster = self._forecaster()
         reasoning = await forecaster.invoke(prompt)
         logger.info(f"Reasoning for URL {question.page_url}: {reasoning}")
         # Parsed without the package's validator, which rejects a confident answer with
@@ -1327,7 +1440,7 @@ class RcForecastBot(ForecastBot):
         question: NumericQuestion,
         prompt: str,
     ) -> ReasonedPrediction[NumericDistribution]:
-        forecaster = self.get_llm("default", "llm")
+        forecaster = self._forecaster()
         reasoning = await forecaster.invoke(prompt)
         logger.info(f"Reasoning for URL {question.page_url}: {reasoning}")
         parsing_instructions = clean_indents(
@@ -1429,7 +1542,7 @@ class RcForecastBot(ForecastBot):
         question: DateQuestion,
         prompt: str,
     ) -> ReasonedPrediction[NumericDistribution]:
-        forecaster = self.get_llm("default", "llm")
+        forecaster = self._forecaster()
         reasoning = await forecaster.invoke(prompt)
         logger.info(f"Reasoning for URL {question.page_url}: {reasoning}")
         parsing_instructions = clean_indents(
@@ -1650,9 +1763,10 @@ def make_bot(
     else:
         reports = _env_int("RESEARCH_REPORTS", 1)
         predictions = _env_int("PREDICTIONS_PER_REPORT", 5)
+    extras = build_extra_forecasters()
     return RcForecastBot(
         research_reports_per_question=reports,
-        predictions_per_research_report=predictions,
+        predictions_per_research_report=predictions + len(extras),
         use_research_summary_to_forecast=False,
         publish_reports_to_metaculus=publish,
         folder_to_save_reports_to=None,
@@ -1660,6 +1774,7 @@ def make_bot(
         extra_metadata_in_explanation=True,
         llms=build_llms(route, tier),
         research_health=research_health,
+        extra_forecasters=extras,
     )
 
 
@@ -1688,15 +1803,32 @@ def health_warnings(health: ResearchHealth) -> list[str]:
     this it shows only in the run page's table; an annotation shows on the run's summary
     and in GitHub's API."""
     warnings = []
-    for name, tally in health.sources.items():
-        failed = tally.searches - tally.worked
-        if failed:
-            reasons = ", ".join(f"{r} x{n}" for r, n in tally.failures.most_common())
-            warnings.append(
-                f"::warning title=Research source failed::{name} failed {failed} of"
-                f" {tally.searches} searches ({reasons})"
-            )
+    kinds = (
+        (health.sources, "Research source failed", "searches"),
+        (health.forecasters, "Extra forecaster failed", "forecasts"),
+    )
+    for tallies, title, unit in kinds:
+        for name, tally in tallies.items():
+            failed = tally.searches - tally.worked
+            if failed:
+                reasons = ", ".join(f"{r} x{n}" for r, n in tally.failures.most_common())
+                warnings.append(
+                    f"::warning title={title}::{name} failed {failed} of"
+                    f" {tally.searches} {unit} ({reasons})"
+                )
     return warnings
+
+
+def _tally_rows(tallies: dict[str, SourceTally]) -> list[str]:
+    rows = []
+    for name, tally in tallies.items():
+        reasons = ", ".join(
+            f"{reason} ×{count}" if count > 1 else reason
+            for reason, count in tally.failures.most_common()
+        )
+        failed = f"{tally.searches - tally.worked}" + (f" ({reasons})" if reasons else "")
+        rows.append(f"| {name} | {tally.searches} | {tally.worked} | {failed} |")
+    return rows
 
 
 def run_report(
@@ -1712,13 +1844,10 @@ def run_report(
     lines.append(f"- Research sources: {', '.join(configured) if configured else 'none'}.")
     if health.sources:
         lines += ["", "| Research source | Searches | Worked | Failed |", "|---|---|---|---|"]
-        for name, tally in health.sources.items():
-            reasons = ", ".join(
-                f"{reason} ×{count}" if count > 1 else reason
-                for reason, count in tally.failures.most_common()
-            )
-            failed = f"{tally.searches - tally.worked}" + (f" ({reasons})" if reasons else "")
-            lines.append(f"| {name} | {tally.searches} | {tally.worked} | {failed} |")
+        lines += _tally_rows(health.sources)
+    if health.forecasters:
+        lines += ["", "| Extra forecaster | Forecasts | Worked | Failed |", "|---|---|---|---|"]
+        lines += _tally_rows(health.forecasters)
     notes: list[str] = []
     deferred = sum(deferred_for_research(r) for r in results)
     if deferred:
@@ -1871,6 +2000,7 @@ def main() -> None:
     if run_mode != "test_questions":
         for variable in TRIAL_MODELS.values():
             os.environ.pop(variable, None)
+    extras = extra_forecaster_models()  # a mistyped EXTRA_FORECASTERS stops the run here
     # PUBLISH=false gives a dry run: full research and forecasts, nothing posted
     publish = _env_flag("PUBLISH", True)
     print_startup_banner(run_mode, will_publish=publish)
@@ -1942,6 +2072,7 @@ def main() -> None:
     health = ResearchHealth()
     passes: list[str] = []
     breakdowns: list[str] = []
+    own_openrouter_spent = [0.0]  # the extra forecasters' spend on Rob's OpenRouter key
 
     def run_pass(
         label: str,
@@ -1967,9 +2098,12 @@ def main() -> None:
         breakdowns.extend(
             spend.breakdown(label, ledger, question_statuses(questions, results, publish))
         )
+        # The extra forecasters bill Rob's own OpenRouter key, not the key the meter tracks
+        extra_spent = spend_on(ledger.calls, {llm.model for llm in bot.extra_forecasters})
+        own_openrouter_spent[0] += extra_spent
         if meter is not None and tier is not None:
             failed = sum(isinstance(r, BaseException) for r in results)
-            meter.record(label, tier, len(results) - failed, failed, ledger.total())
+            meter.record(label, tier, len(results) - failed, failed, ledger.total() - extra_spent)
         return results
 
     def paused_by(tier: budget.Tier | None, has_work: bool) -> str | None:
@@ -2075,6 +2209,13 @@ def main() -> None:
         budget.write_step_summary(breakdowns)
     configured = [source_name(s) for s in research_sources(build_llms(route))]
     lines = run_report(passes, configured, health, reports)
+    if extras:
+        counts = Counter(extras)
+        names = ", ".join(f"{m} ×{n}" if n > 1 else m for m, n in counts.items())
+        notes.append(
+            f"- Extra forecasters: {names}. Spent on your own OpenRouter key this run:"
+            f" ${own_openrouter_spent[0]:.2f}."
+        )
     if notes:
         lines += ["", *notes]
     print("\n".join(lines) + "\n")
