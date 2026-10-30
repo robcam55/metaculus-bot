@@ -10,6 +10,8 @@ posted comment's sections, the AskNews settings, and the spend measured per call
 """
 
 import asyncio
+import contextlib
+import io
 import logging
 import math
 import os
@@ -675,14 +677,18 @@ def check_run_loop() -> None:
 
     # a question left without research also turns the run red, says why, and is counted
     # on the run page (the next run retries it)
-    calls, summary, exited, _ = run_main(
-        "tournament",
-        100.0,
-        questions,
-        fail_urls=("https://example.invalid/q/5",),
-        deferred_urls=("https://example.invalid/q/4",),
-        OPENROUTER_API_KEY="sk-fake",
-    )
+    printed = io.StringIO()
+    with contextlib.redirect_stdout(printed):
+        calls, summary, exited, _ = run_main(
+            "tournament",
+            100.0,
+            questions,
+            fail_urls=("https://example.invalid/q/5",),
+            deferred_urls=("https://example.invalid/q/4",),
+            OPENROUTER_API_KEY="sk-fake",
+        )
+    # and the failed source is annotated, since it alone doesn't turn a run red
+    assert "::warning title=Research source failed::fake-search failed 1 of 4 searches (RuntimeError x1)" in printed.getvalue()
     assert exited == (
         "2 question(s) failed (1 for lack of research; the next run retries them);"
         " see the log above"
@@ -1269,7 +1275,7 @@ def check_scorecard() -> None:
         "| FutureEval | multiple_choice | 1 | -10.0 | -10.0 |",
         "3 resolved: mean forecast 38%, resolved Yes 67% (± 27%), Brier 0.177.",
         "| 0%–10% | 1 | 5% | 0% |",
-        "2 forecaster ranges: outcome below the 10th percentile 0%, between the 10th and 90th 50%, above the 90th 50%",
+        "2 forecaster ranges on 1 questions: outcome below the 10th percentile 0%, between the 10th and 90th 50%, above the 90th 50%",
         "1 resolved: mean probability on the winner 40%; the winner was the favourite 0% of the time.",
     ):
         assert expected in text, (expected, text)
@@ -1282,7 +1288,7 @@ def check_scorecard() -> None:
                   {"run_time": "2026-10-21T12:00:00Z", "forecasters": [{"prediction": "unparseable 1e"}]},
               ]}  # fmt: skip
     text = "\n".join(scorecard.scorecard({"questions": [beyond]}))
-    assert "1 forecaster ranges: outcome below the 10th percentile 0%, between the 10th and 90th 0%, above the 90th 100%" in text, text
+    assert "1 forecaster ranges on 1 questions: outcome below the 10th percentile 0%, between the 10th and 90th 0%, above the 90th 100%" in text, text
     empty = "\n".join(scorecard.scorecard({"questions": []}))
     assert "No resolved binary forecasts yet." in empty, empty
     assert "No scored questions yet." in empty and "No resolved yes/no or multiple-choice forecasts with their members yet." in empty, empty  # fmt: skip
@@ -1299,6 +1305,14 @@ def check_scorecard() -> None:
         ("How many measles cases will Peru's CDC report as of mid-October?", "numeric", "Reported counts"),
         ("What will the Google Trends score for 'flu' be?", "numeric", "Google Trends"),
         ("Will the FAA type-certify the Boeing 737 MAX 10 before 2027?", "binary", "Other"),
+        # words that mean something else outside a market or a game
+        ("Will Iran close the Strait of Hormuz before December 1, 2026?", "binary", "Other"),
+        ("Will Nintendo release a new Zelda game before 2027?", "binary", "Other"),
+        ("Will the Fed's December decision match market expectations?", "binary", "Other"),
+        ("Will Russia and Ukraine sign a peace settlement before 2027?", "binary", "Other"),
+        ("How many gold medals will the US win at the 2028 Olympics?", "numeric", "Sports"),
+        ("Will Bitcoin still be above $100,000 on November 30?", "binary", "Prices and markets"),
+        ("When will the CDC report the first case?", "date", "Other"),
     ):  # fmt: skip
         assert scorecard.kind(titled(title, kind)) == expected, (title, scorecard.kind(titled(title, kind)))
 
@@ -1306,14 +1320,17 @@ def check_scorecard() -> None:
     # the aggregate against the average member; each model against the most common one
     def tagged(p, model):
         return {"prediction": f"{p}%\nModel: {model}"}
+
+    def run(forecasters, at="2026-10-31T12:00:05.0Z", posted="2026-10-31T12:00:01.0Z"):
+        return {"forecast_time": posted, "traces": [{"run_time": at, "forecasters": forecasters}]}
     opus, gpt = "anthropic/claude-opus-5-5", "openrouter/openai/gpt-6.1-sol"
-    q1 = {**binary(0.7, "yes", 4.0), "traces": [{"forecasters": [tagged(60.0, opus), tagged(70.0, opus), tagged(80.0, gpt)]}]}  # fmt: skip
-    q2 = {**binary(0.2, "no", 2.0), "traces": [{"forecasters": [tagged(10.0, opus), tagged(30.0, opus), tagged(20.0, gpt)]}]}  # fmt: skip
-    old = {**binary(0.5, "yes", 0.0), "traces": [{"forecasters": [{"prediction": "40.0%"}, {"prediction": "60.0%"}]}]}  # fmt: skip
-    mc_members = {**mc, "traces": [{"forecasters": [
-        {"prediction": "- a: 50.0%\n- b: 50.0%\nModel: " + opus},
-        {"prediction": "- a: 70.0%\n- b: 30.0%\nModel: " + gpt},
-    ]}]}  # fmt: skip
+    q1 = {**binary(0.7, "yes", 4.0), **run([tagged(60.0, opus), tagged(70.0, opus), tagged(80.0, gpt)])}  # fmt: skip
+    q2 = {**binary(0.2, "no", 2.0), **run([tagged(10.0, opus), tagged(30.0, opus), tagged(20.0, gpt)])}  # fmt: skip
+    old = {**binary(0.5, "yes", 0.0), **run([{"prediction": "40.0%"}, {"prediction": "60.0%"}])}  # fmt: skip
+    mc_members = {**mc, **run([
+        {"prediction": "- a: 50.0%\n- b: 50.0%\n\nModel: " + opus},
+        {"prediction": "- a: 70.0%\n- b: 30.0%\n\nModel: " + gpt},
+    ])}  # fmt: skip
     lines = scorecard.members([q1, q2, old, mc_members])
     text = "\n".join(lines)
     ln = math.log
@@ -1329,11 +1346,23 @@ def check_scorecard() -> None:
         100 * ln(0.8) - statistics.mean(100 * ln(x) for x in (0.9, 0.7)),
         100 * ln(0.3) - 100 * ln(0.5),
     ]
-    assert f"| {gpt} − {opus} | 3 | {scorecard._mean_se(diffs)} |" in text, (text, diffs)
-    # one family so far: said so, no comparison row
-    assert "One model so far (anthropic/claude-opus-5-5)" in "\n".join(
-        scorecard.members([{**q1, "traces": [{"forecasters": [tagged(60.0, opus), tagged(70.0, opus)]}]}])
-    )
+    # one name per model on either route (openrouter/ dropped, claude-opus-5-5 as 5.5)
+    assert f"| openai/gpt-6.1-sol − anthropic/claude-opus-5.5 | 3 | {scorecard._mean_se(diffs)} |" in text, (text, diffs)
+    # one family so far: said so, no comparison row; Opus on either route is one model
+    assert "One model so far (anthropic/claude-opus-5.5)" in "\n".join(scorecard.members([
+        {**q1, **run([tagged(60.0, opus), tagged(70.0, "openrouter/anthropic/claude-opus-5.5")])}]))  # fmt: skip
+    # two models that never share a question: said so
+    assert "no questions in common" in "\n".join(scorecard.members([
+        {**q1, **run([tagged(60.0, opus)])}, {**q2, **run([tagged(20.0, gpt)])}]))  # fmt: skip
+    # a later run's forecast (the Cup, the Test Bot) isn't scored against an earlier run's
+    # members; the members still count for the models
+    later = {**q1, **run([tagged(30.0, opus), tagged(30.0, opus)], posted="2026-11-02T09:00:00Z")}
+    assert "Aggregate" not in "\n".join(scorecard.members([later])), scorecard.members([later])
+    # setups: the "Model:" line marks the 2026-10-30 rules; untagged runs are older
+    assert scorecard.setup(q1) == "since 2026-10-30" and scorecard.setup(old) == "before 2026-10-30"
+    text = "\n".join(scorecard.scorecard({"questions": [q1, q2, old]}))
+    assert "| since 2026-10-30 | binary | 2 | +3.0 ± 1.0 |" in text and "| before 2026-10-30 | binary | 1 | +0.0 |" in text, text
+    assert "- since 2026-10-30: 2 resolved: mean forecast 45%" in text, text
     print("scorecard: ok")
 
 
@@ -1438,6 +1467,13 @@ def check_guards() -> None:
         parsed[:] = [pcts([0, 0, 5, 5.2, 20, 30])]
         got = asyncio.run(bot._numeric_prompt_to_forecast(q, "prompt"))
         assert got.prediction_value.get_cdf(), got
+        assert main.model_of_reasoning(got.reasoning) == "fake/forecaster", got.reasoning
+        # a date forecast runs end to end too, and names its model
+        when = timed_question("date")
+        parsed[:] = [[main.DatePercentile(percentile=p, value=datetime(2026, 11, d, tzinfo=timezone.utc))
+                      for p, d in zip([0.1, 0.2, 0.4, 0.6, 0.8, 0.9], [2, 5, 9, 14, 20, 27])]]  # fmt: skip
+        got_date = asyncio.run(bot._date_prompt_to_forecast(when, "prompt"))
+        assert got_date.prediction_value.get_cdf() and main.model_of_reasoning(got_date.reasoning) == "fake/forecaster"
 
         # three forecasts: the mixture is their mean CDF, wider than the median where they
         # disagree; a misread outlier is left out
@@ -1467,6 +1503,7 @@ def check_guards() -> None:
         sharp = [0.92, 0.08] + [0.0] * 6
         parsed[:] = [[fg.OptionGuess(option_name=o, probability=p) for o, p in zip(options, sharp)]]
         got = asyncio.run(bot._multiple_choice_prompt_to_forecast(mc, "prompt"))
+        assert main.model_of_reasoning(got.reasoning) == "fake/forecaster", got.reasoning
         probs = got.prediction_value.to_dict()
         assert list(probs) == options and abs(sum(probs.values()) - 1) < 1e-9, probs
         assert all(abs(probs[o] - 0.01) < 1e-9 for o in options[2:]), probs
@@ -1580,6 +1617,44 @@ def check_own_key_research() -> None:
             replies.append(uncited)
             text = asyncio.run(llm.invoke("Research this question."))
             assert "https://www.reuters.com/world/example-2026-10-27/" in text, text
+
+            # a page opened with web fetch: litellm drops the fetch result and a citation of
+            # the page has no URL, so the fetched URL comes from the fetch call. It is
+            # listed first, and an uncited search result is not passed off as the source
+            page = "https://www.iaea.org/newscenter/update-2026-10-29"
+            fetch_blocks = [
+                {"type": "server_tool_use", "id": "f1", "name": "web_fetch", "input": {"url": page}},
+                {"type": "web_fetch_tool_result", "tool_use_id": "f1", "content": {
+                    "type": "web_fetch_result", "url": page, "retrieved_at": "2026-10-30T12:00:00Z",
+                    "content": {"type": "document", "title": "IAEA update", "citations": {"enabled": True},
+                                "source": {"type": "text", "media_type": "text/plain", "data": "Offsite power restored."}}}},
+                {"type": "text", "text": " Offsite power was restored on 2026-10-29.", "citations": [
+                    {"type": "char_location", "cited_text": "Offsite power restored.", "document_index": 0,
+                     "document_title": "IAEA update", "start_char_index": 0, "end_char_index": 23}]},
+            ]  # fmt: skip
+            searched_and_fetched = anthropic_search_reply()
+            searched_and_fetched["content"][-1].pop("citations")  # the search result isn't cited
+            searched_and_fetched["content"] += fetch_blocks
+            fetch_only = anthropic_search_reply()
+            fetch_only["content"] = fetch_only["content"][:1] + fetch_blocks
+            for reply in (searched_and_fetched, fetch_only):
+                replies.append(reply)
+                text = asyncio.run(llm.invoke("Research this question."))
+                assert page in text and "Offsite power was restored on 2026-10-29." in text, text
+                assert "reuters.com" not in text.split("2026-10-29.")[-1], text
+
+            # a reply cut short with no text at all (thinking and tool blocks only) fails
+            # GeneralLlm's own check before the stop reason is read: empty, not retried
+            llm.allowed_tries = 2
+            for stop in ("pause_turn", "max_tokens"):
+                sent.clear()
+                silent = anthropic_search_reply(stop)
+                silent["content"] = [{"type": "thinking", "thinking": "", "signature": "s"}] + silent["content"][1:3]
+                replies[:] = [silent, anthropic_search_reply()]
+                assert asyncio.run(llm.invoke("Research this question.")) == "", stop
+                assert len(sent) == 1, (stop, len(sent))
+            replies.clear()
+            llm.allowed_tries = 1
 
             # an Opus 5.5 forecast: effort high in output_config, the larger reply cap, no
             # thinking budget or sampling parameters (Opus 5.5 rejects both)
@@ -1746,11 +1821,15 @@ def check_prompts() -> None:
     # check both ways in place of the one-sided "over-predict Yes" step
     for expected in (
         "(a) The question: in one sentence, what exactly must happen",
-        "1 - (1 - yearly rate)^(days left / 365)",
+        "1 - (1 - p)^(days left / 365)",
+        "1 - e^(-r x days left / 365)",
+        "needs no rescaling",
         "a process already under way reaching its scheduled end",
         "An announced target date shows a plan exists, not that it will be met",
         "A search that finds nothing is not evidence",
-        "roughly twice as likely as being past it on the final day",
+        "(f) Markets and prices: a recent forecast on this question or a close match",
+        "If only daily closes count it is less: about the same with 1 trading day left",
+        "the standard deviation of its daily % changes",
         "A thin or stale market is weak evidence",
         "Would a Yes surprise you at this probability? Would a No?",
         "(h) Reconcile these into one probability",
@@ -1764,17 +1843,21 @@ def check_prompts() -> None:
     for kind in ("numeric", "date"):
         assert main.WIDTH_RULE in prompts[kind], (kind, prompts[kind])
         assert "humble" not in prompts[kind] and "wide 90/10" not in prompts[kind], prompts[kind]
-    assert "1.3 x the typical daily move x the square root of the trading days left" in prompts["numeric"]
-    assert "typical daily move" not in prompts["date"], prompts["date"]
+    assert "1.3 x that daily volatility x the square root of the days it trades before the deadline" in prompts["numeric"]
+    assert "go wider than this" in prompts["numeric"] and main.DAILY_VOLATILITY in prompts["numeric"]
+    assert "daily volatility" not in prompts["date"], prompts["date"]
     # research: open the named source, a searched base rate, a series' move, each venue
     for expected in (
         "open it first if you can",
-        "as a count with its period",
-        "its typical daily move recently",
+        "as a count that says what was counted",
+        "the standard deviation of its daily % changes",
         'For each of Polymarket, Kalshi, Manifold and Metaculus',
-        'or write "not found"',
+        'or write "not found" (searched) or "not searched"',
     ):
         assert expected in research_prompt, (expected, research_prompt)
+    # numeric questions get past values of the quantity, not an event count
+    numeric_research = bot._research_prompt(timed_question("numeric"))
+    assert "past values of the same quantity" in numeric_research and "Search once for the base rate" not in numeric_research
     print("prompts: ok")
 
 

@@ -12,15 +12,19 @@ forecasts can show earlier is bias:
   than 80% inside means the ranges run too narrow.
 - Multiple choice: the mean probability given to the option that won, and how often it
   was the forecast's favourite.
+- By setup: forecasts from before the 2026-10-30 prompt and research rules against those
+  after, told apart by the "Model:" line that arrived with them. The tables above mix
+  both; judge the rules by these rows.
 - By kind of question, from the title: prices and markets, status on a date, sports and
-  so on, to show where the points are won and lost. Descriptive only: at a dozen
-  questions a kind, a gap under about 12 points is noise.
+  so on, to show where the points are won and lost, per setup. Descriptive only: at a
+  dozen questions a kind, a gap under about 12 points is noise.
 - The aggregate against its own members, and each model against the most common one on
   the questions both forecast, in log score (100 x ln of the probability given to what
   happened, the peer score's units). Paired on the same questions, these have far less
   noise than comparing peer scores between two setups. The model comes from the
   "Model:" line main.py adds to each forecaster's line in the posted summary; older
-  comments have none and count only in the aggregate's row.
+  comments have none and count only in the aggregate's row. One model's ids on the two
+  routes (OpenRouter's and Anthropic's) count as one.
 Read-only, standard library only: `python scorecard.py review.json`.
 """
 
@@ -32,6 +36,7 @@ import re
 import statistics
 import sys
 from collections import defaultdict
+from datetime import datetime
 from typing import Any
 
 BINS = ((0.0, 0.1), (0.1, 0.3), (0.3, 0.5), (0.5, 0.7), (0.7, 0.9), (0.9, 1.0001))
@@ -46,15 +51,19 @@ _OPTION = re.compile(r"^- (.+): ([\d.]+)%\s*$", re.MULTILINE)
 # Kinds of question, by title; the first that matches wins. Status applies to yes/no
 # questions only, and counts of official reports to numeric ones
 SPORTS = re.compile(
-    r"\b(nfl|nba|mlb|nhl|bundesliga|premier league|la liga|serie a|ligue 1|champions league"
-    r"|alcs|nlcs|world series|super bowl|grand prix|formula 1|matchday|night football"
-    r"|touchdowns?|passing yards|game|match|fixture|series score)\b",
+    r"\b(nfl|nba|wnba|mlb|nhl|ncaa|ufc|nascar|bundesliga|premier league|la liga|serie a"
+    r"|ligue 1|champions league|alcs|nlcs|world series|super bowl|stanley cup|world cup"
+    r"|olympics?|wimbledon|(australian|french|us) open|ballon d'or|grand prix|formula 1"
+    r"|matchday|night football|touchdowns?|passing yards|fixture|series score)\b",
     re.IGNORECASE,
 )
+# Market words only where they can't mean something else: "close" alone also closes
+# straits and polls, "gold" wins medals, "settlement" ends wars
 MARKETS = re.compile(
-    r"\b(price|prices|close|closes|closing|settle|settles|settlement|futures|stock|shares"
-    r"|etfs?|index|bitcoin|btc|ethereum|crypto\w*|zcash|zec|s&p|nasdaq|dow|bist|brent|wti"
-    r"|gold|wheat|yield|exchange rate|market cap\w*|inflows?)\b",
+    r"\b(price|prices|clos\w* (price|level|high|low|above|below|at)|settle\w* (price|at"
+    r"|above|below)|futures|stock|shares|etfs?|bitcoin|btc|ethereum|crypto\w*|zcash|zec"
+    r"|s&p|nasdaq|dow jones|vix|nikkei|ftse|dax|bist|brent|wti|(gold|silver|oil|wheat)"
+    r" (price|futures)|(bond|treasury|\d+-year) yield|exchange rate|market cap\w*)\b",
     re.IGNORECASE,
 )
 STATUS = re.compile(
@@ -132,14 +141,24 @@ def binary_calibration(questions: list[dict]) -> list[str]:
     return lines
 
 
+def binary_by_setup(questions: list[dict]) -> list[str]:
+    """The binary calibration summary line, once per setup."""
+    lines = []
+    for name in ("before 2026-10-30", "since 2026-10-30"):
+        group = [q for q in questions if setup(q) == name]
+        line = binary_calibration(group)[0]
+        lines.append(f"- {name}: {line}")
+    return lines
+
+
 def _rate_se(outcomes: tuple[float, ...]) -> float:
     rate = statistics.mean(outcomes)
     return math.sqrt(rate * (1 - rate) / len(outcomes))
 
 
-def _forecasters(q: dict) -> list[str]:
-    """The forecasters of the run that was scored: the latest before the spot scoring time,
-    as bot-review picks it (its traces come newest first), else the latest."""
+def _scored_trace(q: dict) -> dict | None:
+    """The run that was scored: the latest before the spot scoring time, as bot-review
+    picks it (its traces come newest first), else the latest."""
     traces = sorted(
         (t for t in q.get("traces") or [] if t.get("forecasters")),
         key=lambda t: t.get("run_time") or "",
@@ -147,12 +166,49 @@ def _forecasters(q: dict) -> list[str]:
     scored_at = q.get("spot_scoring_time")
     before = [t for t in traces if scored_at and (t.get("run_time") or "") <= scored_at]
     chosen = (before or traces)[-1:]
-    return [f.get("prediction") or "" for f in chosen[0]["forecasters"]] if chosen else []
+    return chosen[0] if chosen else None
+
+
+def _forecasters(q: dict) -> list[str]:
+    """The forecasters of the run that was scored."""
+    trace = _scored_trace(q)
+    return [f.get("prediction") or "" for f in trace["forecasters"]] if trace else []
+
+
+def _time(value: Any) -> datetime | None:
+    try:
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def _same_run(q: dict) -> bool:
+    """Whether the posted forecast (bot-review's latest) came from the scored run. The bot
+    posts its forecast seconds before its comment, so a later run's forecast is later than
+    the scored run's comment; the Cup and the Test Bot forecast questions again."""
+    trace = _scored_trace(q)
+    forecast_at = _time(q.get("forecast_time"))
+    run_at = _time(trace.get("run_time")) if trace else None
+    return bool(forecast_at and run_at and forecast_at <= run_at)
+
+
+def setup(q: dict) -> str:
+    """Which setup forecast it: the "Model:" line arrived with the 2026-10-30 rules."""
+    tagged = any(_MODEL.search(text) for text in _forecasters(q))
+    return "since 2026-10-30" if tagged else "before 2026-10-30"
+
+
+def _canonical(model: str) -> str:
+    """One name for one model on either route: openrouter/anthropic/claude-opus-5.5 and
+    anthropic/claude-opus-5-5 are both anthropic/claude-opus-5.5."""
+    model = model.removeprefix("openrouter/")
+    return re.sub(r"^(anthropic/claude-[a-z]+-\d+)-(\d+)$", r"\1.\2", model)
 
 
 def numeric_coverage(questions: list[dict]) -> list[str]:
     counts = {"below": 0, "inside": 0, "above": 0}
-    for q in questions:
+    counted: set[int] = set()
+    for i, q in enumerate(questions):
         if q.get("question_type") not in ("numeric", "discrete"):
             continue
         resolution = q.get("resolution")
@@ -167,6 +223,7 @@ def numeric_coverage(questions: list[dict]) -> list[str]:
                 continue  # a forecast written some other way: skipped, not fatal
             if 0.1 not in points or 0.9 not in points:
                 continue
+            counted.add(i)
             if outcome < points[0.1]:
                 counts["below"] += 1
             elif outcome > points[0.9]:
@@ -177,7 +234,7 @@ def numeric_coverage(questions: list[dict]) -> list[str]:
     if not total:
         return ["No resolved numeric forecasts with their percentiles yet."]
     return [
-        f"{total} forecaster ranges: outcome below the 10th percentile"
+        f"{total} forecaster ranges on {len(counted)} questions: outcome below the 10th percentile"
         f" {counts['below'] / total:.0%}, between the 10th and 90th"
         f" {counts['inside'] / total:.0%}, above the 90th {counts['above'] / total:.0%}"
         " (nominally 10%, 80%, 10%)."
@@ -209,25 +266,38 @@ def kind(q: dict) -> str:
         return "Community prediction"
     if SPORTS.search(title):
         return "Sports"
-    binary = q.get("question_type") == "binary"
-    if binary and STATUS.search(title):
-        return "Status on a date"
     if MARKETS.search(title):
         return "Prices and markets"
-    if not binary and q.get("question_type") != "multiple_choice" and REPORTED.search(title):
+    if q.get("question_type") == "binary" and STATUS.search(title):
+        return "Status on a date"
+    if q.get("question_type") in ("numeric", "discrete") and REPORTED.search(title):
         return "Reported counts"
     return "Other"
 
 
-def kinds(questions: list[dict]) -> list[str]:
-    groups: dict[str, list[float]] = defaultdict(list)
+def setups(questions: list[dict]) -> list[str]:
+    groups: dict[tuple[str, str], list[float]] = defaultdict(list)
     for q in _scored(questions):
-        groups[kind(q)].append(q["scores"]["spot_peer_score"])
+        score = q["scores"]["spot_peer_score"]
+        groups[(setup(q), "all types")].append(score)
+        groups[(setup(q), q.get("question_type") or "?")].append(score)
     if not groups:
         return ["No scored questions yet."]
-    lines = ["| Kind of question | Scored | Mean spot peer ± SE |", "|---|---|---|"]
-    for name, scores in sorted(groups.items(), key=lambda item: -len(item[1])):
-        lines.append(f"| {name} | {len(scores)} | {_mean_se(scores)} |")
+    lines = ["| Setup | Type | Scored | Mean spot peer ± SE |", "|---|---|---|---|"]
+    for (name, kind_), scores in sorted(groups.items()):
+        lines.append(f"| {name} | {kind_} | {len(scores)} | {_mean_se(scores)} |")
+    return lines
+
+
+def kinds(questions: list[dict]) -> list[str]:
+    groups: dict[tuple[str, str], list[float]] = defaultdict(list)
+    for q in _scored(questions):
+        groups[(kind(q), setup(q))].append(q["scores"]["spot_peer_score"])
+    if not groups:
+        return ["No scored questions yet."]
+    lines = ["| Kind of question | Setup | Scored | Mean spot peer ± SE |", "|---|---|---|---|"]
+    for (name, when), scores in sorted(groups.items(), key=lambda item: (-len(item[1]), item[0])):
+        lines.append(f"| {name} | {when} | {len(scores)} | {_mean_se(scores)} |")
     return lines
 
 
@@ -237,7 +307,8 @@ def _members(q: dict) -> list[tuple[str, str]]:
     members = []
     for text in _forecasters(q):
         found = _MODEL.search(text)
-        members.append((found.group(1) if found else "untagged", _MODEL.sub("", text).strip()))
+        model = _canonical(found.group(1)) if found else "untagged"
+        members.append((model, _MODEL.sub("", text).strip()))
     return members
 
 
@@ -275,7 +346,8 @@ def _aggregate_points(q: dict) -> float | None:
 
 def members(questions: list[dict]) -> list[str]:
     """Yes/no and multiple choice: the posted aggregate against the average of its own
-    members, and each model against the most common one on shared questions."""
+    members (only where the posted forecast came from the scored run), and each model
+    against the most common one on shared questions."""
     gains: list[float] = []
     by_model: dict[str, dict[int, list[float]]] = defaultdict(dict)
     for i, q in enumerate(questions):
@@ -283,7 +355,7 @@ def members(questions: list[dict]) -> list[str]:
         scored = [(model, points) for model, points in scored if points is not None]
         if not scored:
             continue
-        aggregate = _aggregate_points(q)
+        aggregate = _aggregate_points(q) if _same_run(q) else None
         if aggregate is not None and len(scored) >= 2:
             gains.append(aggregate - statistics.mean(points for _, points in scored))
         for model, points in scored:
@@ -299,6 +371,7 @@ def members(questions: list[dict]) -> list[str]:
     tagged = {m: qs for m, qs in by_model.items() if m != "untagged"}
     if len(tagged) >= 2:
         reference = max(tagged, key=lambda m: len(tagged[m]))
+        compared = 0
         for model, per_question in sorted(tagged.items()):
             if model == reference:
                 continue
@@ -308,7 +381,10 @@ def members(questions: list[dict]) -> list[str]:
                 for i in shared
             ]
             if diffs:
+                compared += 1
                 lines.append(f"| {model} − {reference} | {len(diffs)} | {_mean_se(diffs)} |")
+        if not compared:
+            lines.append(f"| Models so far ({', '.join(sorted(tagged))}): no questions in common | – | – |")
     elif tagged:
         lines.append(f"| One model so far ({', '.join(sorted(tagged))}) | – | – |")
     return lines
@@ -335,6 +411,12 @@ def scorecard(review: dict[str, Any]) -> list[str]:
         "**Multiple choice**",
         "",
         *multiple_choice(questions),
+        "",
+        "**By setup** (the 2026-10-30 prompt and research rules against the setup before them)",
+        "",
+        *setups(questions),
+        "",
+        *binary_by_setup(questions),
         "",
         "**By kind of question** (descriptive; at a dozen questions a kind, gaps under about 12 points are noise)",
         "",

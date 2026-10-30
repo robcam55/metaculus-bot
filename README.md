@@ -94,7 +94,8 @@ The changes are in `main.py` (`RcForecastBot`), `budget.py`, `spend.py`, `alerts
     which Metaculus's credits cover). On your own key, Sonnet 5.5 calls Anthropic's web
     search tool directly (`web_search_20260209`, which filters results before they enter
     the context), up to four searches a question, with each round of results cached for
-    the next search and its sources kept. It can also open two pages a question with
+    the next search and its sources kept (pages it opened listed first when cited). It can
+    also open two pages a question with
     Anthropic's web fetch tool (`web_fetch_20260209`, up to 8,000 tokens a page;
     `RESEARCH_WEB_FETCH=false` turns it off). Or Perplexity, with its own key. Its prompt
     carries the question's background, and asks for:
@@ -120,7 +121,8 @@ The changes are in `main.py` (`RcForecastBot`), `budget.py`, `spend.py`, `alerts
 - **A report on each run's page.** For each tournament: how many questions were open, how
   many not yet forecast, and how many the run took. Then the research sources that are set
   up, and how many searches each returned, with the error types of any that failed.
-  - A failing source is otherwise only a warning in the log, and the run stays green.
+  - A failing source leaves the run green. It shows in this table and as a "Research
+    source failed" warning annotation on the run's summary.
   - An idle run still lists the sources, so new AskNews keys show up within 20 minutes.
   - A red run whose job reads "cancelled" after about 15 minutes, with no steps and no log,
     never got a GitHub runner, so the bot never started. Nothing needs fixing: the next run
@@ -145,19 +147,23 @@ The changes are in `main.py` (`RcForecastBot`), `budget.py`, `spend.py`, `alerts
   leniently now, each option floored at 1%).
 - **Forecast prompts with specific rules.**
   - Yes/no: restate exactly what must happen, by when and per which source; an outside
-    view, with a yearly rate scaled to the days left; the status quo read from the named
-    source, and whether it means nothing changes or a process reaching its scheduled end;
-    announced target dates as plans, not promises; a search that finds nothing as no
-    evidence; price thresholds read off a distribution of where the price will be
-    (touching a level any time before the deadline is about twice as likely as being past
-    it on the day); a liquid, closely matched market as strong evidence; and a check of
-    the number in both directions, in place of the old one-sided "models over-predict
-    Yes" step.
+    view, with a yearly base rate converted to the days left (from a share of years or a
+    count of events, and not rescaled when it already covers such a window); the status
+    quo read from the named source, and whether it means nothing changes or a process
+    reaching its scheduled end; announced target dates as plans, not promises; a search
+    that finds nothing as no evidence; a liquid, closely matched market as strong evidence;
+    price thresholds read off a distribution of where the price will be, with touching a
+    level before the deadline more likely than being past it on the day (about twice with
+    intraday prices over weeks, 1.2 to 1.5 times on daily closes over days to two weeks);
+    and a check of the number in both directions, in place of the old one-sided "models
+    over-predict Yes" step.
   - Multiple choice: how often the favourite actually wins, how it would fail, and the
     same market rule.
   - Numeric and date: the range's width set by how forecastable the quantity is, in
-    place of the template's "set wide intervals"; for traded prices, a floor of about
-    1.3 x the typical daily move x the square root of the trading days left on each side.
+    place of the template's "set wide intervals", with room for revised reports; for traded
+    prices, a floor of about 1.3 x the daily volatility (the standard deviation of daily %
+    changes) x the square root of the days it trades on each side, wider again with
+    earnings or another scheduled release in the window.
   - Each forecast's reasoning and its line in the posted summary name the model that made
     it, for the scorecard's per-model tables.
 - **Operational changes.**
@@ -184,7 +190,8 @@ The changes are in `main.py` (`RcForecastBot`), `budget.py`, `spend.py`, `alerts
   where numeric outcomes fell against the forecasters' 10th and 90th percentiles; the
   probability given to the winning option on multiple choice; mean spot peer by kind of
   question (prices and markets, status on a date, sports, reported counts, other, from the
-  title); and, paired on the same questions, the aggregate against its own members and
+  title) and by setup, before and after the 2026-10-30 rules; and, paired on the same
+  questions, the aggregate against its own members and
   each model against the most common one.
 
 Offline checks (no keys): `python tests/check_rc_bot.py`. They also run on every pull
@@ -415,12 +422,12 @@ The main architectural choices and the reasons behind them. Each links to where 
   — Claude's 2026-10-28 health review; Rob's go-ahead that day, built in [#13](https://github.com/robcam55/metaculus-bot/pull/13).
 - **Rob's key also when the credits' balance can't be read, or there's no OpenRouter key.** Once the credits ran out (2026-10-25), an unreadable balance sent a run back onto them, uncapped, where every question would fail. Paying with Rob's key for that run costs at most one run's questions while credits remain. Without any OpenRouter key, FutureEval and MiniBench used to fall through to the Metaculus Cup's unpaced Sonnet 5 × 5, ignoring `BUDGET_TIER=pause`.
 - **Prompt and research rules from the leading bots (2026-10-30).** Rob asked for every avenue that might add a few points, ready to back out if it doesn't help. Two research workflows read Metaculus's analyses and nine open-source bots, then put each candidate past two skeptics, one on the evidence and one on the code. Five changes survived, all small and cheap:
-  - **What the bot's own record showed.** Its 61 scored questions (one MiniBench round, made by the older setup) scored +1.0 a question on yes/no, against +9 to +18 on discrete and multiple choice. Status-on-a-date questions averaged about −1. Four of the five worst yes/no misses were Yes outcomes forecast at 13-42%. The binary forecasts averaged 36% against 41% resolved Yes, so no Yes lean showed for the one-sided step to correct.
+  - **What the bot's own record showed.** Its 61 scored questions (mostly one MiniBench round, made by the older setup) scored +2.3 a question on yes/no (+1.0 on MiniBench's 35), against +9 to +18 on discrete and multiple choice. Status-on-a-date questions averaged about −1. Four of the five worst yes/no misses were Yes outcomes forecast at 13-42%. The binary forecasts averaged 36% against 41% resolved Yes, so no Yes lean showed for the one-sided step to correct.
   - **Yes/no rules.** The criteria restatement, the trajectory question and the soft clock come from nostreambot (10th in Spring 2026, about +12.7 a question in Summer 2026). Its 815-record audit, on its older models, found announced-target questions forecast at 44% for events that happened 8% of the time, about 19 points worse; the other rules each come from a single named miss. The market rule follows the Spring 2026 survey (checking markets r=+0.34, correlational) with nostreambot's caution that thin or stale prices don't anchor. Honest expectation: 0 to +0.5 a question, about $0.02-0.05 more.
-  - **Numeric width and price floor.** The bot's 9 resolved numeric ranges all held the outcome inside their 10th to 90th percentiles (nominally 80%), and nostreambot found its non-financial ranges 22% too wide; its blanket widening moved calibration the wrong way in every segment it measured. So width now follows forecastability. The one place ranges ran too narrow was a traded price (XTND, −57.6, the worst question), hence the random-walk floor for prices only.
+  - **Numeric width and price floor.** The evidence on width is thin: the bot's 9 resolved forecaster ranges (3 questions, one model) all held the outcome inside their 10th to 90th percentiles, which a calibrated forecaster would manage about half the time on so few. nostreambot found its non-financial ranges 22% too wide, and its blanket widening moved calibration the wrong way in every segment it measured. So width now follows forecastability, with room for revised reports. The one place ranges ran too narrow was a traded price (XTND, −57.6, the worst question), hence the random-walk floor for prices only. It is defined on the standard deviation of daily moves: a median or average move runs 20-50% smaller for fat-tailed prices and would make the floor that much too narrow.
   - **Research.** Spring 2026's winner read its resolution links; several losses here turned on a source's state (a grid connection, a tide gauge). Web fetch lets the researcher open them. The searched base rate and the venue-by-venue market lines replace a base rate from memory and discourage invented market numbers. About $0.04-0.10 a question more.
   - **Measurement.** Per-question peer scores can't tell +3 from +6 this season (about 700 questions a setup would be needed). The model tags make paired, member-by-member comparisons possible once a second model family is added, and the kinds table shows where points go. bot-review moves to 0.1.2, which reads Metaculus's archived comments in full; with 0.1.1 the members of only 13 of 61 questions survived, likely for that reason.
-  - **Backing out.** `RESEARCH_WEB_FETCH=false` stops the page fetches. The prompt rules revert with this change's commit. Judge them by the kinds table and the binary calibration table, not by rank.
+  - **Judging and backing out.** Judge the rules by the scorecard's "since 2026-10-30" rows (by setup, binary calibration by setup, kinds), against the "before" rows, not by rank, and only once a few dozen new questions have resolved. Width in particular: under about 75% of outcomes inside the 10th to 90th percentile over 20 or more new numeric questions means putting a widening line back. `RESEARCH_WEB_FETCH=false` stops the page fetches. To drop the prompt rules alone, revert the prompt text in main.py (the binary, multiple-choice, numeric and date prompts, the research brief's added lines, `WIDTH_RULE` and `DAILY_VOLATILITY`) by hand: reverting the whole change would also remove the scorecard tables and the model tags, and move bot-review back to 0.1.1.
 
   — Claude's 2026-10-30 research into the leading bots; Rob's go-ahead that day in chat ("Let's move forward with these changes ... If they don't seem to meaningfully enhance prediction accuracy, we can back down").
 - **New Claude models flagged daily, never switched to automatically (`model_watch.py`).** Rob asked on 2026-10-28 to evaluate each new Claude release so the bot doesn't fall behind, by auto-update or at least a notice. A notice was chosen over an automatic switch for four reasons. Anthropic's model ids are fixed versions with no "latest" alias. Haiku 5.5 and Sonnet 5.5 each rejected a setting the bot sent, which would have failed every question until fixed. A new tier can cost far more (Fable 5.1 is 2.5 times Opus 5.5). And litellm must know a new model's price before the spend figures work. The check lists models through Anthropic's Models API, which costs nothing, and opens one issue per model released after 2026-10-28. The Test Bot's trial inputs let a new model be tried on bot-testing-area questions, which the rules allow, before a switch. Quality isn't judged by backtests, because a newer model may have seen the outcomes in training. In [#13](https://github.com/robcam55/metaculus-bot/pull/13).
