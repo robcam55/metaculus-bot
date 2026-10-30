@@ -5,13 +5,22 @@ A leaderboard rank after a few resolved questions is mostly noise: at 2 question
 range for a bot's true rank among 253 is about 14th to 200th. What the bot's own resolved
 forecasts can show earlier is bias:
 - Mean spot peer score per question, with its standard error, by tournament and type.
-- Binary: the mean forecast against the share that resolved Yes, and by bin. This tests
-  the binary prompt's "language models over-predict Yes" step before anyone tunes it.
+- Binary: the mean forecast against the share that resolved Yes, and by bin. This shows
+  any lean either way; the binary prompt checks its number in both directions.
 - Numeric and discrete: how often the outcome fell below each forecaster's 10th
   percentile, between the 10th and 90th, or above the 90th; nominally 10/80/10. Fewer
   than 80% inside means the ranges run too narrow.
 - Multiple choice: the mean probability given to the option that won, and how often it
   was the forecast's favourite.
+- By kind of question, from the title: prices and markets, status on a date, sports and
+  so on, to show where the points are won and lost. Descriptive only: at a dozen
+  questions a kind, a gap under about 12 points is noise.
+- The aggregate against its own members, and each model against the most common one on
+  the questions both forecast, in log score (100 x ln of the probability given to what
+  happened, the peer score's units). Paired on the same questions, these have far less
+  noise than comparing peer scores between two setups. The model comes from the
+  "Model:" line main.py adds to each forecaster's line in the posted summary; older
+  comments have none and count only in the aggregate's row.
 Read-only, standard library only: `python scorecard.py review.json`.
 """
 
@@ -30,6 +39,32 @@ BINS = ((0.0, 0.1), (0.1, 0.3), (0.3, 0.5), (0.5, 0.7), (0.7, 0.9), (0.9, 1.0001
 _PERCENTILE = re.compile(r"([\d.]+)% chance of value below (-?\d+(?:\.\d*)?(?:[eE][+-]?\d+)?)")
 # How Metaculus resolves an open-bound question whose outcome fell beyond its range
 _BEYOND = {"above_upper_bound": math.inf, "below_lower_bound": -math.inf}
+# The forecaster's model, on the last line of its summary entry (main.py, MODEL_LINE)
+_MODEL = re.compile(r"^Model: (\S+)\s*$", re.MULTILINE)
+_BINARY_PROBABILITY = re.compile(r"([\d.]+)%")
+_OPTION = re.compile(r"^- (.+): ([\d.]+)%\s*$", re.MULTILINE)
+# Kinds of question, by title; the first that matches wins. Status applies to yes/no
+# questions only, and counts of official reports to numeric ones
+SPORTS = re.compile(
+    r"\b(nfl|nba|mlb|nhl|bundesliga|premier league|la liga|serie a|ligue 1|champions league"
+    r"|alcs|nlcs|world series|super bowl|grand prix|formula 1|matchday|night football"
+    r"|touchdowns?|passing yards|game|match|fixture|series score)\b",
+    re.IGNORECASE,
+)
+MARKETS = re.compile(
+    r"\b(price|prices|close|closes|closing|settle|settles|settlement|futures|stock|shares"
+    r"|etfs?|index|bitcoin|btc|ethereum|crypto\w*|zcash|zec|s&p|nasdaq|dow|bist|brent|wti"
+    r"|gold|wheat|yield|exchange rate|market cap\w*|inflows?)\b",
+    re.IGNORECASE,
+)
+STATUS = re.compile(
+    r"\bas of\b|\bstill\b|\bin effect\b|\bremain\b|\bhave (been )?(filed|announced|published"
+    r"|released|declared|resumed|reported|confirmed|launched|signed)\b"
+    r"|\bbe (held|connected|suspended|in place)\b",
+    re.IGNORECASE,
+)
+REPORTED = re.compile(r"\breport\w*\b", re.IGNORECASE)
+LOG_FLOOR = 0.001  # a probability below this scores as this, so one bad parse can't dominate
 
 
 def _mean_se(values: list[float]) -> str:
@@ -165,6 +200,120 @@ def multiple_choice(questions: list[dict]) -> list[str]:
     ]
 
 
+def kind(q: dict) -> str:
+    """The kind of question, from its title."""
+    title = q.get("title") or ""
+    if re.search(r"google trends", title, re.IGNORECASE):
+        return "Google Trends"
+    if re.search(r"community prediction", title, re.IGNORECASE):
+        return "Community prediction"
+    if SPORTS.search(title):
+        return "Sports"
+    binary = q.get("question_type") == "binary"
+    if binary and STATUS.search(title):
+        return "Status on a date"
+    if MARKETS.search(title):
+        return "Prices and markets"
+    if not binary and q.get("question_type") != "multiple_choice" and REPORTED.search(title):
+        return "Reported counts"
+    return "Other"
+
+
+def kinds(questions: list[dict]) -> list[str]:
+    groups: dict[str, list[float]] = defaultdict(list)
+    for q in _scored(questions):
+        groups[kind(q)].append(q["scores"]["spot_peer_score"])
+    if not groups:
+        return ["No scored questions yet."]
+    lines = ["| Kind of question | Scored | Mean spot peer ± SE |", "|---|---|---|"]
+    for name, scores in sorted(groups.items(), key=lambda item: -len(item[1])):
+        lines.append(f"| {name} | {len(scores)} | {_mean_se(scores)} |")
+    return lines
+
+
+def _members(q: dict) -> list[tuple[str, str]]:
+    """(model, prediction text) for each forecaster of the scored run; "untagged" for
+    comments from before main.py named the model."""
+    members = []
+    for text in _forecasters(q):
+        found = _MODEL.search(text)
+        members.append((found.group(1) if found else "untagged", _MODEL.sub("", text).strip()))
+    return members
+
+
+def _points(probability: float) -> float:
+    return 100 * math.log(max(probability, LOG_FLOOR))
+
+
+def _member_points(q: dict, text: str) -> float | None:
+    """100 x ln of the probability this forecaster gave the outcome; None if unreadable."""
+    resolution = q.get("resolution")
+    if q.get("question_type") == "binary" and resolution in ("yes", "no"):
+        found = _BINARY_PROBABILITY.search(text)
+        if not found:
+            return None
+        p = float(found.group(1)) / 100
+        return _points(p if resolution == "yes" else 1 - p)
+    if q.get("question_type") == "multiple_choice":
+        options = {name.strip(): float(value) / 100 for name, value in _OPTION.findall(text)}
+        if resolution in options:
+            return _points(options[resolution])
+    return None
+
+
+def _aggregate_points(q: dict) -> float | None:
+    forecast = q.get("forecast") or {}
+    resolution = q.get("resolution")
+    if q.get("question_type") == "binary" and resolution in ("yes", "no"):
+        p = forecast.get("probability_yes")
+        return None if p is None else _points(p if resolution == "yes" else 1 - p)
+    probabilities = forecast.get("probabilities") or {}
+    if q.get("question_type") == "multiple_choice" and resolution in probabilities:
+        return _points(probabilities[resolution])
+    return None
+
+
+def members(questions: list[dict]) -> list[str]:
+    """Yes/no and multiple choice: the posted aggregate against the average of its own
+    members, and each model against the most common one on shared questions."""
+    gains: list[float] = []
+    by_model: dict[str, dict[int, list[float]]] = defaultdict(dict)
+    for i, q in enumerate(questions):
+        scored = [(model, _member_points(q, text)) for model, text in _members(q)]
+        scored = [(model, points) for model, points in scored if points is not None]
+        if not scored:
+            continue
+        aggregate = _aggregate_points(q)
+        if aggregate is not None and len(scored) >= 2:
+            gains.append(aggregate - statistics.mean(points for _, points in scored))
+        for model, points in scored:
+            by_model[model].setdefault(i, []).append(points)
+    if not gains and not by_model:
+        return ["No resolved yes/no or multiple-choice forecasts with their members yet."]
+    lines = [
+        "| Comparison (log score, 100 x ln) | Questions | Mean difference ± SE |",
+        "|---|---|---|",
+    ]
+    if gains:
+        lines.append(f"| Aggregate − average member | {len(gains)} | {_mean_se(gains)} |")
+    tagged = {m: qs for m, qs in by_model.items() if m != "untagged"}
+    if len(tagged) >= 2:
+        reference = max(tagged, key=lambda m: len(tagged[m]))
+        for model, per_question in sorted(tagged.items()):
+            if model == reference:
+                continue
+            shared = sorted(set(per_question) & set(tagged[reference]))
+            diffs = [
+                statistics.mean(per_question[i]) - statistics.mean(tagged[reference][i])
+                for i in shared
+            ]
+            if diffs:
+                lines.append(f"| {model} − {reference} | {len(diffs)} | {_mean_se(diffs)} |")
+    elif tagged:
+        lines.append(f"| One model so far ({', '.join(sorted(tagged))}) | – | – |")
+    return lines
+
+
 def scorecard(review: dict[str, Any]) -> list[str]:
     questions = review.get("questions") or []
     return [
@@ -186,6 +335,14 @@ def scorecard(review: dict[str, Any]) -> list[str]:
         "**Multiple choice**",
         "",
         *multiple_choice(questions),
+        "",
+        "**By kind of question** (descriptive; at a dozen questions a kind, gaps under about 12 points are noise)",
+        "",
+        *kinds(questions),
+        "",
+        "**Members and models** (paired on the same questions; positive means the first did better)",
+        "",
+        *members(questions),
     ]
 
 

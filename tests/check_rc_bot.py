@@ -13,6 +13,8 @@ import asyncio
 import logging
 import math
 import os
+import re
+import statistics
 import sys
 import tempfile
 import types
@@ -40,6 +42,7 @@ KEYS = (
     "FORECASTER_TIMEOUT_S",
     "PARSER_MODEL",
     "SEARCH_MODEL",
+    "RESEARCH_WEB_FETCH",
     "TRIAL_FORECASTER_MODEL",
     "TRIAL_RESEARCHER_MODEL",
     "TRIAL_PARSER_MODEL",
@@ -81,10 +84,13 @@ with env():
     import main  # noqa: E402  (import after clearing keys: dotenv must not leak real ones)
     import spend  # noqa: E402
     from forecasting_tools import (  # noqa: E402
+        BinaryPrediction,
         BinaryQuestion,
         GeneralLlm,
         MultipleChoiceQuestion,
         NumericQuestion,
+        PredictedOptionList,
+        ReasonedPrediction,
     )
 
 # Generation look-ups the offline run loop attempted (it must attempt none: every fake
@@ -166,16 +172,24 @@ def check_routing() -> None:
         assert d["parser"].litellm_kwargs["output_config"] == {"effort": "low"}
         assert d["parser"].litellm_kwargs["max_tokens"] == main.ANTHROPIC_PARSER_MAX_TOKENS
         assert d["summarizer"] is d["parser"]
-        # no AskNews: Sonnet 5 with Anthropic's own web search is the one source
-        assert main.source_name(d["researcher"]) == "anthropic/claude-sonnet-5-5 + web search"
+        # no AskNews: Sonnet 5.5 with Anthropic's own web search and fetch is the one source
+        assert main.source_name(d["researcher"]) == "anthropic/claude-sonnet-5-5 + web search and fetch"
         assert isinstance(d["researcher"], main.AnthropicSearchLlm), d["researcher"]
-        # the dynamic-filtering tool, passed as a tool: web_search_options would send the
+        # the dynamic-filtering tools, passed as tools: web_search_options would send the
         # older web_search_20250305
-        assert d["researcher"].litellm_kwargs["tools"] == [main.ANTHROPIC_SEARCH_TOOL]
+        assert d["researcher"].litellm_kwargs["tools"] == [main.ANTHROPIC_SEARCH_TOOL, main.ANTHROPIC_FETCH_TOOL]
         assert d["researcher"].litellm_kwargs["tools"][0]["type"] == "web_search_20260209"
+        assert main.ANTHROPIC_FETCH_TOOL["type"] == "web_fetch_20260209"
+        # four searches and two fetches stay under the server's 10-round tool loop
+        assert main.ANTHROPIC_SEARCH_TOOL["max_uses"] + main.ANTHROPIC_FETCH_TOOL["max_uses"] <= 6
         assert "web_search_options" not in d["researcher"].litellm_kwargs
         assert d["researcher"].litellm_kwargs["max_tokens"] == main.ANTHROPIC_MAX_TOKENS
         assert d["researcher_2"] is None
+    # RESEARCH_WEB_FETCH=false: search only, without a code change
+    with env(ANTHROPIC_API_KEY="x", RESEARCH_WEB_FETCH="false"):
+        d = main.build_llms("anthropic")
+        assert d["researcher"].litellm_kwargs["tools"] == [main.ANTHROPIC_SEARCH_TOOL]
+        assert main.source_name(d["researcher"]) == "anthropic/claude-sonnet-5-5 + web search"
 
     with env(OPENROUTER_API_KEY="x", ASKNEWS_CLIENT_ID="x", ASKNEWS_SECRET="y"):
         d = main.RcForecastBot._llm_config_defaults()
@@ -222,7 +236,7 @@ def check_routing() -> None:
         assert model_of(d["default"]) == "anthropic/claude-sonnet-5-5"
         assert model_of(d["parser"]) == "anthropic/claude-haiku-5-5"
         assert d["researcher"] == main.ASKNEWS_RESEARCHER
-        assert main.source_name(d["researcher_2"]) == "anthropic/claude-sonnet-5-5 + web search"
+        assert main.source_name(d["researcher_2"]) == "anthropic/claude-sonnet-5-5 + web search and fetch"
         # the OpenRouter route sends no reply cap and no search tool (:online searches)
         d = main.build_llms("openrouter")
         assert "max_tokens" not in d["default"].litellm_kwargs
@@ -742,7 +756,7 @@ def check_own_key() -> None:
     assert "Metaculus's credits: $1.50 left. Spent on your key this run: $0.75." in summary
     assert "(Metaculus's credits are under the $2 floor)" in summary, summary
     assert "| FutureEval | opus-3 | 2 | 0 | $0.50 | $0.25 |" in summary, summary
-    assert "- Research sources: anthropic/claude-sonnet-5-5 + web search." in summary, summary
+    assert "- Research sources: anthropic/claude-sonnet-5-5 + web search and fetch." in summary, summary
     assert LAST["alerts"] == ["Metaculus's credits ran out (of the $100 limit)"], LAST
     assert "- Opened an issue to tell Rob about the credits." in summary, summary
 
@@ -1166,6 +1180,64 @@ def check_model_watch() -> None:
     print("model watch: ok")
 
 
+def check_model_tags() -> None:
+    """Each forecast names its model in its reasoning and on its line of the posted
+    summary, in a form bot-review keeps and scorecard.py reads."""
+    import scorecard
+    from forecasting_tools.data_models.binary_report import BinaryReport
+    from forecasting_tools.data_models.multiple_choice_report import MultipleChoiceReport
+    from forecasting_tools.data_models.forecast_report import ResearchWithPredictions
+
+    opus = "anthropic/claude-opus-5-5"
+    tagged = main.with_model(opus, "Step (a)...\nProbability: 34%")
+    assert tagged.startswith(f"Model: {opus}\n\n") and main.model_of_reasoning(tagged) == opus
+    assert main.model_of_reasoning("Step (a)... Model: x") is None
+
+    with env(ANTHROPIC_API_KEY="x"):
+        bot = main.RcForecastBot(publish_reports_to_metaculus=False)
+    bot.get_llm = lambda name, kind="llm": FakeLlm("Probability: 34%", model=opus)  # type: ignore[method-assign]
+
+    async def fake_parse(*args, **kwargs):
+        return BinaryPrediction(prediction_in_decimal=0.34)
+
+    real_parse = main.parse
+    try:
+        main.parse = fake_parse
+        got = asyncio.run(bot._binary_prompt_to_forecast(binary_question(), "prompt"))
+    finally:
+        main.parse = real_parse
+    assert main.model_of_reasoning(got.reasoning) == opus, got.reasoning
+
+    # the summary: bot-review 0.1.2's own pattern still finds every forecaster, and the
+    # text it keeps for each carries the model
+    forecaster_pattern = re.compile(r"^\*Forecaster (\d+)(?: \([^)]*\))?\*:", re.MULTILINE)
+    collection = ResearchWithPredictions(
+        research_report="r", summary_report="s",
+        predictions=[got, ReasonedPrediction(prediction_value=0.5, reasoning="untagged")],
+    )  # fmt: skip
+    summary = main.RcForecastBot._format_and_expand_research_summary(1, BinaryReport, collection)
+    marks = list(forecaster_pattern.finditer(summary))
+    assert [m.group(1) for m in marks] == ["1", "2"], summary
+    first = summary[marks[0].end() : marks[1].start()].strip()
+    assert first == f"34.0%\nModel: {opus}", first
+    assert scorecard._MODEL.search(first).group(1) == opus
+    assert "Model:" not in summary[marks[1].end() :].split("###")[0], summary
+    assert "## Report 1 Summary" in summary and "### Research Summary" in summary, summary
+    # multiple choice: the option lines stay parseable above the model line
+    options = PredictedOptionList(predicted_options=[
+        {"option_name": "a", "probability": 0.7}, {"option_name": "b", "probability": 0.3}])  # fmt: skip
+    mc_collection = ResearchWithPredictions(
+        research_report="r", summary_report="s",
+        predictions=[ReasonedPrediction(prediction_value=options, reasoning=main.with_model(opus, "x"))],
+    )  # fmt: skip
+    mc_summary = main.RcForecastBot._format_and_expand_research_summary(1, MultipleChoiceReport, mc_collection)  # fmt: skip
+    body = mc_summary[forecaster_pattern.search(mc_summary).end() :].split("###")[0].strip()
+    q = {"question_type": "multiple_choice", "resolution": "b"}
+    assert scorecard._MODEL.search(body).group(1) == opus, body
+    assert abs(scorecard._member_points(q, scorecard._MODEL.sub("", body)) - 100 * math.log(0.3)) < 1e-9, body
+    print("model tags: ok")
+
+
 def check_scorecard() -> None:
     """scorecard.py over a review.json shaped like bot-review's."""
     import scorecard
@@ -1213,6 +1285,55 @@ def check_scorecard() -> None:
     assert "1 forecaster ranges: outcome below the 10th percentile 0%, between the 10th and 90th 0%, above the 90th 100%" in text, text
     empty = "\n".join(scorecard.scorecard({"questions": []}))
     assert "No resolved binary forecasts yet." in empty, empty
+    assert "No scored questions yet." in empty and "No resolved yes/no or multiple-choice forecasts with their members yet." in empty, empty  # fmt: skip
+
+    # kinds of question, by title (first match wins; status only for yes/no)
+    def titled(title, kind="binary"):
+        return {"title": title, "question_type": kind}
+    for title, kind, expected in (
+        ("Will the Seahawks beat the Broncos on Thursday Night Football?", "binary", "Sports"),
+        ("Will Delta Air Lines (DAL) stock close above $85.00 on October 15?", "binary", "Prices and markets"),
+        ("Will the U.S. naval blockade of Iran's crude oil exports still be in effect on October 15?", "binary", "Status on a date"),
+        ("Will Zaporizhzhia be connected to offsite grid power on October 17?", "binary", "Status on a date"),
+        ("What will U.S. spot Bitcoin ETFs' cumulative net inflow be as of October 15?", "numeric", "Prices and markets"),
+        ("How many measles cases will Peru's CDC report as of mid-October?", "numeric", "Reported counts"),
+        ("What will the Google Trends score for 'flu' be?", "numeric", "Google Trends"),
+        ("Will the FAA type-certify the Boeing 737 MAX 10 before 2027?", "binary", "Other"),
+    ):  # fmt: skip
+        assert scorecard.kind(titled(title, kind)) == expected, (title, scorecard.kind(titled(title, kind)))
+
+    # members and models, from the "Model:" line main.py adds to each forecaster's entry;
+    # the aggregate against the average member; each model against the most common one
+    def tagged(p, model):
+        return {"prediction": f"{p}%\nModel: {model}"}
+    opus, gpt = "anthropic/claude-opus-5-5", "openrouter/openai/gpt-6.1-sol"
+    q1 = {**binary(0.7, "yes", 4.0), "traces": [{"forecasters": [tagged(60.0, opus), tagged(70.0, opus), tagged(80.0, gpt)]}]}  # fmt: skip
+    q2 = {**binary(0.2, "no", 2.0), "traces": [{"forecasters": [tagged(10.0, opus), tagged(30.0, opus), tagged(20.0, gpt)]}]}  # fmt: skip
+    old = {**binary(0.5, "yes", 0.0), "traces": [{"forecasters": [{"prediction": "40.0%"}, {"prediction": "60.0%"}]}]}  # fmt: skip
+    mc_members = {**mc, "traces": [{"forecasters": [
+        {"prediction": "- a: 50.0%\n- b: 50.0%\nModel: " + opus},
+        {"prediction": "- a: 70.0%\n- b: 30.0%\nModel: " + gpt},
+    ]}]}  # fmt: skip
+    lines = scorecard.members([q1, q2, old, mc_members])
+    text = "\n".join(lines)
+    ln = math.log
+    gains = [
+        100 * ln(0.7) - statistics.mean(100 * ln(x) for x in (0.6, 0.7, 0.8)),
+        100 * ln(0.8) - statistics.mean(100 * ln(x) for x in (0.9, 0.7, 0.8)),
+        100 * ln(0.5) - statistics.mean(100 * ln(x) for x in (0.4, 0.6)),
+        100 * ln(0.4) - statistics.mean(100 * ln(x) for x in (0.5, 0.3)),
+    ]
+    assert f"| Aggregate − average member | 4 | {scorecard._mean_se(gains)} |" in text, (text, gains)
+    diffs = [
+        100 * ln(0.8) - statistics.mean(100 * ln(x) for x in (0.6, 0.7)),
+        100 * ln(0.8) - statistics.mean(100 * ln(x) for x in (0.9, 0.7)),
+        100 * ln(0.3) - 100 * ln(0.5),
+    ]
+    assert f"| {gpt} − {opus} | 3 | {scorecard._mean_se(diffs)} |" in text, (text, diffs)
+    # one family so far: said so, no comparison row
+    assert "One model so far (anthropic/claude-opus-5-5)" in "\n".join(
+        scorecard.members([{**q1, "traces": [{"forecasters": [tagged(60.0, opus), tagged(70.0, opus)]}]}])
+    )
     print("scorecard: ok")
 
 
@@ -1242,8 +1363,9 @@ def check_aggregation() -> None:
 class FakeLlm:
     """A forecaster whose reply is fixed, for the prompt-to-forecast methods."""
 
-    def __init__(self, reply: str = "Reasoning...") -> None:
+    def __init__(self, reply: str = "Reasoning...", model: str = "fake/forecaster") -> None:
         self.reply = reply
+        self.model = model
 
     async def invoke(self, prompt, system_prompt=None):
         return self.reply
@@ -1419,7 +1541,14 @@ def check_own_key_research() -> None:
             with spend.collecting() as ledger:
                 text = asyncio.run(llm.invoke("Research this question."))
             body = sent[0]["body"]
-            assert body["tools"] == [{"type": "web_search_20260209", "name": "web_search", "max_uses": 5}], body["tools"]  # fmt: skip
+            assert body["tools"] == [
+                {"type": "web_search_20260209", "name": "web_search", "max_uses": 4},
+                {"type": "web_fetch_20260209", "name": "web_fetch", "max_uses": 2,
+                 "max_content_tokens": 8000, "citations": {"enabled": True}},
+            ], body["tools"]  # fmt: skip
+            # litellm 1.80.10 names the fetch beta in place of any other; the Test Bot
+            # confirms Anthropic accepts it (RESEARCH_WEB_FETCH=false turns fetch off)
+            assert sent[0]["headers"].get("anthropic-beta") == "web-fetch-2025-09-10", sent[0]["headers"]
             assert body["messages"] == [{"role": "user", "content": [
                 {"type": "text", "text": "Research this question.", "cache_control": {"type": "ephemeral"}}]}], body["messages"]  # fmt: skip
             assert "temperature" not in body and "thinking" not in body, body
@@ -1583,7 +1712,7 @@ def check_prompts() -> None:
         assert expected in research_prompt, (expected, research_prompt)
     assert "None given." in bot._research_prompt(bare)  # no background: no "None"
     # the source the criteria name, and forecasts elsewhere; the outcome by question type
-    for expected in ("give its latest value or status", "Polymarket, Kalshi, Manifold", "whether the question would resolve Yes or No"):  # fmt: skip
+    for expected in ("Give its latest value or status", "Polymarket, Kalshi, Manifold", "whether the question would resolve Yes or No"):  # fmt: skip
         assert expected in research_prompt, (expected, research_prompt)
     mc_prompt = bot._research_prompt(timed_question("mc"))
     assert "which option the question would resolve to" in mc_prompt, mc_prompt
@@ -1613,6 +1742,39 @@ def check_prompts() -> None:
         assert f"Today is {today}" in prompt, (kind, prompt)
         assert "scheduled to resolve 2026-12-31 23:59 UTC" in prompt, (kind, prompt)
         assert "Forecasting on this question closes" in prompt, (kind, prompt)
+    # yes/no: restate the criteria, trajectory, soft clock, price thresholds, markets, and a
+    # check both ways in place of the one-sided "over-predict Yes" step
+    for expected in (
+        "(a) The question: in one sentence, what exactly must happen",
+        "1 - (1 - yearly rate)^(days left / 365)",
+        "a process already under way reaching its scheduled end",
+        "An announced target date shows a plan exists, not that it will be met",
+        "A search that finds nothing is not evidence",
+        "roughly twice as likely as being past it on the final day",
+        "A thin or stale market is weak evidence",
+        "Would a Yes surprise you at this probability? Would a No?",
+        "(h) Reconcile these into one probability",
+    ):
+        assert expected in prompts["binary"], (expected, prompts["binary"])
+    assert "over-predict" not in prompts["binary"], prompts["binary"]
+    assert "if the favourite fails, the most likely way it happens" in prompts["mc"], prompts["mc"]
+    assert "a thin or stale market is weak evidence" in prompts["mc"], prompts["mc"]
+    # numeric and date: width by forecastability, not "set wide intervals"; traded prices
+    # keep a random-walk floor
+    for kind in ("numeric", "date"):
+        assert main.WIDTH_RULE in prompts[kind], (kind, prompts[kind])
+        assert "humble" not in prompts[kind] and "wide 90/10" not in prompts[kind], prompts[kind]
+    assert "1.3 x the typical daily move x the square root of the trading days left" in prompts["numeric"]
+    assert "typical daily move" not in prompts["date"], prompts["date"]
+    # research: open the named source, a searched base rate, a series' move, each venue
+    for expected in (
+        "open it first if you can",
+        "as a count with its period",
+        "its typical daily move recently",
+        'For each of Polymarket, Kalshi, Manifold and Metaculus',
+        'or write "not found"',
+    ):
+        assert expected in research_prompt, (expected, research_prompt)
     print("prompts: ok")
 
 
@@ -2258,6 +2420,7 @@ if __name__ == "__main__":
     check_alerts()
     check_watchdog()
     check_model_watch()
+    check_model_tags()
     check_scorecard()
     check_aggregation()
     check_guards()

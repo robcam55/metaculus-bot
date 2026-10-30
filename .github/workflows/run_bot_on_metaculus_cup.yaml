@@ -52,6 +52,7 @@ jobs:
           METACULUS_CUP_ID: ${{ vars.METACULUS_CUP_ID }}
           FORECASTER_MODEL: ${{ vars.FORECASTER_MODEL }}
           FORECASTER_EFFORT: ${{ vars.FORECASTER_EFFORT }}
+          RESEARCH_WEB_FETCH: ${{ vars.RESEARCH_WEB_FETCH }}
           PARSER_MODEL: ${{ vars.PARSER_MODEL }}
           ASKNEWS_STRATEGY: ${{ vars.ASKNEWS_STRATEGY }}
           ASKNEWS_ARTICLES: ${{ vars.ASKNEWS_ARTICLES }}

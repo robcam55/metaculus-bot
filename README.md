@@ -93,11 +93,18 @@ The changes are in `main.py` (`RcForecastBot`), `budget.py`, `spend.py`, `alerts
   - A search-backed model: Sonnet 5.5 with OpenRouter's `:online` (Anthropic's own web search,
     which Metaculus's credits cover). On your own key, Sonnet 5.5 calls Anthropic's web
     search tool directly (`web_search_20260209`, which filters results before they enter
-    the context), up to five searches a question, with each round of results cached for
-    the next search and its sources kept. Or Perplexity, with its own key. Its prompt
-    carries the question's background, and asks for the latest value of the source the
-    resolution criteria name and for published forecasts on the question or close ones
-    (prediction markets, Metaculus), which the tournament's rules allow.
+    the context), up to four searches a question, with each round of results cached for
+    the next search and its sources kept. It can also open two pages a question with
+    Anthropic's web fetch tool (`web_fetch_20260209`, up to 8,000 tokens a page;
+    `RESEARCH_WEB_FETCH=false` turns it off). Or Perplexity, with its own key. Its prompt
+    carries the question's background, and asks for:
+    - the source the resolution criteria name, opened first where it can be: its latest
+      value or status, any schedule or prediction it publishes for the period, and whether
+      the outcome already looks settled;
+    - a searched base rate, as a count with its period;
+    - for a price or data series, its latest value and typical daily move;
+    - for each of Polymarket, Kalshi, Manifold and Metaculus, a forecast on the question
+      or a close one, or "not found" (the tournament's rules allow published forecasts).
 
   Every prompt, the search-backed model's and the forecasters', carries today's date and
   the question's close and resolution times.
@@ -136,9 +143,23 @@ The changes are in `main.py` (`RcForecastBot`), `budget.py`, `spend.py`, `alerts
   the run until its timeout (bounded now, as in 0.3.5); a confident multiple-choice answer
   with several 0% options, or a sum a little off 100%, failed on every retry (parsed
   leniently now, each option floored at 1%).
-- **An outside-view-first binary prompt.** It asks for a reference class and base rate,
-  weights the status quo, and checks explicitly against language models' lean toward
-  "Yes".
+- **Forecast prompts with specific rules.**
+  - Yes/no: restate exactly what must happen, by when and per which source; an outside
+    view, with a yearly rate scaled to the days left; the status quo read from the named
+    source, and whether it means nothing changes or a process reaching its scheduled end;
+    announced target dates as plans, not promises; a search that finds nothing as no
+    evidence; price thresholds read off a distribution of where the price will be
+    (touching a level any time before the deadline is about twice as likely as being past
+    it on the day); a liquid, closely matched market as strong evidence; and a check of
+    the number in both directions, in place of the old one-sided "models over-predict
+    Yes" step.
+  - Multiple choice: how often the favourite actually wins, how it would fail, and the
+    same market rule.
+  - Numeric and date: the range's width set by how forecastable the quantity is, in
+    place of the template's "set wide intervals"; for traded prices, a floor of about
+    1.3 x the typical daily move x the square root of the trading days left on each side.
+  - Each forecast's reasoning and its line in the posted summary name the model that made
+    it, for the scorecard's per-model tables.
 - **Operational changes.**
   - The Fall 2026 tournament ids are built in, because the pinned `forecasting-tools`
     still points at Summer. `AIB_TOURNAMENT_ID`, `MINIBENCH_ID` and `METACULUS_CUP_ID`
@@ -160,8 +181,11 @@ The changes are in `main.py` (`RcForecastBot`), `budget.py`, `spend.py`, `alerts
     model on bot-testing-area questions without a code change (Setup, step 10).
 - **A calibration scorecard in the weekly review (`scorecard.py`).** Mean spot peer score
   per question with its standard error, by tournament and type; binary calibration;
-  where numeric outcomes fell against the forecasters' 10th and 90th percentiles; and the
-  probability given to the winning option on multiple choice.
+  where numeric outcomes fell against the forecasters' 10th and 90th percentiles; the
+  probability given to the winning option on multiple choice; mean spot peer by kind of
+  question (prices and markets, status on a date, sports, reported counts, other, from the
+  title); and, paired on the same questions, the aggregate against its own members and
+  each model against the most common one.
 
 Offline checks (no keys): `python tests/check_rc_bot.py`. They also run on every pull
 request and push to `main`, on the packages `poetry.lock` pins, which the forecasting runs
@@ -265,7 +289,7 @@ newer local litellm once hid a call that crashes on the pinned one.
    4. Test it: `Actions → Test Bot → Run workflow` with "Who pays" set to `own-key`. It
       forecasts three bot-testing-area questions on your key, for about $2. The run
       page's "Your Anthropic key" section shows the spend, and the research table should
-      show `anthropic/claude-sonnet-5-5 + web search` working. The log's `Spend:` lines show
+      show `anthropic/claude-sonnet-5-5 + web search and fetch` working. The log's `Spend:` lines show
       the research calls' cache reads.
 
    The Metaculus Cup workflow uses this key too, but only when you run it by hand.
@@ -309,6 +333,7 @@ Other optional repository variables (empty means the default):
 | `PARSER_MODEL` | Claude Haiku 5.5 through the same route. `anthropic/claude-haiku-4-5` brings back the old parser (at temperature 0). |
 | `SEARCH_MODEL` | `openrouter/anthropic/claude-sonnet-5.5:online` (OpenRouter route only) |
 | `FORECASTER_MODEL` | `anthropic/claude-sonnet-5-5` (Metaculus Cup only; on the credits, and on your own key after them, the tier picks) |
+| `RESEARCH_WEB_FETCH` | On (Rob's own key only): research may open two pages a question. `false` turns it off, leaving web search alone. |
 | `FORECASTER_EFFORT` | `high` (Anthropic's own API only). `low` or `medium` sets that level; `default` sends none, which is `medium` on Opus 5.5 and `high` on Sonnet 5.5. |
 | `PREDICTIONS_PER_REPORT` | 5 (Metaculus Cup only) |
 | `ASKNEWS_STRATEGY` | `latest`: one latest-news search per question, covering the past day or two. `archive` searches the AskNews archive (about two months) instead; `both` does both, 12 seconds apart. Archive searches may count as several calls against AskNews's quota: confirm with AskNews first. |
@@ -389,6 +414,15 @@ The main architectural choices and the reasons behind them. Each links to where 
 
   — Claude's 2026-10-28 health review; Rob's go-ahead that day, built in [#13](https://github.com/robcam55/metaculus-bot/pull/13).
 - **Rob's key also when the credits' balance can't be read, or there's no OpenRouter key.** Once the credits ran out (2026-10-25), an unreadable balance sent a run back onto them, uncapped, where every question would fail. Paying with Rob's key for that run costs at most one run's questions while credits remain. Without any OpenRouter key, FutureEval and MiniBench used to fall through to the Metaculus Cup's unpaced Sonnet 5 × 5, ignoring `BUDGET_TIER=pause`.
+- **Prompt and research rules from the leading bots (2026-10-30).** Rob asked for every avenue that might add a few points, ready to back out if it doesn't help. Two research workflows read Metaculus's analyses and nine open-source bots, then put each candidate past two skeptics, one on the evidence and one on the code. Five changes survived, all small and cheap:
+  - **What the bot's own record showed.** Its 61 scored questions (one MiniBench round, made by the older setup) scored +1.0 a question on yes/no, against +9 to +18 on discrete and multiple choice. Status-on-a-date questions averaged about −1. Four of the five worst yes/no misses were Yes outcomes forecast at 13-42%. The binary forecasts averaged 36% against 41% resolved Yes, so no Yes lean showed for the one-sided step to correct.
+  - **Yes/no rules.** The criteria restatement, the trajectory question and the soft clock come from nostreambot (10th in Spring 2026, about +12.7 a question in Summer 2026). Its 815-record audit, on its older models, found announced-target questions forecast at 44% for events that happened 8% of the time, about 19 points worse; the other rules each come from a single named miss. The market rule follows the Spring 2026 survey (checking markets r=+0.34, correlational) with nostreambot's caution that thin or stale prices don't anchor. Honest expectation: 0 to +0.5 a question, about $0.02-0.05 more.
+  - **Numeric width and price floor.** The bot's 9 resolved numeric ranges all held the outcome inside their 10th to 90th percentiles (nominally 80%), and nostreambot found its non-financial ranges 22% too wide; its blanket widening moved calibration the wrong way in every segment it measured. So width now follows forecastability. The one place ranges ran too narrow was a traded price (XTND, −57.6, the worst question), hence the random-walk floor for prices only.
+  - **Research.** Spring 2026's winner read its resolution links; several losses here turned on a source's state (a grid connection, a tide gauge). Web fetch lets the researcher open them. The searched base rate and the venue-by-venue market lines replace a base rate from memory and discourage invented market numbers. About $0.04-0.10 a question more.
+  - **Measurement.** Per-question peer scores can't tell +3 from +6 this season (about 700 questions a setup would be needed). The model tags make paired, member-by-member comparisons possible once a second model family is added, and the kinds table shows where points go. bot-review moves to 0.1.2, which reads Metaculus's archived comments in full; with 0.1.1 the members of only 13 of 61 questions survived, likely for that reason.
+  - **Backing out.** `RESEARCH_WEB_FETCH=false` stops the page fetches. The prompt rules revert with this change's commit. Judge them by the kinds table and the binary calibration table, not by rank.
+
+  — Claude's 2026-10-30 research into the leading bots; Rob's go-ahead that day in chat ("Let's move forward with these changes ... If they don't seem to meaningfully enhance prediction accuracy, we can back down").
 - **New Claude models flagged daily, never switched to automatically (`model_watch.py`).** Rob asked on 2026-10-28 to evaluate each new Claude release so the bot doesn't fall behind, by auto-update or at least a notice. A notice was chosen over an automatic switch for four reasons. Anthropic's model ids are fixed versions with no "latest" alias. Haiku 5.5 and Sonnet 5.5 each rejected a setting the bot sent, which would have failed every question until fixed. A new tier can cost far more (Fable 5.1 is 2.5 times Opus 5.5). And litellm must know a new model's price before the spend figures work. The check lists models through Anthropic's Models API, which costs nothing, and opens one issue per model released after 2026-10-28. The Test Bot's trial inputs let a new model be tried on bot-testing-area questions, which the rules allow, before a switch. Quality isn't judged by backtests, because a newer model may have seen the outcomes in training. In [#13](https://github.com/robcam55/metaculus-bot/pull/13).
 
   — Claude's 2026-10-28 health review; Rob's go-ahead that day, built in [#13](https://github.com/robcam55/metaculus-bot/pull/13).
