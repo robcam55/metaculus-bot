@@ -327,6 +327,36 @@ newer local litellm once hid a call that crashes on the pinned one.
     An issue titled "Claude model no longer offered" means a model the bot runs is gone
     from your key's list and every call to it fails: switch that one first. Anthropic
     also emails deprecation notices to the account well before a model is retired.
+11. **A second model family (optional, on your own OpenRouter key).** Off until you set it
+    up. Metaculus's OpenRouter credits are gone for the season, so this is your money.
+    1. Create an OpenRouter account and key at openrouter.ai, add credit (its balance is
+       the cap), then store the key under its own name. Never put it in
+       `OPENROUTER_API_KEY`: the bot reads that as Metaculus's credits.
+
+       ```bash
+       gh secret set OPENROUTER_OWN_API_KEY --repo robcam55/metaculus-bot
+       ```
+
+    2. Try it: `Actions → Test Bot → Run workflow` with "Who pays" `own-key` and, in
+       "Extra forecasters", for example `openrouter/openai/gpt-6.1-sol:2` (two GPT-6.1 Sol
+       forecasts) or `openrouter/google/gemini-4-argon:2`. The run page's "Extra
+       forecaster" table should show every forecast worked, its notes the OpenRouter spend,
+       and each forecaster's line in the posted comment its model.
+    3. Turn it on for FutureEval and MiniBench with the repository variable
+       `EXTRA_FORECASTERS`, the same comma-separated list (for example
+       `openrouter/openai/gpt-6.1-sol:2,openrouter/google/gemini-4-argon:1`). The Metaculus
+       Cup doesn't use it. With three Opus forecasts and two extras, yes/no questions take
+       the trimmed mean of five; extras never outnumber the bot's own forecasts (one at a
+       one-forecast tier). They run at `FORECASTER_EFFORT`, sent as OpenRouter's reasoning
+       effort, with a 32,000-token cap a call. Two GPT-6.1 Sol forecasts at high effort add
+       roughly $0.06-0.16 a question; Gemini 4 Argon's price reportedly doubles on Dec 1.
+    4. Judge it with the weekly scorecard's "Members and models" table: each model against
+       Opus on the same questions, which needs far fewer questions than comparing peer
+       scores. An extra that fails (no OpenRouter credit, say) only drops out of that
+       question: whether a question goes ahead depends on the bot's own forecasts alone,
+       and extras never carry a question by themselves. The run page counts the failures
+       and annotates them. A list set without the key turns the extras off with an
+       annotation; on the Test Bot it stops the run.
 
 Other optional repository variables (empty means the default):
 
@@ -340,8 +370,9 @@ Other optional repository variables (empty means the default):
 | `PARSER_MODEL` | Claude Haiku 5.5 through the same route. `anthropic/claude-haiku-4-5` brings back the old parser (at temperature 0). |
 | `SEARCH_MODEL` | `openrouter/anthropic/claude-sonnet-5.5:online` (OpenRouter route only) |
 | `FORECASTER_MODEL` | `anthropic/claude-sonnet-5-5` (Metaculus Cup only; on the credits, and on your own key after them, the tier picks) |
+| `EXTRA_FORECASTERS` | Empty: none. OpenRouter models, comma-separated, each with an optional count, that forecast beside the bot's own in FutureEval and MiniBench on your `OPENROUTER_OWN_API_KEY` (Setup, step 11), for example `openrouter/openai/gpt-6.1-sol:2,openrouter/google/gemini-4-argon:1`. At most 5 extra forecasts, and never more than the bot's own. |
 | `RESEARCH_WEB_FETCH` | On (Rob's own key only): research may open two pages a question. `false` turns it off, leaving web search alone. |
-| `FORECASTER_EFFORT` | `high` (Anthropic's own API only). `low` or `medium` sets that level; `default` sends none, which is `medium` on Opus 5.5 and `high` on Sonnet 5.5. |
+| `FORECASTER_EFFORT` | `high` (Anthropic's own API, and the extra forecasters as OpenRouter's reasoning effort). `low` or `medium` sets that level; `default` sends none, which is `medium` on Opus 5.5 and `high` on Sonnet 5.5. |
 | `PREDICTIONS_PER_REPORT` | 5 (Metaculus Cup only) |
 | `ASKNEWS_STRATEGY` | `latest`: one latest-news search per question, covering the past day or two. `archive` searches the AskNews archive (about two months) instead; `both` does both, 12 seconds apart. Archive searches may count as several calls against AskNews's quota: confirm with AskNews first. |
 | `ASKNEWS_ARTICLES` | 8 articles per AskNews search |
@@ -421,6 +452,12 @@ The main architectural choices and the reasons behind them. Each links to where 
 
   — Claude's 2026-10-28 health review; Rob's go-ahead that day, built in [#13](https://github.com/robcam55/metaculus-bot/pull/13).
 - **Rob's key also when the credits' balance can't be read, or there's no OpenRouter key.** Once the credits ran out (2026-10-25), an unreadable balance sent a run back onto them, uncapped, where every question would fail. Paying with Rob's key for that run costs at most one run's questions while credits remain. Without any OpenRouter key, FutureEval and MiniBench used to fall through to the Metaculus Cup's unpaced Sonnet 5 × 5, ignoring `BUDGET_TIER=pause`.
+- **A second model family on Rob's own OpenRouter key (2026-10-30, off until set up).** Rob asked whether models outside the Claude family, Gemini 4 Argon in particular, could help.
+  - **Evidence.** In Metaculus's same-setup house bots, OpenAI's reasoning models led most seasons and no Claude model ever did: GPT-5.1-high scored 11.3 against Claude Sonnet 4.5-high's 8.9 in Spring 2026, with overlapping intervals. In the Spring 2026 survey, using GPT-5.4 as the final model was the strongest single marker of score (r=+0.42), and Opus about zero; that is correlational. On ForecastBench today, GPT-6.1 Sol and Opus 5.5 are level (62.3 and 62.5). nostreambot found no gain from mixing vendors at three members. Gemini 4 Argon has no forecasting record yet; Metaculus added a house bot for it on Oct 15.
+  - **Choice.** Extra members beside the three Opus forecasts, not a switch: a hedge on the model choice and less alike errors, worth perhaps +1 a question, not a step change. With five members the yes/no aggregate is the trimmed mean; a three-member mix was avoided, because the median mutes the odd member out. Each forecast names its model, so the scorecard can compare members paired on the same questions.
+  - **Mechanics.** The key is `OPENROUTER_OWN_API_KEY`, never `OPENROUTER_API_KEY` (llm_route reads that as Metaculus's credits). Effort goes as OpenRouter's own `reasoning` setting, because litellm 1.80.10 refuses `reasoning_effort` for models it doesn't know to reason, Gemini 4 Argon among them. The extras' spend is kept off the Anthropic key's figures and shown on its own. The package's bar of half the forecasts succeeding counts the bot's own forecasts only, so an OpenRouter outage can't fail questions and the extras can't carry a question when the bot's own key is at its limit. A review with two skeptics a finding found that bar, the conditional-question routing, the parsing and the missing-key cases, all fixed before merge.
+
+  — Claude's 2026-10-30 research into the leading bots; Rob's go-ahead that day in chat ("Let's move forward with these changes").
 - **Prompt and research rules from the leading bots (2026-10-30).** Rob asked for every avenue that might add a few points, ready to back out if it doesn't help. Two research workflows read Metaculus's analyses and nine open-source bots, then put each candidate past two skeptics, one on the evidence and one on the code. Five changes survived, all small and cheap:
   - **What the bot's own record showed.** Its 61 scored questions (mostly one MiniBench round, made by the older setup) scored +2.3 a question on yes/no (+1.0 on MiniBench's 35), against +9 to +18 on discrete and multiple choice. Status-on-a-date questions averaged about −1. Four of the five worst yes/no misses were Yes outcomes forecast at 13-42%. The binary forecasts averaged 36% against 41% resolved Yes, so no Yes lean showed for the one-sided step to correct.
   - **Yes/no rules.** The criteria restatement, the trajectory question and the soft clock come from nostreambot (10th in Spring 2026, about +12.7 a question in Summer 2026). Its 815-record audit, on its older models, found announced-target questions forecast at 44% for events that happened 8% of the time, about 19 points worse; the other rules each come from a single named miss. The market rule follows the Spring 2026 survey (checking markets r=+0.34, correlational) with nostreambot's caution that thin or stale prices don't anchor. Honest expectation: 0 to +0.5 a question, about $0.02-0.05 more.
