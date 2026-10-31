@@ -1,5 +1,6 @@
 import argparse
 import asyncio
+import json
 import logging
 import math
 import os
@@ -62,6 +63,7 @@ from forecasting_tools import (
 )
 from forecasting_tools.ai_models import general_llm
 from forecasting_tools.ai_models.ai_utils.response_types import TextTokenCostResponse
+from forecasting_tools.data_models.forecast_report import ResearchWithPredictions
 import litellm
 
 dotenv.load_dotenv()
@@ -102,6 +104,30 @@ NO_RESEARCH_NOTE = (
     " what you could not check, and keep your uncertainty wide."
 )
 
+# How wide a numeric or date range should be. The template said "set wide 90/10 confidence
+# intervals". The bot's evidence that its ranges ran too wide is thin: its 9 resolved
+# forecaster ranges (3 questions, one model, before the mixture) all held the outcome
+# inside the 10th to 90th percentile, which a calibrated forecaster would manage about
+# half the time on so few. nostreambot's 43-question check found its own non-financial
+# ranges 22% too wide. So this asks for width by forecastability, with no push either way,
+# and keeps room for revised reports. The scorecard's 10th-90th coverage row is the test:
+# under about 75% inside over 20 or more new-prompt questions means put a widening line
+# back. Traded prices get a random-walk floor in the numeric prompt's step (g).
+WIDTH_RULE = (
+    "Set the width of your range by how forecastable the quantity is: narrow when"
+    " published data or a short horizon nearly fixes it, wide when it depends on events"
+    " that have not happened yet. For counts and statistics still being reported, leave"
+    " room for revisions, backlogs and late reports. Do not widen or narrow out of habit."
+)
+# How the price rules measure a series' daily moves. The 1.3 in the numeric floor is the
+# 10th/90th percentile z (1.28) for a standard deviation; a median or average absolute move
+# runs 20-50% smaller for fat-tailed prices, which would make the floor that much too narrow
+DAILY_VOLATILITY = (
+    "daily volatility (the standard deviation of its daily % changes: annualized"
+    " volatility / 16, or / 19 for crypto, which trades every day; an average absolute"
+    " daily move x 1.25)"
+)
+
 # forecasting-tools 0.2.x (the template's pin) still points at the Summer 2026 season;
 # its 0.3.1 release carries these Fall 2026 ids. AIB_TOURNAMENT_ID and METACULUS_CUP_ID
 # (numeric id or slug) override them for later seasons.
@@ -138,12 +164,26 @@ PARSER_EFFORT = "low"
 ANTHROPIC_PARSER_MAX_TOKENS = 8000
 # Models that take no effort setting and accept a temperature: Haiku 4.5 and older
 _OLDER_HAIKU = re.compile(r"haiku-[34]")
-# Anthropic's own web search for the search-backed model on Rob's key, up to five searches
+# Anthropic's own web search for the search-backed model on Rob's key, up to four searches
 # a question at $10 per 1,000. It is passed as a tool, not litellm's web_search_options,
 # which litellm 1.80.10 always sends as the older web_search_20250305: this version
 # filters results before they enter the context (dynamic filtering, no extra fee), so
 # fewer of them are billed as input.
-ANTHROPIC_SEARCH_TOOL = {"type": "web_search_20260209", "name": "web_search", "max_uses": 5}
+ANTHROPIC_SEARCH_TOOL = {"type": "web_search_20260209", "name": "web_search", "max_uses": 4}
+# And Anthropic's web fetch, so research can open the page the resolution criteria name
+# and read its current state: the Spring 2026 winner read its resolution links, and
+# several losses here turned on a source's state (a grid connection, a tide gauge). No
+# fee; a fetched page is billed as input, capped here at 8,000 tokens, twice a question.
+# Four searches and two fetches keep the server's tool loop well under its 10 rounds.
+# litellm 1.80.10 sends the beta header web-fetch-2025-09-10 with it, in place of any
+# other. RESEARCH_WEB_FETCH=false turns it off without a code change.
+ANTHROPIC_FETCH_TOOL = {
+    "type": "web_fetch_20260209",
+    "name": "web_fetch",
+    "max_uses": 2,
+    "max_content_tokens": 8000,
+    "citations": {"enabled": True},
+}
 # Stop reasons (as litellm reports them) for a research reply that ended before its
 # answer: a server-side search loop paused, the reply ran out of tokens, or a safety
 # classifier stopped it
@@ -325,7 +365,7 @@ class SourceTally:
 @dataclass
 class ResearchHealth:
     """What each research source returned during a run, for the Actions run page. A failed
-    source is otherwise only a warning in the log, and the run stays green."""
+    source leaves the run green; it shows in this table and as a warning annotation."""
 
     sources: dict[str, SourceTally] = field(default_factory=dict)
     # Questions (by question_key) whose forecast went ahead with no research
@@ -380,7 +420,8 @@ def source_name(source: GeneralLlm | str) -> str:
         if source.litellm_kwargs.get("web_search_options") or any(
             isinstance(t, dict) and t.get("name") == "web_search" for t in tools
         ):
-            return f"{source.model} + web search"
+            fetch = any(isinstance(t, dict) and t.get("name") == "web_fetch" for t in tools)
+            return f"{source.model} + web search" + (" and fetch" if fetch else "")
         return source.model
     if source == ASKNEWS_RESEARCHER:
         return asknews_label()
@@ -450,14 +491,20 @@ class AnthropicSearchLlm(GeneralLlm):
     - Turn away a reply that stopped early (CUT_SHORT). GeneralLlm accepts any text, so
       a reply holding only "I'll search for this." counted as research. It comes back
       empty instead, which run_research counts as "returned nothing", and isn't retried:
-      a fresh request reruns the whole search and usually stops the same way.
+      a fresh request reruns the whole search and usually stops the same way. A reply
+      with no text at all (only thinking and tool blocks, as a cut-short loop can be)
+      fails GeneralLlm's own check before the stop reason is read; it is treated the same.
+    - List the pages it opened. litellm drops web fetch results, and a citation of a
+      fetched page carries no URL, so the fetched URLs come from the fetch calls.
     The researcher is always invoked with a plain prompt, which model_input_to_message
     turns into one user message."""
 
     async def _mockable_direct_call_to_model(self, prompt):
         try:
             return await super()._mockable_direct_call_to_model(prompt)
-        except ResearchCutShort as e:  # caught here, inside GeneralLlm's retries
+        except (ResearchCutShort, AssertionError) as e:  # inside GeneralLlm's retries
+            if isinstance(e, AssertionError) and not str(e).startswith(NO_TEXT_ASSERTION):
+                raise
             logger.warning(f"{e}: no research from {self.model} this time")
             return TextTokenCostResponse(
                 data="",
@@ -483,14 +530,25 @@ class AnthropicSearchLlm(GeneralLlm):
         reason = getattr(choices[0], "finish_reason", None)
         if reason in CUT_SHORT:
             raise ResearchCutShort(f"The research reply stopped early ({reason})")
-        fields = getattr(choices[0].message, "provider_specific_fields", None) or {}
+        message = choices[0].message
+        fields = getattr(message, "provider_specific_fields", None) or {}
         urls: list[str] = []
+        cited_page = False  # a citation of a fetched page (it carries no URL)
+        cited_any = False
         for group in fields.get("citations") or []:
             for citation in group or []:
-                url = citation.get("url") if isinstance(citation, dict) else None
+                if not isinstance(citation, dict):
+                    continue
+                cited_any = True
+                cited_page = cited_page or citation.get("type") in FETCH_CITATIONS
+                url = citation.get("url")
                 if url and url not in urls:
                     urls.append(url)
-        if not urls:
+        if cited_page:
+            # The pages it opened come first: the resolution source, when it found one.
+            # Only when a fetched page is cited, since a failed fetch can't be told apart
+            urls = [u for u in _fetched_urls(message) if u not in urls] + urls
+        if not cited_any:
             # Nothing cited (with dynamic filtering the searches run inside code, and
             # the answer may cite none): the pages the searches returned, instead
             for result in fields.get("web_search_results") or []:
@@ -500,6 +558,45 @@ class AnthropicSearchLlm(GeneralLlm):
                     if url and url not in urls:
                         urls.append(url)
         return urls or GeneralLlm._extract_citations(response, choices)
+
+
+# GeneralLlm's assertion for a reply with no text block
+NO_TEXT_ASSERTION = "Answer is not a string"
+# Citation types that point into a fetched page (a document) rather than a search result
+FETCH_CITATIONS = ("char_location", "page_location", "content_block_location")
+
+
+def _fetched_urls(message) -> list[str]:
+    """The URLs the reply's web fetch calls opened, in order (litellm keeps the server's
+    tool calls as tool_calls, with their input as JSON arguments)."""
+    urls: list[str] = []
+    for call in getattr(message, "tool_calls", None) or []:
+        function = getattr(call, "function", None)
+        if getattr(function, "name", None) != "web_fetch":
+            continue
+        try:
+            url = json.loads(function.arguments or "{}").get("url")
+        except (TypeError, ValueError, AttributeError):
+            continue
+        if url and url not in urls:
+            urls.append(url)
+    return urls
+
+
+# Each forecast's reasoning starts with the model that wrote it, and each forecaster's line
+# in the posted summary ends with it. bot-review keeps that line's text, so the weekly
+# scorecard can compare models on the same questions (scorecard.py, members)
+MODEL_LINE = "Model: {}"
+_MODEL_PREFIX = re.compile(r"\AModel: (\S+)\n")
+
+
+def with_model(model: str, reasoning: str) -> str:
+    return f"{MODEL_LINE.format(model)}\n\n{reasoning}"
+
+
+def model_of_reasoning(reasoning: str) -> str | None:
+    found = _MODEL_PREFIX.match(reasoning)
+    return found.group(1) if found else None
 
 
 # The Test Bot's inputs for trying another model in one role (test_bot.yaml sets these
@@ -608,7 +705,8 @@ def build_llms(
             temperature=None,
             timeout=300,
             allowed_tries=2,
-            tools=[dict(ANTHROPIC_SEARCH_TOOL)],
+            tools=[dict(ANTHROPIC_SEARCH_TOOL)]
+            + ([dict(ANTHROPIC_FETCH_TOOL)] if _env_flag("RESEARCH_WEB_FETCH", True) else []),
             **room,
         )
     if os.getenv("RESEARCHER"):
@@ -649,9 +747,10 @@ class RcForecastBot(ForecastBot):
     - Each run's page shows what every model call cost, by OpenRouter's own figures, per
       question and per part of the work: each research source, each forecast, and parsing
       with the research summary (spend.py). Measuring changes no request.
-    - Binary questions: an outside-view-first prompt with an explicit check against the
-      known "Yes" lean of language models, and a trimmed mean (drop the highest and
-      lowest) over all predictions instead of the median.
+    - Binary questions: an outside-view-first prompt that restates the criteria, reads the
+      status quo from the named source, treats liquid matched markets as strong evidence
+      and checks its number in both directions; a trimmed mean (drop the highest and
+      lowest) once there are four or more predictions.
     - Tournament ids overridable by env (AIB_TOURNAMENT_ID, MINIBENCH_ID) so a new season
       doesn't wait on a forecasting-tools release.
 
@@ -858,6 +957,35 @@ class RcForecastBot(ForecastBot):
         with spend.tagged(part=f"forecast {self._forecasts_started[key]}"):
             return await super()._make_prediction(question, research)
 
+    @classmethod
+    def _format_and_expand_research_summary(
+        cls,
+        report_number: int,
+        report_type: type[ForecastReport],
+        predicted_research: ResearchWithPredictions,
+    ) -> str:
+        """The package's summary of one research report, with each forecaster's model on
+        the line after its prediction (see MODEL_LINE)."""
+        bullets = ""
+        for j, forecast in enumerate(predicted_research.predictions):
+            readable = report_type.make_readable_prediction(forecast.prediction_value)
+            model = model_of_reasoning(forecast.reasoning)
+            # after a list (multiple choice, numeric) the model line is its own paragraph,
+            # and each forecaster ends with a blank line, as in the package's original
+            gap = "\n\n" if readable.endswith("\n") else "\n"
+            tag = f"{gap}{MODEL_LINE.format(model)}" if model else ""
+            bullets += f"*Forecaster {j + 1}*: {readable.rstrip()}{tag}\n\n"
+        return clean_indents(
+            f"""
+            ## Report {report_number} Summary
+            ### Forecasts
+            {bullets}
+
+            ### Research Summary
+            {predicted_research.summary_report}
+            """
+        )
+
     @staticmethod
     def _can_retry(question: MetaculusQuestion, now: datetime | None = None) -> bool:
         if question.close_time is None:
@@ -872,26 +1000,44 @@ class RcForecastBot(ForecastBot):
     def _research_prompt(self, question: MetaculusQuestion) -> str:
         """The research brief. Besides the news, it asks for the two things the
         Spring 2026 bot survey found most associated with better scores: the current
-        reading of the source the criteria name, and forecasts on the question or close
-        ones elsewhere. Using published forecasts, Metaculus's own included, is within the
-        tournament's rules."""
+        reading of the source the criteria name (opened directly where the web fetch tool
+        is on), and forecasts on the question or close ones elsewhere, venue by venue so a
+        missing one reads "not found" rather than an invented number. Using published
+        forecasts, Metaculus's own included, is within the tournament's rules. It also asks
+        for a searched base rate as a count, and for a price series' latest value and
+        typical move, which the forecast prompts use."""
+        event_base_rate = (
+            "Search once for the base rate: how often this kind of event happened, as a count"
+            " that says what was counted: years with at least one such event (for example"
+            ' "in 3 of the last 20 years"), windows like this question\'s (for example "2 of'
+            ' the last 15 Novembers"), or events per year. If an exact figure is missing or'
+            " paywalled, give the closest proxy and say it is one."
+        )
         if isinstance(question, MultipleChoiceQuestion):
             outcome = "which option the question would resolve to"
             options = f"\nThe options are: {question.options}\n"
+            base_rate = event_base_rate
         elif isinstance(question, (NumericQuestion, DateQuestion)):
             outcome = "what the question would resolve to"
             options = ""
+            base_rate = (
+                "Unless it is a traded price, give past values of the same quantity in"
+                " comparable periods, with their dates."
+            )
         else:
             outcome = "whether the question would resolve Yes or No"
             options = ""
+            base_rate = event_base_rate
         return clean_indents(
             f"""
             You are an assistant to a superforecaster.
             The superforecaster will give you a question they intend to forecast on.
             To be a great assistant, you generate a concise but detailed rundown of the most relevant news, including {outcome} based on current information.
-            Include dates for every fact, relevant base rates or historical frequencies if you know them, and any scheduled events before the question resolves.
-            If the resolution criteria name a source (an official page, a data series, a report), give its latest value or status and when it was published.
-            If a prediction market (Polymarket, Kalshi, Manifold) or Metaculus has a forecast on this question or a closely related one, give it with its date and a link, and say how closely that question matches this one's criteria.
+            Include dates for every fact, and any scheduled events before the question resolves.
+            If the resolution criteria or fine print name a source (an official page, a data series, a report) or link to one, open it first if you can. Give its latest value or status and when it was published, any schedule or prediction it publishes for the period (a court calendar, a release date, tide predictions), and whether the outcome already looks settled.
+            {base_rate}
+            For a price, index or other data series the question turns on, give its latest value with its date and how volatile it is: the standard deviation of its daily % changes, or failing that its annualized or option-implied volatility, saying which figure you give.
+            For each of Polymarket, Kalshi, Manifold and Metaculus, say whether you found a forecast on this question or a close one: give it with its date and a link, and say how closely that question matches this one's criteria, or write "not found" (searched) or "not searched".
             You do not produce forecasts yourself.
 
             {timeline(question)}
@@ -989,12 +1135,14 @@ class RcForecastBot(ForecastBot):
             {timeline(question)}
 
             Work through these steps briefly before answering:
-            (a) Time left: how long until the outcome is known, and how much can realistically change in that time?
-            (b) Outside view: name the most relevant reference class and its base rate. If several apply, say which you trust most and why.
-            (c) Status quo: what happens if nothing changes? The world changes slowly most of the time, so give the status quo extra weight, especially when little time is left.
-            (d) Inside view: the specific, dated evidence that should move you away from the base rate, and roughly how far. Separate facts from speculation, and note what you could not find out.
-            (e) The strongest case for the outcome you currently think less likely. Language models tend to over-predict "Yes"; check you are not doing the same.
-            (f) Reconcile these into one probability. Avoid 0% and 100%, and go below 3% or above 97% only when the outcome is effectively already determined.
+            (a) The question: in one sentence, what exactly must happen, by when, and according to which source. Forecast that question, not a related one.
+            (b) Time left: how long until the outcome is known, and how much can realistically change in that time?
+            (c) Outside view: name the most relevant reference class and its base rate. If several apply, say which you trust most and why. For an event that could happen on any day, convert the base rate to the time left: from the share of years with at least one such event, p, about 1 - (1 - p)^(days left / 365); from a number of events per year, r, about 1 - e^(-r x days left / 365). A base rate already counted over windows like this question's (the same months in past years) needs no rescaling.
+            (d) Status quo: start from the current state the named source shows. Decide whether the status quo means nothing changes, or a process already under way reaching its scheduled end (a deadline arriving, a trend continuing). The world changes slowly most of the time, so give the status quo extra weight, especially when little time is left.
+            (e) Inside view: the specific, dated evidence that should move you away from the base rate, and roughly how far. Separate facts from speculation, and note what you could not find out. An announced target date shows a plan exists, not that it will be met; official timelines often slip. A search that finds nothing is not evidence that something did not happen, unless the source would certainly have reported it.
+            (f) Markets and prices: a recent forecast on this question or a close match from a liquid market or Metaculus is strong evidence: move away from it only for a reason you can name, such as different criteria or dates. A thin or stale market is weak evidence. If the question asks whether a traded price or index will be past a level, also estimate where it will be (its latest value, and its {DAILY_VOLATILITY} times the square root of the days it trades before the deadline), then read off the chance. Reaching a level not yet reached at any time before the deadline is more likely than being past it on the final day: about twice as likely if intraday prices count and several weeks are left. If only daily closes count it is less: about the same with 1 trading day left, 1.2 times with 2-3, 1.4 times at a week, 1.5 times at two weeks, and somewhat less again for levels far from today's price.
+            (g) The strongest case for the outcome you currently think less likely. Then check your number both ways: out of 100 questions like this one, about how many resolve Yes? Would a Yes surprise you at this probability? Would a No?
+            (h) Reconcile these into one probability. Avoid 0% and 100%, and go below 3% or above 97% only when the outcome is effectively already determined.
             {self._get_conditional_disclaimer_if_necessary(question)}
 
             The last thing you write is your final answer as: "Probability: ZZ%", 0-100
@@ -1008,7 +1156,8 @@ class RcForecastBot(ForecastBot):
         question: BinaryQuestion,
         prompt: str,
     ) -> ReasonedPrediction[float]:
-        reasoning = await self.get_llm("default", "llm").invoke(prompt)
+        forecaster = self.get_llm("default", "llm")
+        reasoning = await forecaster.invoke(prompt)
         logger.info(f"Reasoning for URL {question.page_url}: {reasoning}")
         binary_prediction: BinaryPrediction = await parse(
             reasoning,
@@ -1021,7 +1170,9 @@ class RcForecastBot(ForecastBot):
         logger.info(
             f"Forecasted URL {question.page_url} with prediction: {decimal_pred}."
         )
-        return ReasonedPrediction(prediction_value=decimal_pred, reasoning=reasoning)
+        return ReasonedPrediction(
+            prediction_value=decimal_pred, reasoning=with_model(forecaster.model, reasoning)
+        )
 
     ##################################### MULTIPLE CHOICE QUESTIONS #####################################
 
@@ -1054,7 +1205,9 @@ class RcForecastBot(ForecastBot):
             Before answering you write:
             (a) The time left until the outcome to the question is known.
             (b) The status quo outcome if nothing changed.
-            (c) A description of an scenario that results in an unexpected outcome.
+            (c) For a contest or ranking: how often the favourite or current leader actually wins in comparable cases and, if the favourite fails, the most likely way it happens.
+            (d) Any recent forecast from a liquid market or Metaculus on this question or a close match. Treat it as strong evidence and move away from it only for a reason you can name, such as different criteria or dates; a thin or stale market is weak evidence.
+            (e) A description of a scenario that results in an unexpected outcome.
 
             {self._get_conditional_disclaimer_if_necessary(question)}
             You write your rationale remembering that (1) good forecasters put extra weight on the status quo outcome since the world changes slowly most of the time, and (2) good forecasters leave some moderate probability on most options to account for unexpected outcomes.
@@ -1084,7 +1237,8 @@ class RcForecastBot(ForecastBot):
             Additionally, you may sometimes need to parse a 0% probability. Please do not skip options with 0% but rather make it an entry in your final list with 0% probability.
             """
         )
-        reasoning = await self.get_llm("default", "llm").invoke(prompt)
+        forecaster = self.get_llm("default", "llm")
+        reasoning = await forecaster.invoke(prompt)
         logger.info(f"Reasoning for URL {question.page_url}: {reasoning}")
         # Parsed without the package's validator, which rejects a confident answer with
         # several 0% options and would do so again on every retry; option_list floors
@@ -1102,7 +1256,8 @@ class RcForecastBot(ForecastBot):
             f"Forecasted URL {question.page_url} with prediction: {predicted_option_list}."
         )
         return ReasonedPrediction(
-            prediction_value=predicted_option_list, reasoning=reasoning
+            prediction_value=predicted_option_list,
+            reasoning=with_model(forecaster.model, reasoning),
         )
 
     ##################################### NUMERIC QUESTIONS #####################################
@@ -1149,9 +1304,10 @@ class RcForecastBot(ForecastBot):
             (d) The expectations of experts and markets.
             (e) A brief description of an unexpected scenario that results in a low outcome.
             (f) A brief description of an unexpected scenario that results in a high outcome.
+            (g) If the question is about a traded price, index or rate: its latest value and its {DAILY_VOLATILITY}. Unless the value cannot move before resolution (a policy rate with no decision in the window) or a hard limit holds it, keep your 10th to 90th percentile range at least as wide as about 1.3 x that daily volatility x the square root of the days it trades before the deadline, on each side of the latest value, in percent terms. If earnings, a central-bank meeting or another scheduled release that can move it falls inside the window, go wider than this.
 
             {self._get_conditional_disclaimer_if_necessary(question)}
-            You remind yourself that good forecasters are humble and set wide 90/10 confidence intervals to account for unknown unknowns.
+            {WIDTH_RULE}
 
             The last thing you write is your final answer as:
             "
@@ -1171,7 +1327,8 @@ class RcForecastBot(ForecastBot):
         question: NumericQuestion,
         prompt: str,
     ) -> ReasonedPrediction[NumericDistribution]:
-        reasoning = await self.get_llm("default", "llm").invoke(prompt)
+        forecaster = self.get_llm("default", "llm")
+        reasoning = await forecaster.invoke(prompt)
         logger.info(f"Reasoning for URL {question.page_url}: {reasoning}")
         parsing_instructions = clean_indents(
             f"""
@@ -1202,7 +1359,9 @@ class RcForecastBot(ForecastBot):
         logger.info(
             f"Forecasted URL {question.page_url} with prediction: {prediction.declared_percentiles}."
         )
-        return ReasonedPrediction(prediction_value=prediction, reasoning=reasoning)
+        return ReasonedPrediction(
+            prediction_value=prediction, reasoning=with_model(forecaster.model, reasoning)
+        )
 
     ##################################### DATE QUESTIONS #####################################
 
@@ -1249,7 +1408,7 @@ class RcForecastBot(ForecastBot):
             (f) A brief description of an unexpected scenario that results in a high outcome.
 
             {self._get_conditional_disclaimer_if_necessary(question)}
-            You remind yourself that good forecasters are humble and set wide 90/10 confidence intervals to account for unknown unknowns.
+            {WIDTH_RULE}
 
             The last thing you write is your final answer as:
             "
@@ -1270,7 +1429,8 @@ class RcForecastBot(ForecastBot):
         question: DateQuestion,
         prompt: str,
     ) -> ReasonedPrediction[NumericDistribution]:
-        reasoning = await self.get_llm("default", "llm").invoke(prompt)
+        forecaster = self.get_llm("default", "llm")
+        reasoning = await forecaster.invoke(prompt)
         logger.info(f"Reasoning for URL {question.page_url}: {reasoning}")
         parsing_instructions = clean_indents(
             f"""
@@ -1303,7 +1463,9 @@ class RcForecastBot(ForecastBot):
         logger.info(
             f"Forecasted URL {question.page_url} with prediction: {prediction.declared_percentiles}."
         )
-        return ReasonedPrediction(prediction_value=prediction, reasoning=reasoning)
+        return ReasonedPrediction(
+            prediction_value=prediction, reasoning=with_model(forecaster.model, reasoning)
+        )
 
     def _create_upper_and_lower_bound_messages(
         self, question: NumericQuestion | DateQuestion
@@ -1518,6 +1680,23 @@ def describe_pass(
         counts.append(f"{new_count} not yet forecast")
     counts.append(f"{taken} taken this run")
     return f"- {label} (`{tournament}`): {', '.join(counts)}" + (f" ({note})." if note else ".")
+
+
+def health_warnings(health: ResearchHealth) -> list[str]:
+    """A GitHub warning annotation for each research source that failed this run. A source
+    that fails while the other still feeds the question leaves the run green, so without
+    this it shows only in the run page's table; an annotation shows on the run's summary
+    and in GitHub's API."""
+    warnings = []
+    for name, tally in health.sources.items():
+        failed = tally.searches - tally.worked
+        if failed:
+            reasons = ", ".join(f"{r} x{n}" for r, n in tally.failures.most_common())
+            warnings.append(
+                f"::warning title=Research source failed::{name} failed {failed} of"
+                f" {tally.searches} searches ({reasons})"
+            )
+    return warnings
 
 
 def run_report(
@@ -1900,6 +2079,8 @@ def main() -> None:
         lines += ["", *notes]
     print("\n".join(lines) + "\n")
     budget.write_step_summary(lines)
+    for warning in health_warnings(health):
+        print(warning)
     failed = len(failures) - limited
     if failed:
         # a failed question turns the Actions run red; one that waits for research too,
