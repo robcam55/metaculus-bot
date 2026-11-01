@@ -12,6 +12,7 @@ posted comment's sections, the AskNews settings, and the spend measured per call
 import asyncio
 import contextlib
 import io
+import json
 import logging
 import math
 import os
@@ -48,6 +49,9 @@ KEYS = (
     "TRIAL_FORECASTER_MODEL",
     "TRIAL_RESEARCHER_MODEL",
     "TRIAL_PARSER_MODEL",
+    "TRIAL_EXTRA_FORECASTERS",
+    "EXTRA_FORECASTERS",
+    "OPENROUTER_OWN_API_KEY",
     "METACULUS_TOKEN",
     "BUDGET_TIER",
     "TEST_QUESTIONS",
@@ -1242,6 +1246,200 @@ def check_model_tags() -> None:
     assert scorecard._MODEL.search(body).group(1) == opus, body
     assert abs(scorecard._member_points(q, scorecard._MODEL.sub("", body)) - 100 * math.log(0.3)) < 1e-9, body
     print("model tags: ok")
+
+
+def check_extra_forecasters() -> None:
+    """A second model family on Rob's own OpenRouter key: off by default, the last forecasts
+    of each report, OpenRouter's own reasoning setting, and its spend kept apart."""
+    sol, argon, opus = "openrouter/openai/gpt-6.1-sol", "openrouter/google/gemini-4-argon", "anthropic/claude-opus-5-5"
+    own = {"OPENROUTER_OWN_API_KEY": "sk-or-own-fake"}
+    with env(ANTHROPIC_API_KEY="x"):
+        assert main.extra_forecaster_models() == [] and main.build_extra_forecasters() == []
+    # a count per model; a variant such as :online is part of the id; commas, semicolons,
+    # spaces or new lines between items
+    with env(EXTRA_FORECASTERS=f" {sol}:2, {argon} ;openrouter/x/y:online\nopenrouter/x/z:online:1", **own):
+        assert main.extra_forecaster_models() == [sol, sol, argon, "openrouter/x/y:online", "openrouter/x/z:online"]
+    # without the key: none (main() then notes and annotates it, or stops a Test Bot trial)
+    with env(EXTRA_FORECASTERS=f"{sol}:2"):
+        assert main.extra_forecaster_models() == [] and main.requested_extras() == f"{sol}:2"
+    # mistyped: the run stops at startup
+    for bad in ("anthropic/claude-opus-5-5:2", f"{sol}:0", f"{sol}:6", f"{sol}: 2", f"{sol} x2", "openrouter/sol"):
+        with env(EXTRA_FORECASTERS=bad, **own):
+            try:
+                main.extra_forecaster_models()
+            except SystemExit as e:
+                assert "EXTRA_FORECASTERS" in str(e), e
+            else:
+                raise AssertionError(f"{bad!r} must stop the run")
+    # the Test Bot's input wins over the variable
+    with env(EXTRA_FORECASTERS=f"{sol}:2", TRIAL_EXTRA_FORECASTERS=argon, **own):
+        assert main.extra_forecaster_models() == [argon]
+
+    # built on Rob's own key (never the credits' key in the environment), with OpenRouter's
+    # reasoning setting, which litellm passes for Gemini 4 Argon where reasoning_effort fails
+    with env(ANTHROPIC_API_KEY="x", OPENROUTER_API_KEY="sk-or-credits", EXTRA_FORECASTERS=f"{sol}:2,{argon}", **own):
+        built = main.build_extra_forecasters()
+        assert [b.model for b in built] == [sol, sol, argon] and built[0] is built[1], built
+        assert built[0].litellm_kwargs["api_key"] == "sk-or-own-fake"
+        assert built[2].litellm_kwargs["reasoning"] == {"effort": "high"}
+        assert built[0].litellm_kwargs["timeout"] == 480
+        assert built[0].litellm_kwargs["max_tokens"] == main.ANTHROPIC_FORECAST_MAX_TOKENS
+        # three Opus forecasts plus three extras
+        bot = main.make_bot("anthropic", budget.TIERS["opus-3"], publish=False)
+        assert bot.predictions_per_research_report == 6 and len(bot.extra_forecasters) == 3
+        # never more extras than the bot's own forecasts: one Sonnet, one extra
+        bot = main.make_bot("anthropic", budget.TIERS["sonnet-1"], publish=False)
+        assert bot.predictions_per_research_report == 2 and [b.model for b in bot.extra_forecasters] == [sol]
+    with env(EXTRA_FORECASTERS=sol, FORECASTER_EFFORT="default", **own):
+        assert "reasoning" not in main.build_extra_forecasters()[0].litellm_kwargs
+
+    # the forecasts of one question run together; the last two go to the extra model, each
+    # names its model, and the run page counts the extras' forecasts
+    with env(ANTHROPIC_API_KEY="x"):
+        bot = main.RcForecastBot(
+            publish_reports_to_metaculus=False, predictions_per_research_report=5,
+            extra_forecasters=[FakeLlm("Probability: 60%", model=sol)] * 2,
+        )  # fmt: skip
+    bot.get_llm = lambda name, kind="llm": FakeLlm("Probability: 30%", model=opus)  # type: ignore[method-assign]
+
+    async def fake_parse(text, *args, **kwargs):
+        return BinaryPrediction(prediction_in_decimal=float(text.split()[-1].rstrip("%")) / 100)
+
+    async def predictions(question, n, **kwargs):
+        bot._note_pads.append(await bot._initialize_notepad(question))  # as forecast_questions does
+        return await asyncio.gather(*(bot._make_prediction(question, "notes") for _ in range(n)), **kwargs)  # fmt: skip
+
+    real_parse = main.parse
+    try:
+        main.parse = fake_parse
+        got = asyncio.run(predictions(binary_question(), 5))
+        assert [main.model_of_reasoning(g.reasoning) for g in got] == [opus] * 3 + [sol] * 2, got
+        assert [g.prediction_value for g in got] == [0.3] * 3 + [0.6] * 2, got
+        assert bot.research_health.forecasters[sol].worked == 2, bot.research_health.forecasters
+        # an extra that fails thins the members and is counted; the others go on
+        broken = FakeLlm(model=argon)
+
+        async def refuse(prompt, system_prompt=None):
+            raise RuntimeError("402 insufficient credits")
+
+        broken.invoke = refuse  # type: ignore[method-assign]
+        bot.extra_forecasters = [broken]
+        bot.predictions_per_research_report = 4
+        q = binary_question().model_copy(update={"page_url": "https://example.invalid/q/9"})
+        results = asyncio.run(predictions(q, 4, return_exceptions=True))
+        assert [type(r).__name__ for r in results] == ["ReasonedPrediction"] * 3 + ["RuntimeError"], results
+        assert dict(bot.research_health.forecasters[argon].failures) == {"RuntimeError": 1}
+        lines = main.run_report([], [], bot.research_health, [])
+        assert f"| {sol} | 2 | 2 | 0 |" in lines and f"| {argon} | 1 | 0 | 1 (RuntimeError) |" in lines, lines
+        # and the failure is annotated, since a thinned question stays green
+        assert f"::warning title=Extra forecaster failed::{argon} failed 1 of 1 forecasts (RuntimeError x1)" in main.health_warnings(bot.research_health)
+    finally:
+        main.parse = real_parse
+
+    # whole questions: the success bar counts the bot's own forecasts only. Extras that all
+    # fail (no OpenRouter credit) thin a question but don't fail it, even with one Opus
+    # forecast failing too; extras alone never carry a question
+    def question_bot(own_replies, extras):
+        with env(ANTHROPIC_API_KEY="x"):
+            b = main.RcForecastBot(
+                publish_reports_to_metaculus=False, skip_previously_forecasted_questions=False,
+                predictions_per_research_report=len(own_replies) + len(extras), extra_forecasters=extras,
+            )  # fmt: skip
+        replies = iter(own_replies)
+
+        def default(name, kind="llm"):
+            if name != "default":
+                return FakeLlm("parsed", model="anthropic/claude-haiku-5-5")
+            llm = FakeLlm(model=opus)
+
+            async def answer(prompt, system_prompt=None):
+                reply = next(replies)
+                if reply is None:
+                    raise TimeoutError("opus timed out")
+                return reply
+
+            llm.invoke = answer  # type: ignore[method-assign]
+            return llm
+
+        async def research(question):
+            return "notes"
+
+        async def summary(question, research):
+            return "summary"
+
+        b.get_llm = default  # type: ignore[method-assign]
+        b.run_research = research  # type: ignore[method-assign]
+        b.summarize_research = summary  # type: ignore[method-assign]
+        return b
+
+    def dead(model):
+        llm = FakeLlm(model=model)
+
+        async def refuse(prompt, system_prompt=None):
+            raise RuntimeError("402 This request requires more credits")
+
+        llm.invoke = refuse  # type: ignore[method-assign]
+        return llm
+
+    real_parse = main.parse
+    try:
+        main.parse = fake_parse
+        q = binary_question().model_copy(update={"page_url": "https://example.invalid/q/21"})
+        for own_replies, extras in (
+            (["Probability: 30%"] * 3, [dead(sol)] * 4),  # four dead extras: 3 of 7 succeed
+            (["Probability: 30%", "Probability: 30%", None], [dead(sol)] * 2),  # and an Opus timeout
+            (["Probability: 30%"], [dead(sol)]),  # one forecast and its one extra
+        ):
+            b = question_bot(own_replies, extras)
+            [report] = asyncio.run(b.forecast_questions([q], return_exceptions=True))
+            assert not isinstance(report, BaseException) and abs(report.prediction - 0.3) < 1e-9, report
+        # the bot's own model fails (its key at its spend limit): no forecast from extras alone
+        alive = FakeLlm("Probability: 60%", model=sol)
+        b = question_bot([None, None, None], [alive, alive])
+        [report] = asyncio.run(b.forecast_questions([q], return_exceptions=True))
+        assert isinstance(report, BaseException) and "opus timed out" in str(report), report
+        # two research reports: each report's last forecasts go to the extras
+        b = question_bot(["x"] * 3, [alive, alive])
+        assert [b._extra_for(slot) is alive for slot in range(1, 11)] == [False] * 3 + [True] * 2 + [False] * 3 + [True] * 2
+        # a leg of a conditional question keeps its member's slot: no new slot, no tally
+        leg = binary_question().model_copy(update={"conditional_type": "parent"})
+        b = question_bot(["Probability: 30%"], [])
+        b._note_pads.append(asyncio.run(b._initialize_notepad(leg)))
+        asyncio.run(b._make_prediction(leg, "notes"))
+        assert not b._forecasts_started and not b._own_succeeded, b._forecasts_started
+    finally:
+        main.parse = real_parse
+
+    # the request: OpenRouter, Rob's own key, reasoning effort; OpenRouter's billed cost is
+    # the call's cost, and spend_on keeps it apart from the Anthropic key's spend
+    import httpx
+
+    sent: list[dict] = []
+
+    async def fake_send(self, request, *args, **kwargs):
+        sent.append({"url": str(request.url), "auth": request.headers.get("authorization"), "body": json.loads(request.content)})  # fmt: skip
+        return httpx.Response(200, request=request, json={
+            "id": "gen-1", "object": "chat.completion", "created": 1, "model": "openai/gpt-6.1-sol",
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": "Probability: 40%"}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15, "cost": 0.0012}})  # fmt: skip
+
+    real_send = httpx.AsyncClient.send
+    try:
+        httpx.AsyncClient.send = fake_send  # type: ignore[method-assign]
+        with env(OPENROUTER_API_KEY="sk-or-credits", EXTRA_FORECASTERS=argon, **own):
+            llm = main.build_extra_forecasters()[0]
+            with spend.collecting() as ledger:
+                assert asyncio.run(llm.invoke("Forecast this.")) == "Probability: 40%"
+    finally:
+        httpx.AsyncClient.send = real_send  # type: ignore[method-assign]
+    assert sent[0]["url"] == "https://openrouter.ai/api/v1/chat/completions", sent
+    assert sent[0]["auth"] == "Bearer sk-or-own-fake", sent[0]["auth"]
+    assert sent[0]["body"]["reasoning"] == {"effort": "high"} and "reasoning_effort" not in sent[0]["body"], sent
+    assert sent[0]["body"]["max_tokens"] == main.ANTHROPIC_FORECAST_MAX_TOKENS, sent
+    assert sent[0]["body"]["model"] == "google/gemini-4-argon", sent
+    assert [(c.model, c.cost) for c in ledger.calls] == [(argon, 0.0012)], ledger.calls
+    assert main.spend_on(ledger.calls, {argon}) == 0.0012 and main.spend_on(ledger.calls, {sol}) == 0.0
+    print("extra forecasters: ok")
 
 
 def check_scorecard() -> None:
@@ -2519,6 +2717,7 @@ if __name__ == "__main__":
     check_watchdog()
     check_model_watch()
     check_model_tags()
+    check_extra_forecasters()
     check_scorecard()
     check_aggregation()
     check_guards()

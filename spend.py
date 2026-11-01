@@ -84,6 +84,7 @@ class Ledger:
     def __init__(self) -> None:
         self.calls: list[Call] = []
         self.raised: Counter[str] = Counter()  # calls that raised, by error type
+        self.raised_models: Counter[str] = Counter()  # and by model
 
     def total(self) -> float:
         return sum(c.cost or 0.0 for c in self.calls)
@@ -344,6 +345,7 @@ def record_raised(model: str, error: BaseException) -> None:
     ledger = _ledger.get()
     if ledger is not None:
         ledger.raised[type(error).__name__] += 1
+        ledger.raised_models[model] += 1
         logger.info(
             f"Spend: {label(_question.get())} | {_part.get() or 'other'} | {model}"
             f" | raised {type(error).__name__}; any cost is missing here"
