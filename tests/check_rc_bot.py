@@ -2198,8 +2198,8 @@ def check_research_tools() -> None:
     for name in (spend.TRACE_VARIABLE, "TRIAL_RESEARCH_TOOLS"):
         assert name in test_bot and name not in tournament and name not in cup, name
 
-    # the written record says what a public trace holds, what storage there is, and which
-    # of this change's rules under older entries Rob hasn't ratified yet
+    # the written record says what a public trace holds, what storage there is, and that
+    # Rob ratified this change's rules under older entries
     readme = (workflows.parents[1] / "README.md").read_text(encoding="utf-8")
     trace_note = "tool inputs and the first 400 characters code printed"
     assert trace_note in " ".join(readme.split()) and trace_note in test_bot
@@ -2209,7 +2209,7 @@ def check_research_tools() -> None:
     closers = [line for line in readme.splitlines() if line.startswith("  \u2014 ")]
     for start, proposal in (("[rc_trader's 2026-09-23 audit](", "Actions cache exception"), ("Rob approved a", "research alert")):
         closer = next(line for line in closers if line.startswith(f"  \u2014 {start}") and "health review" in line)
-        assert f"The {proposal} is Claude's proposal, not ratified until Rob approves the PR" in closer, closer
+        assert f"The {proposal} was Claude's proposal, which Rob ratified on 2026-11-04" in closer, closer
     print("research tools: ok")
 
 
