@@ -835,6 +835,20 @@ def check_own_key() -> None:
     _, _, exited, _ = run_main("test_questions", 1.5, questions, TRIAL_RESEARCH_TOOLS="fast", **keys)
     assert "RESEARCH_TOOLS must be" in (exited or ""), exited
 
+    # the run page lists a tool setting only when the run could read it: on the credits
+    # research has no tools, so the input is called out as ignored instead
+    testing = {"bot-testing-area": [open_question(9, 2)]}
+    trial = dict(TRIAL_RESEARCH_TOOLS="basic:5", **keys)
+    _, summary, exited, _ = run_main("test_questions", 80.0, testing, **trial)
+    assert exited is None and "On trial" not in summary, (exited, summary)
+    assert "- `research_tools` input ignored:" in summary, summary
+    _, summary, _, _ = run_main("test_questions", 80.0, testing, PAY_WITH="own-key", **trial)
+    assert "- On trial (Test Bot inputs): tools `basic:5`." in summary, summary
+    assert "input ignored" not in summary, summary
+    # on Rob's key too, when another source took the place of its search tool
+    _, summary, _, _ = run_main("test_questions", 80.0, testing, PAY_WITH="own-key", PERPLEXITY_API_KEY="x", **trial)
+    assert "On trial" not in summary and "- `research_tools` input ignored:" in summary, summary
+
     # no key set: paused under the floor, and the alert says so
     calls, summary, _, _ = run_main("tournament", 1.5, questions, OPENROUTER_API_KEY="sk-fake")
     assert calls == [] and LAST["key_checks"] == 0, (calls, LAST)
@@ -1085,16 +1099,20 @@ def check_alerts() -> None:
     assert open_only == [False, False, False, False, True], open_only
 
     # degraded research: titled by the ISO week, so a second call that week opens nothing,
-    # whether or not Rob closed the first
+    # even once Rob has closed the first. The fake lists issues as GitHub does: a closed one
+    # only for state "all"
     year, week, _ = datetime.now(timezone.utc).isocalendar()
     filed: list[dict] = []
-    alerts.requests.get = lambda url, headers, params, timeout: FakeResponse(filed)  # type: ignore[assignment]
+    alerts.requests.get = lambda url, headers, params, timeout: FakeResponse(  # type: ignore[assignment]
+        [issue for issue in filed if params["state"] == "all" or issue.get("state") != "closed"]
+    )
     alerts.requests.post = lambda url, headers, json, timeout: (  # type: ignore[assignment]
         filed.append(json) or FakeResponse({})
     )
     try:
         with env(GITHUB_TOKEN=secret, GITHUB_REPOSITORY="o/r"):
             assert alerts.research_degraded(6, 12, "searches failed") is True
+            filed[0]["state"] = "closed"
             assert alerts.research_degraded(7, 12, "stopped early") is False
     finally:
         alerts.requests.get, alerts.requests.post = real_get, real_post  # type: ignore[assignment]
@@ -1825,18 +1843,23 @@ def cut_short_stops(*stops: str) -> list[str]:
 
 def anthropic_limit_reply() -> dict:
     """A research reply as Anthropic's API sends it when lookups run into their limits: one
-    search that found pages, one past its max_uses, a fetch, and code that printed the
-    limit. Its secrets are the ones a trace must never log."""
+    search that found two pages, one past its max_uses, one that found none, a fetch, and
+    code that printed the limit. The text's last tally is the one that counts. Its secrets
+    are the ones a trace must never log."""
     url = "https://www.reuters.com/world/example-2026-10-27/"
     reply = anthropic_search_reply()
     reply["content"] = [
         {"type": "thinking", "thinking": "THINKING-TEXT", "signature": "s"},
+        {"type": "text", "text": "A draft tally. Lookups: 9 worked, 0 failed.\n"},
         {"type": "server_tool_use", "id": "s1", "name": "web_search", "input": {"query": "polymarket"}},
         {"type": "web_search_tool_result", "tool_use_id": "s1", "content": [
+            {"type": "web_search_result", "url": url, "title": "Reuters", "encrypted_content": "ENCRYPTED-TEXT"},
             {"type": "web_search_result", "url": url, "title": "Reuters", "encrypted_content": "ENCRYPTED-TEXT"}]},
         {"type": "server_tool_use", "id": "s2", "name": "web_search", "input": {"query": "kalshi"}},
         {"type": "web_search_tool_result", "tool_use_id": "s2", "content": {
             "type": "web_search_tool_result_error", "error_code": "max_uses_exceeded"}},
+        {"type": "server_tool_use", "id": "s3", "name": "web_search", "input": {"query": "manifold"}},
+        {"type": "web_search_tool_result", "tool_use_id": "s3", "content": []},
         {"type": "server_tool_use", "id": "f1", "name": "web_fetch", "input": {"url": url}},
         {"type": "web_fetch_tool_result", "tool_use_id": "f1", "content": {
             "type": "web_fetch_result", "url": url, "retrieved_at": "2026-10-30T12:00:00Z",
@@ -1859,10 +1882,11 @@ def check_tool_census() -> None:
 
     key = "sk-ant-FAKE-never-logged"
     sent: list[dict] = []
+    reply = [anthropic_limit_reply()]
 
     async def fake_send(self, request, *args, **kwargs):
         sent.append(json.loads(request.content))
-        return httpx.Response(200, request=request, json=anthropic_limit_reply())
+        return httpx.Response(200, request=request, json=reply[0])
 
     records: list[logging.LogRecord] = []
     handler = logging.Handler()
@@ -1879,15 +1903,34 @@ def check_tool_census() -> None:
             with spend.collecting() as ledger:
                 asyncio.run(llm.invoke("Research this question."))
             call = ledger.calls[0]
-            assert (call.search_tries, call.search_pages, call.search_errors) == (2, 1, ("max_uses_exceeded",)), call
+            assert (call.search_tries, call.search_pages, call.search_errors) == (3, 1, ("max_uses_exceeded",)), call
             assert (call.fetch_tries, call.code_runs, call.tally) == (1, 1, (1, 2)), call
-            assert call.answered and call.searches == 4, call
+            assert call.answered and call.stop == "stop" and call.searches == 4, call
             assert not any("Research trace:" in r.getMessage() for r in records), "trace is off here"
             spend_line = next(r.getMessage() for r in records if r.getMessage().startswith("Spend: "))
             assert (
-                " | tools: 2 searches tried, 1 with pages, 1 fetches tried, 1 code runs, errors"
-                " max_uses_exceeded, tally (1, 2), stop " in spend_line
+                " | tools: 3 searches tried, 1 with pages, 1 fetches tried, 1 code runs, errors"
+                " max_uses_exceeded, tally (1, 2), stop stop, " in spend_line
             ), spend_line
+
+            # the watch's first rule, from real replies: one cut short or with no text is
+            # "stopped early", and a whole one isn't
+            def watched(answer: dict) -> spend.Call:
+                reply[0] = answer
+                with spend.collecting() as replied:
+                    asyncio.run(llm.invoke("Research this question."))
+                return replied.calls[0]
+
+            assert research_watch.reason(watched(anthropic_search_reply())) is None
+            for stop in cut_short_stops("pause_turn", "max_tokens", "refusal"):
+                call = watched(anthropic_search_reply(stop))
+                assert call.stop == {"max_tokens": "length"}.get(stop, stop), call
+                assert research_watch.reason(call) == "stopped early", call
+            for blocks in ([{"type": "thinking", "thinking": "t", "signature": "s"}], [{"type": "text", "text": " \n"}]):
+                call = watched({**anthropic_search_reply(), "content": blocks})
+                assert call.answered is False and call.stop == "stop", call
+                assert research_watch.reason(call) == "stopped early", call
+            reply[0] = anthropic_limit_reply()
 
         records.clear()
         with env(ANTHROPIC_API_KEY=key, TRIAL_RAW_TRACE="true"):
@@ -1914,9 +1957,9 @@ def check_tool_census() -> None:
     by_type: dict[str, list[dict]] = {}
     for block in trace["blocks"]:
         by_type.setdefault(block["type"], []).append(block)
-    assert [b["name"] for b in by_type["server_tool_use"]] == ["web_search", "web_search", "web_fetch", "code_execution"]
+    assert [b["name"] for b in by_type["server_tool_use"]] == ["web_search"] * 3 + ["web_fetch", "code_execution"]
     assert "polymarket" in by_type["server_tool_use"][0]["input"], trace
-    assert [b.get("results") for b in by_type["web_search_tool_result"]] == [1, None], trace
+    assert [b.get("results") for b in by_type["web_search_tool_result"]] == [2, None, 0], trace
     assert by_type["web_search_tool_result"][1]["error_code"] == "max_uses_exceeded", trace
     assert by_type["web_fetch_tool_result"][0]["result_type"] == "web_fetch_result", trace
     assert by_type["code_execution_tool_result"] == [{
@@ -2143,9 +2186,30 @@ def check_research_tools() -> None:
         assert "RESEARCH_TOOL_NOTE: ${{ vars.RESEARCH_TOOL_NOTE }}" in workflow
     for name in ("RESEARCH_WATCH_FILE", "actions/cache/restore", "actions/cache/save"):
         assert name in tournament and name not in test_bot and name not in cup, name
-    assert "continue-on-error: true" in tournament
+    assert tournament.count("continue-on-error: true") == 2
+    # the window survives a run only if the file the bot writes is the one both steps carry,
+    # the save sees its marker, and the restore finds an earlier run's key
+    assert "RESEARCH_WATCH_FILE: research_watch.json\n" in tournament
+    assert tournament.count("path: research_watch.json\n") == 2
+    assert "if: always() && hashFiles('research_watch.json.updated') != ''\n" in tournament
+    assert "key: research-watch-${{ github.run_id }}\n" in tournament
+    assert "restore-keys: research-watch-\n" in tournament
+    assert "key: research-watch-${{ github.run_id }}-${{ github.run_attempt }}\n" in tournament
     for name in (spend.TRACE_VARIABLE, "TRIAL_RESEARCH_TOOLS"):
         assert name in test_bot and name not in tournament and name not in cup, name
+
+    # the written record says what a public trace holds, what storage there is, and which
+    # of this change's rules under older entries Rob hasn't ratified yet
+    readme = (workflows.parents[1] / "README.md").read_text(encoding="utf-8")
+    trace_note = "tool inputs and the first 400 characters code printed"
+    assert trace_note in " ".join(readme.split()) and trace_note in test_bot
+    trace_doc = " ".join((spend.log_trace.__doc__ or "").split())
+    assert "the first 400 characters" in trace_doc and "can hold page text" in trace_doc, trace_doc
+    assert "the bot keeps no storage" not in readme
+    closers = [line for line in readme.splitlines() if line.startswith("  \u2014 ")]
+    for start, proposal in (("[rc_trader's 2026-09-23 audit](", "Actions cache exception"), ("Rob approved a", "research alert")):
+        closer = next(line for line in closers if line.startswith(f"  \u2014 {start}") and "health review" in line)
+        assert f"The {proposal} is Claude's proposal, not ratified until Rob approves the PR" in closer, closer
     print("research tools: ok")
 
 
@@ -2389,8 +2453,17 @@ def check_research_watch() -> None:
             # an idle run: no line, no file touched
             opened.clear()
             notes = []
+            before = saved.read_text(encoding="utf-8")
             main.watch_research([], main.ResearchHealth(), notes)
             assert notes == [] and opened == []
+
+            # a refusal at the spend limit isn't lost research, so a run of them is idle too,
+            # and leaves nothing to trip the alert once the limit lifts
+            refused = main.ResearchHealth()
+            for _ in range(8):
+                refused.record(name, "spend limit")
+            main.watch_research([], refused, notes)
+            assert notes == [] and opened == [] and saved.read_text(encoding="utf-8") == before
 
         # a failure here can't touch the run
         real_update = research_watch.update
@@ -2455,6 +2528,9 @@ def _research_survives_one_failure() -> None:
         assert main.spend_limit_reached(e), e
     else:
         raise AssertionError("research with every source failed must raise")
+    # and the run page, and the research watch, can tell it from a call that failed
+    assert tallies["perplexity/sonar-pro"].failures == {"spend limit": 1}, tallies
+    assert tallies["asknews/latest"].failures == {"RuntimeError": 2}, tallies
 
 
 def timed_question(kind: str = "binary", closes_in: timedelta | None = timedelta(hours=2)):

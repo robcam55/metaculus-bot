@@ -104,4 +104,4 @@ jobs:
           TRIAL_PARSER_MODEL: ${{ inputs.parser }}
           TRIAL_EXTRA_FORECASTERS: ${{ inputs.extra }}
           TRIAL_RESEARCH_TOOLS: ${{ inputs.research_tools }}
-          TRIAL_RAW_TRACE: "true" # logs each research reply's block types; Test Bot only
+          TRIAL_RAW_TRACE: "true" # logs each research reply's block types, tool inputs and the first 400 characters code printed; Test Bot only

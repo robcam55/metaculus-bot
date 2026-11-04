@@ -1074,8 +1074,9 @@ class RcForecastBot(ForecastBot):
                         f"Research source {name} failed for {question.page_url}:"
                         f" {type(e).__name__}: {e}"
                     )
-                    self.research_health.record(name, type(e).__name__)
-                    if spend_limit_reached(e):
+                    limited = spend_limit_reached(e)
+                    self.research_health.record(name, "spend limit" if limited else type(e).__name__)
+                    if limited:
                         refused = e
                     continue
                 if not (text and text.strip()):
@@ -2101,13 +2102,15 @@ def watch_research(calls: list[spend.Call], health: ResearchHealth, notes: list[
     a report came back degraded, and an issue when too many of the last ones did. The run's
     colour doesn't change, and measuring must not break the run: this never raises."""
     try:
-        # A cut-short or empty reply is already a call that research_watch.reason flags
+        # A cut-short or empty reply is already a call that research_watch.reason flags.
+        # A refusal at the spend limit isn't lost research: the run pauses and its own alert
+        # says why, and counting it would trip this alert once the limit lifts
         raised = sum(
             n
             for name, tally in health.sources.items()
             if name.startswith("anthropic/")
             for reason, n in tally.failures.items()
-            if reason != "returned nothing"
+            if reason not in ("returned nothing", "spend limit")
         )
         watch = research_watch.update(calls, raised, os.getenv("RESEARCH_WATCH_FILE", ""))
         if watch is None:
@@ -2363,9 +2366,18 @@ def main() -> None:
                 describe_pass("bot-testing-area", "bot-testing-area", len(testing), len(questions))
             )
             reports += run_pass("bot-testing-area", questions, tier, skip_previous=False)
-        trying = [f"{role} `{model}`" for role, model in trials.items() if model and (role != "extra" or extras)]
+        # Only the search tool on Rob's key reads a tool setting: elsewhere it does nothing,
+        # and the page must not read as if it ran
+        tools_ran = any(isinstance(s, AnthropicSearchLlm) for s in research_sources(build_llms(route)))
+        trying = [
+            f"{role} `{model}`"
+            for role, model in trials.items()
+            if model and (role != "extra" or extras) and (role != "tools" or tools_ran)
+        ]
         if trying:
             notes.append(f"- On trial (Test Bot inputs): {', '.join(trying)}.")
+        if trials["tools"] and not tools_ran:
+            notes.append("- `research_tools` input ignored: this run's research doesn't use the web tools on your key.")
 
     failures = [r for r in reports if isinstance(r, BaseException)]
     # Questions Anthropic refused to pay for on Rob's key mid-run: no red run (the next

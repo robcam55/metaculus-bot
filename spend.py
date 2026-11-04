@@ -64,7 +64,8 @@ ANTHROPIC_SEARCH_FEE = 0.01
 PARSING = "Parsing and summary"
 OTHER = "Other"
 
-# Set by the Test Bot alone: logs each research reply's block types (log_trace)
+# Set by the Test Bot alone: logs each research reply's block types, tool inputs and the
+# first 400 characters code printed (log_trace)
 TRACE_VARIABLE = "TRIAL_RAW_TRACE"
 # The line the research note asks each report to end with
 TALLY = re.compile(r"Lookups:\**\s*(\d+)\s+worked,\s*(\d+)\s+failed", re.I)
@@ -421,8 +422,10 @@ def record_raised(model: str, error: BaseException) -> None:
 
 def log_trace(text: str) -> None:
     """One raw research reply's shape, for the Test Bot's log: its block types, the tools'
-    inputs, and what code execution printed. The repo and its logs are public, so never
-    encrypted content or a document's text."""
+    inputs, and the first 400 characters code execution printed, which is how its error
+    text shows. The repo and its logs are public, so never encrypted content or a fetched
+    document. Code output is the one exception: with `filtered` tools the script prints from
+    what it found, so that output can hold page text."""
     reply = json.loads(text)
     blocks = []
     for block in reply.get("content") or []:
