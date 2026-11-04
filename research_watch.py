@@ -58,7 +58,7 @@ def reason(call: spend.Call) -> str | None:
         return "searches failed"
     if call.searches >= 3 and call.prompt_tokens - call.cache_reads < FRESH_FLOOR:
         return "results never reached the reply"
-    if call.tally and (call.tally[0] == 0 or call.tally[1] > call.tally[0]):
+    if call.tally and (call.tally[0] == 0 or call.tally[1] > call.tally[0]) and call.search_pages < call.search_tries:
         return "most lookups failed"
     return None
 

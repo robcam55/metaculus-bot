@@ -2322,10 +2322,24 @@ def check_research_watch() -> None:
     assert reason(research_call(prompt_tokens=35000, cache_reads=20000)) is None
     assert reason(research_call(searches=3, **thin)) == "results never reached the reply"
     assert reason(research_call(searches=2, **thin)) is None  # too few billed to tell
-    assert reason(research_call(tally=(2, 3))) == "most lookups failed"
-    assert reason(research_call(tally=(0, 0))) == "most lookups failed"
+    # the tally counts only when some search truly failed
+    one_failed = dict(search_pages=4)
+    assert reason(research_call(tally=(2, 3), **one_failed)) == "most lookups failed"
+    assert reason(research_call(tally=(0, 0), **one_failed)) == "most lookups failed"
+    assert reason(research_call(tally=(3, 3), **one_failed)) is None
+    assert reason(research_call(tally=(5, 0), **one_failed)) is None
+    # with pages on every search the results reached the model: Claude calling one failed
+    # for finding nothing relevant isn't lost research
+    assert reason(research_call(tally=(2, 3))) is None
+    assert reason(research_call(tally=(0, 0))) is None
     assert reason(research_call(tally=(3, 3))) is None
     assert reason(research_call(tally=(5, 0))) is None
+    # the first live report, 46337 in run 41883989681, flagged though nothing was lost
+    live = research_call(
+        searches=5, search_tries=5, search_pages=5, fetch_tries=2, code_runs=0,
+        prompt_tokens=56532, cache_reads=0, tally=(3, 4),
+    )  # fmt: skip
+    assert reason(live) is None
 
     # only research on Rob's key
     picked = research_call()
