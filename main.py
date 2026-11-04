@@ -170,10 +170,11 @@ ANTHROPIC_PARSER_MAX_TOKENS = 8000
 _OLDER_HAIKU = re.compile(r"haiku-[34]")
 # Anthropic's own web search and fetch for the search-backed model on Rob's key, passed as
 # tools because litellm's web_search_options always sends the older web_search_20250305.
-# Both are called directly: these versions default to being called from inside code
+# Both are called directly: Sonnet 5.5 otherwise calls these versions from inside code
 # execution (dynamic filtering), and from 10-31 to 11-03 that lost most of what was paid
-# for. In 46 of 71 reports searches were billed and came back, yet none reached the reply
-# (README, Why). Direct results all enter the context, which costs more and can't vanish.
+# for. In 46 of 71 reports searches were billed and came back, yet none reached the reply:
+# its scripts crashed or hit the limit first (README, Why). Direct results all enter the
+# context, which costs more and can't vanish.
 # litellm 1.80.10 passes allowed_callers through and sends the beta header
 # web-fetch-2025-09-10 in place of any other.
 ANTHROPIC_SEARCH_TOOL = {
@@ -197,7 +198,7 @@ ANTHROPIC_FETCH_TOOL = {
 # 2026-11-04: filtered:4 sends exactly that request, the system note included (none). Each
 # direct use can take a server round and a paused reply is thrown away whole (litellm
 # can't continue it), so searches + fetches + the final answer stay within the server's
-# 10 rounds.
+# 10 rounds. The trial never reached them.
 RESEARCH_TOOL_MODES = ("direct", "basic", "filtered")
 DEFAULT_RESEARCH_TOOLS = "direct:5"
 MAX_RESEARCH_SEARCHES = 6
