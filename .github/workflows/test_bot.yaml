@@ -27,6 +27,9 @@ on:
       extra:
         description: "Extra forecasters to try on your OpenRouter key, e.g. openrouter/openai/gpt-6.1-sol:2 (empty: EXTRA_FORECASTERS)"
         default: ""
+      research_tools:
+        description: "Research tool setting to try on your key, e.g. basic:5 or filtered:4 (empty: RESEARCH_TOOLS)"
+        default: ""
 
 # Add concurrency group to prevent parallel runs
 concurrency:
@@ -84,6 +87,8 @@ jobs:
           FORECASTER_MODEL: ${{ vars.FORECASTER_MODEL }}
           FORECASTER_EFFORT: ${{ vars.FORECASTER_EFFORT }}
           RESEARCH_WEB_FETCH: ${{ vars.RESEARCH_WEB_FETCH }}
+          RESEARCH_TOOLS: ${{ vars.RESEARCH_TOOLS }}
+          RESEARCH_TOOL_NOTE: ${{ vars.RESEARCH_TOOL_NOTE }}
           # A second model family, on Rob's own OpenRouter key (off unless both are set)
           OPENROUTER_OWN_API_KEY: ${{ secrets.OPENROUTER_OWN_API_KEY }}
           EXTRA_FORECASTERS: ${{ vars.EXTRA_FORECASTERS }}
@@ -98,3 +103,5 @@ jobs:
           TRIAL_RESEARCHER_MODEL: ${{ inputs.researcher }}
           TRIAL_PARSER_MODEL: ${{ inputs.parser }}
           TRIAL_EXTRA_FORECASTERS: ${{ inputs.extra }}
+          TRIAL_RESEARCH_TOOLS: ${{ inputs.research_tools }}
+          TRIAL_RAW_TRACE: "true" # logs each research reply's block types; Test Bot only

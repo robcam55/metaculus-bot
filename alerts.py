@@ -6,8 +6,8 @@ every 20 minutes for as long as the cause lasts. An alert instead opens one issu
 time its event happens, mentioning the repository's owner. Later runs find an issue with
 the same title, open or closed (for Rob's own key and the Cloudflare clock, open), and
 open nothing. Each title
-names what makes the event new: a new credit limit after a Metaculus top-up, or a new
-month for Rob's own key.
+names what makes the event new: a new credit limit after a Metaculus top-up, a new
+month for Rob's own key, or a new week for research that keeps coming back degraded.
 
 No forecasting-tools import here, so the offline checks can exercise it directly.
 """
@@ -80,6 +80,11 @@ def _month() -> str:
     return f"{datetime.now(timezone.utc):%Y-%m}"
 
 
+def _week() -> str:
+    year, week, _ = datetime.now(timezone.utc).isocalendar()
+    return f"{year}-W{week:02d}"
+
+
 def _limit(limit: float | None) -> str:
     return f" (of the ${limit:.0f} limit)" if limit is not None else ""
 
@@ -142,4 +147,16 @@ def own_key_rejected(error: str) -> bool:
         f"Anthropic rejected `ANTHROPIC_API_KEY` ({error}), so the bot is paused. Replace"
         " the repository secret with a working key from the Claude Console." + REOPEN_NOTE,
         open_only=True,
+    )
+
+
+def research_degraded(bad: int, window: int, reasons: str) -> bool:
+    return raise_alert(
+        f"Research is degraded ({_week()})",
+        f"{bad} of the last {window} research reports on your Anthropic key came back degraded"
+        f" ({reasons}). Forecasts still went out on AskNews and whatever search found, and the"
+        " run stays green on purpose. Read the reports and the tools part of each Spend line"
+        " in the run's log. RESEARCH_TOOLS changes the tool setting without a code change"
+        " (README, the variables table). This issue opens at most once a week; close it"
+        " whenever.",
     )

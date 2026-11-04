@@ -27,6 +27,9 @@ import alerts
 # Numeric and multiple-choice answers that would otherwise sink a whole question.
 import forecast_guards
 
+# Whether research on Rob's key reaches its reports, across runs.
+import research_watch
+
 # Runtime helpers (env validation, banners, dependency-warning suppression).
 from bot_helpers import (
     check_environment,
@@ -165,30 +168,62 @@ PARSER_EFFORT = "low"
 ANTHROPIC_PARSER_MAX_TOKENS = 8000
 # Models that take no effort setting and accept a temperature: Haiku 4.5 and older
 _OLDER_HAIKU = re.compile(r"haiku-[34]")
-# Anthropic's own web search for the search-backed model on Rob's key, up to four searches
-# a question at $10 per 1,000. It is passed as a tool, not litellm's web_search_options,
-# which litellm 1.80.10 always sends as the older web_search_20250305: this version
-# filters results before they enter the context (dynamic filtering, no extra fee), so
-# fewer of them are billed as input.
-ANTHROPIC_SEARCH_TOOL = {"type": "web_search_20260209", "name": "web_search", "max_uses": 4}
-# And Anthropic's web fetch, so research can open the page the resolution criteria name
-# and read its current state: the Spring 2026 winner read its resolution links, and
-# several losses here turned on a source's state (a grid connection, a tide gauge). No
-# fee; a fetched page is billed as input, capped here at 8,000 tokens, twice a question.
-# Four searches and two fetches keep the server's tool loop well under its 10 rounds.
-# litellm 1.80.10 sends the beta header web-fetch-2025-09-10 with it, in place of any
-# other. RESEARCH_WEB_FETCH=false turns it off without a code change.
+# Anthropic's own web search and fetch for the search-backed model on Rob's key, passed as
+# tools because litellm's web_search_options always sends the older web_search_20250305.
+# Both are called directly: these versions default to being called from inside code
+# execution (dynamic filtering), and from 10-31 to 11-03 that lost most of what was paid
+# for. In 46 of 71 reports searches were billed and came back, yet none reached the reply
+# (README, Why). Direct results all enter the context, which costs more and can't vanish.
+# litellm 1.80.10 passes allowed_callers through and sends the beta header
+# web-fetch-2025-09-10 in place of any other.
+ANTHROPIC_SEARCH_TOOL = {
+    "type": "web_search_20260209",
+    "name": "web_search",
+    "max_uses": 5,
+    "allowed_callers": ["direct"],
+}
+# No fee for a fetch; a page is billed as input, capped at 8,000 tokens. A fetch that fails
+# still counts. RESEARCH_WEB_FETCH=false turns it off without a code change.
 ANTHROPIC_FETCH_TOOL = {
     "type": "web_fetch_20260209",
     "name": "web_fetch",
     "max_uses": 2,
     "max_content_tokens": 8000,
     "citations": {"enabled": True},
+    "allowed_callers": ["direct"],
 }
+# RESEARCH_TOOLS, written mode:searches. direct is the default. basic is the older
+# versions, which call directly by default. filtered is the tools as they ran before
+# 2026-11-04: filtered:4 sends exactly that request, the system note included (none). Each
+# direct use can take a server round and a paused reply is thrown away whole (litellm
+# can't continue it), so searches + fetches + the final answer stay within the server's
+# 10 rounds.
+RESEARCH_TOOL_MODES = ("direct", "basic", "filtered")
+DEFAULT_RESEARCH_TOOLS = "direct:5"
+MAX_RESEARCH_SEARCHES = 6
+BASIC_SEARCH_TYPE = "web_search_20250305"
+BASIC_FETCH_TYPE = "web_fetch_20250910"
+# The allowance and the order to spend it in, as a system note on this route alone: the
+# shared brief also goes to :online and Perplexity
+TOOL_NOTE = (
+    "{allowance} Make one call at a time and read each result before the next.\n\n"
+    "Spend them in this order:\n"
+    "1. If the resolution criteria or fine print name a source or link to one, {first}\n"
+    "2. Forecasts elsewhere: at most two searches, one naming Polymarket and Kalshi, one"
+    " naming Manifold and Metaculus, not one per venue.\n"
+    "3. The base rate or past values the brief asks for.\n"
+    "4. With what is left, the latest value and volatility of a data series the question"
+    " turns on, then other news.\n\n"
+    "If a tool says it has reached its limit, stop calling it and write the report from"
+    " what you have. Write nothing between calls: everything goes in one final report.\n\n"
+    'A lookup that returned an error or was refused is not a finding: write "lookup failed"'
+    ' for it, never "not found". End the report with one line in exactly this form,'
+    " counting every {counted} you tried: Lookups: N worked, M failed."
+)
 # Stop reasons (as litellm reports them) for a research reply that ended before its
 # answer: a server-side search loop paused, the reply ran out of tokens, or a safety
 # classifier stopped it
-CUT_SHORT = ("pause_turn", "length", "refusal")
+CUT_SHORT = research_watch.CUT_SHORT
 
 # What Anthropic says when a key can't spend: a workspace or organization spend limit
 # (400 invalid_request_error, or 429 enforced_spend_limit_reached), prepaid credit gone,
@@ -479,6 +514,65 @@ def _env_flag(name: str, default: bool) -> bool:
     return value in ("1", "true", "yes", "on")
 
 
+def research_tools() -> tuple[str, int]:
+    """RESEARCH_TOOLS (a repository variable), or the Test Bot's input: the tool mode and
+    searches a question, like direct:5."""
+    value = (trial_model("tools") or os.getenv("RESEARCH_TOOLS", "")).strip().lower()
+    value = value or DEFAULT_RESEARCH_TOOLS
+    mode, _, count = value.partition(":")
+    if (
+        mode not in RESEARCH_TOOL_MODES
+        or not count.isdecimal()
+        or not 1 <= int(count) <= MAX_RESEARCH_SEARCHES
+    ):
+        raise SystemExit(
+            "RESEARCH_TOOLS must be direct, basic or filtered, then a colon and 1 to"
+            f" {MAX_RESEARCH_SEARCHES} searches, like direct:5; got {value!r}"
+        )
+    return mode, int(count)
+
+
+def anthropic_research_tools() -> list[dict]:
+    """The web tools for research on Rob's key, as RESEARCH_TOOLS and RESEARCH_WEB_FETCH
+    set them."""
+    mode, searches = research_tools()
+    search = {**ANTHROPIC_SEARCH_TOOL, "max_uses": searches}
+    fetch = dict(ANTHROPIC_FETCH_TOOL)
+    if mode in ("filtered", "basic"):
+        search.pop("allowed_callers")
+        fetch.pop("allowed_callers")
+    if mode == "basic":
+        search["type"], fetch["type"] = BASIC_SEARCH_TYPE, BASIC_FETCH_TYPE
+    return [search] + ([fetch] if _env_flag("RESEARCH_WEB_FETCH", True) else [])
+
+
+def tool_rules(tools: list[dict]) -> str | None:
+    """The system note for research with these tools, its numbers their own max_uses, or
+    None: filtered sends the old request, and RESEARCH_TOOL_NOTE=false turns it off."""
+    if research_tools()[0] == "filtered" or not _env_flag("RESEARCH_TOOL_NOTE", True):
+        return None
+    uses = {tool.get("name"): tool.get("max_uses") for tool in tools}
+    searches, fetches = uses.get("web_search"), uses.get("web_fetch")
+    if not searches:
+        return None
+    allowance = f"{searches} web {'search' if searches == 1 else 'searches'}"
+    if not fetches:
+        return TOOL_NOTE.format(
+            allowance=f"You have {allowance} for this question, and no more.",
+            first="spend one search finding its latest reading first.",
+            counted="search",
+        )
+    pages = f"{fetches} page {'fetch' if fetches == 1 else 'fetches'}"
+    return TOOL_NOTE.format(
+        allowance=(
+            f"You have {allowance} and {pages} for this question, and no more."
+            " A fetch that fails still counts."
+        ),
+        first="open it first: fetch its link, or spend one search finding it.",
+        counted="search and fetch",
+    )
+
+
 def _has_asknews() -> bool:
     return bool(
         (os.getenv("ASKNEWS_CLIENT_ID") and os.getenv("ASKNEWS_SECRET"))
@@ -491,7 +585,7 @@ class ResearchCutShort(RuntimeError):
 
 
 class AnthropicSearchLlm(GeneralLlm):
-    """Sonnet 5.5 with Anthropic's web search, on Rob's own key. Three things GeneralLlm
+    """Sonnet 5.5 with Anthropic's web search, on Rob's own key. Five things GeneralLlm
     doesn't do on this route:
     - Keep the sources. litellm 1.80.10 keeps Anthropic's citations in the message's
       provider_specific_fields, which GeneralLlm never reads, so until 2026-10-28 the
@@ -508,8 +602,10 @@ class AnthropicSearchLlm(GeneralLlm):
       fails GeneralLlm's own check before the stop reason is read; it is treated the same.
     - List the pages it opened. litellm drops web fetch results, and a citation of a
       fetched page carries no URL, so the fetched URLs come from the fetch calls.
+    - Send a system note with the search allowance and the order to spend it in (tool_rules),
+      on this route alone: the shared brief also goes to :online and Perplexity.
     The researcher is always invoked with a plain prompt, which model_input_to_message
-    turns into one user message."""
+    turns into the note and one user message."""
 
     async def _mockable_direct_call_to_model(self, prompt):
         try:
@@ -528,6 +624,8 @@ class AnthropicSearchLlm(GeneralLlm):
             )
 
     def model_input_to_message(self, user_input, system_prompt=None):
+        if system_prompt is None and isinstance(user_input, str):
+            system_prompt = tool_rules(self.litellm_kwargs.get("tools") or [])
         messages = super().model_input_to_message(user_input, system_prompt)
         last = messages[-1]
         if last.get("role") == "user" and isinstance(last.get("content"), str):
@@ -561,8 +659,7 @@ class AnthropicSearchLlm(GeneralLlm):
             # Only when a fetched page is cited, since a failed fetch can't be told apart
             urls = [u for u in _fetched_urls(message) if u not in urls] + urls
         if not cited_any:
-            # Nothing cited (with dynamic filtering the searches run inside code, and
-            # the answer may cite none): the pages the searches returned, instead
+            # Nothing cited (a reply can cite none): the pages the searches returned, instead
             for result in fields.get("web_search_results") or []:
                 found = result.get("content") if isinstance(result, dict) else None
                 for item in found if isinstance(found, list) else []:
@@ -611,19 +708,21 @@ def model_of_reasoning(reasoning: str) -> str | None:
     return found.group(1) if found else None
 
 
-# The Test Bot's inputs for trying another model in one role (test_bot.yaml sets these
-# from its own inputs; no other workflow does, and main() drops them outside the Test Bot):
-# how a newly released model is run before a switch (model_watch.py)
+# The Test Bot's inputs for trying another model in one role, or research tool setting
+# (test_bot.yaml sets these from its own inputs; no other workflow does, and main() drops
+# them outside the Test Bot): how a newly released model is run before a switch
+# (model_watch.py)
 TRIAL_MODELS = {
     "forecaster": "TRIAL_FORECASTER_MODEL",
     "researcher": "TRIAL_RESEARCHER_MODEL",
     "parser": "TRIAL_PARSER_MODEL",
     "extra": "TRIAL_EXTRA_FORECASTERS",
+    "tools": "TRIAL_RESEARCH_TOOLS",
 }
 
 
 def trial_model(role: str) -> str:
-    """The model the Test Bot is trying for `role`, or "" for the bot's own."""
+    """What the Test Bot is trying for `role`, or "" for the bot's own."""
     return os.getenv(TRIAL_MODELS[role], "").strip()
 
 
@@ -792,8 +891,7 @@ def build_llms(
             temperature=None,
             timeout=300,
             allowed_tries=2,
-            tools=[dict(ANTHROPIC_SEARCH_TOOL)]
-            + ([dict(ANTHROPIC_FETCH_TOOL)] if _env_flag("RESEARCH_WEB_FETCH", True) else []),
+            tools=anthropic_research_tools(),
             **room,
         )
     if os.getenv("RESEARCHER"):
@@ -1998,6 +2096,33 @@ def credit_alerts(meter: budget.SpendMeter, plan: budget.Plan) -> list[str]:
     return ["- Opened an issue to tell Rob about the credits."] if opened else []
 
 
+def watch_research(calls: list[spend.Call], health: ResearchHealth, notes: list[str]) -> None:
+    """A line on the run page for what the web tools did on Rob's key, an annotation when
+    a report came back degraded, and an issue when too many of the last ones did. The run's
+    colour doesn't change, and measuring must not break the run: this never raises."""
+    try:
+        # A cut-short or empty reply is already a call that research_watch.reason flags
+        raised = sum(
+            n
+            for name, tally in health.sources.items()
+            if name.startswith("anthropic/")
+            for reason, n in tally.failures.items()
+            if reason != "returned nothing"
+        )
+        watch = research_watch.update(calls, raised, os.getenv("RESEARCH_WATCH_FILE", ""))
+        if watch is None:
+            return
+        notes.append(watch.line)
+        if watch.warning:
+            print(watch.warning)
+        if watch.tripped:
+            # Tripped by earlier runs alone, this run has no reasons of its own to give
+            reasons = ", ".join(sorted(set(watch.degraded))) or "none of them this run"
+            alerts.research_degraded(watch.bad, watch.window, reasons)
+    except Exception as e:
+        logger.warning(f"Research watch failed ({type(e).__name__})")
+
+
 class OwnKey:
     """Rob's own Anthropic key during one run. It is checked once, before the first
     question it would pay for, so a key that can't pay costs no AskNews calls or
@@ -2052,6 +2177,7 @@ def main() -> None:
         for variable in TRIAL_MODELS.values():
             os.environ.pop(variable, None)
     extras = extra_forecaster_models()  # a mistyped EXTRA_FORECASTERS stops the run here
+    research_tools()  # a mistyped RESEARCH_TOOLS stops the run here
     extras_without_key = bool(requested_extras()) and not extras
     if extras_without_key and trials["extra"]:
         sys.exit(f"The Test Bot's extra forecasters need the {OWN_OPENROUTER_KEY} secret (Setup, step 11)")
@@ -2124,6 +2250,7 @@ def main() -> None:
     }
 
     health = ResearchHealth()
+    watch_calls: list[spend.Call] = []  # the research replies on Rob's key, across passes
     passes: list[str] = []
     breakdowns: list[str] = []
     own_openrouter_spent = [0.0]  # the extra forecasters' spend on Rob's OpenRouter key
@@ -2150,6 +2277,7 @@ def main() -> None:
             own_key.checked, own_key.problem = True, "limit"
         # OpenRouter's records only on its own route; list prices fill gaps on every route
         ledger.look_up(os.environ["OPENROUTER_API_KEY"] if route == "openrouter" else "")
+        watch_calls.extend(research_watch.replies(ledger.calls))
         breakdowns.extend(
             spend.breakdown(label, ledger, question_statuses(questions, results, publish))
         )
@@ -2266,6 +2394,7 @@ def main() -> None:
         budget.write_step_summary(breakdowns)
     configured = [source_name(s) for s in research_sources(build_llms(route))]
     lines = run_report(passes, configured, health, reports)
+    watch_research(watch_calls, health, notes)
     if extras:
         counts = Counter(extras)
         names = ", ".join(f"{m} ×{n}" if n > 1 else m for m, n in counts.items())
