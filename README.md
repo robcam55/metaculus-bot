@@ -9,7 +9,8 @@ questions a season against professional forecasters, with no money at risk.
 ## What's different from the template
 
 The changes are in `main.py` (`RcForecastBot`), `budget.py`, `spend.py`, `alerts.py`,
-`forecast_guards.py`, `clock_watchdog.py`, `model_watch.py` and `scorecard.py`:
+`forecast_guards.py`, `clock_watchdog.py`, `model_watch.py`, `research_watch.py` and
+`scorecard.py`:
 - **Claude models, on Metaculus's credits first.**
   - Metaculus's donated OpenRouter credits (`OPENROUTER_API_KEY`) pay before a personal
     `ANTHROPIC_API_KEY`.
@@ -92,13 +93,13 @@ The changes are in `main.py` (`RcForecastBot`), `budget.py`, `spend.py`, `alerts
     `ASKNEWS_ARTICLES` change this without a code change.
   - A search-backed model: Sonnet 5.5 with OpenRouter's `:online` (Anthropic's own web search,
     which Metaculus's credits cover). On your own key, Sonnet 5.5 calls Anthropic's web
-    search tool directly (`web_search_20260209`, which filters results before they enter
-    the context), up to four searches a question, with each round of results cached for
-    the next search and its sources kept (pages it opened listed first when cited). It can
-    also open two pages a question with
-    Anthropic's web fetch tool (`web_fetch_20260209`, up to 8,000 tokens a page;
-    `RESEARCH_WEB_FETCH=false` turns it off). Or Perplexity, with its own key. Its prompt
-    carries the question's background, and asks for:
+    search and fetch tools directly (`web_search_20260209` and `web_fetch_20260209`, with
+    `allowed_callers`, not from inside code), up to five searches and two page fetches a
+    question, with a note giving that allowance and an order of priorities. Each round of
+    results is cached for the next search, and its sources are kept (pages it opened
+    listed first when cited). A page runs up to 8,000 tokens; `RESEARCH_WEB_FETCH=false`
+    turns fetch off. Or Perplexity, with its own key. Its prompt carries the question's
+    background, and asks for:
     - the source the resolution criteria name, opened first where it can be: its latest
       value or status, any schedule or prediction it publishes for the period, and whether
       the outcome already looks settled;
@@ -110,9 +111,10 @@ The changes are in `main.py` (`RcForecastBot`), `budget.py`, `spend.py`, `alerts
   Every prompt, the search-backed model's and the forecasters', carries today's date and
   the question's close and resolution times.
 
-  If one source fails, the other still feeds the forecast. If every source fails (an
-  AskNews search that finds nothing, or a web search cut short, counts as failed), the
-  question isn't forecast blind:
+  If one source fails, the other still feeds the forecast. Research that came back with
+  text also counts as degraded when its tools failed (below), though it still feeds the
+  forecast. If every source fails (an AskNews search that finds nothing, or a web search
+  cut short, counts as failed), the question isn't forecast blind:
   - It waits for the next run, 20 minutes later, and turns this run red.
   - A question closing within 45 minutes gets no further try. It is forecast without
     research, and the forecasters are told so.
@@ -120,9 +122,14 @@ The changes are in `main.py` (`RcForecastBot`), `budget.py`, `spend.py`, `alerts
     question is forecast from the reports that found research.
 - **A report on each run's page.** For each tournament: how many questions were open, how
   many not yet forecast, and how many the run took. Then the research sources that are set
-  up, and how many searches each returned, with the error types of any that failed.
+  up, and how many searches each returned, with the error types of any that failed ("spend
+  limit" for a refusal at a spend limit).
   - A failing source leaves the run green. It shows in this table and as a "Research
     source failed" warning annotation on the run's summary.
+  - A research line counts what the web tools did: searches that brought back pages,
+    error codes, fetches tried, code runs and degraded reports. A degraded report adds a
+    "Research degraded" annotation, and 6 degraded of the last 12 opens one issue a week.
+    The run stays green.
   - An idle run still lists the sources, so new AskNews keys show up within 20 minutes.
   - A red run whose job reads "cancelled" after about 15 minutes, with no steps and no log,
     never got a GitHub runner, so the bot never started. Nothing needs fixing: the next run
@@ -358,6 +365,11 @@ newer local litellm once hid a call that crashes on the pinned one.
        and annotates them. A list set without the key turns the extras off with an
        annotation; on the Test Bot it stops the run.
 
+The Test Bot's `research_tools` input tries a research tool setting on your key for one
+run (`basic:5` or `filtered:4`, say) without a repository variable. The Test Bot logs each
+research reply's block types, tool inputs and the first 400 characters code printed. Those
+logs are public, and with `filtered` that output can be page text.
+
 Other optional repository variables (empty means the default):
 
 | Variable | Default |
@@ -372,6 +384,8 @@ Other optional repository variables (empty means the default):
 | `FORECASTER_MODEL` | `anthropic/claude-sonnet-5-5` (Metaculus Cup only; on the credits, and on your own key after them, the tier picks) |
 | `EXTRA_FORECASTERS` | Empty: none. OpenRouter models, comma-separated, each with an optional count, that forecast beside the bot's own in FutureEval and MiniBench on your `OPENROUTER_OWN_API_KEY` (Setup, step 11), for example `openrouter/openai/gpt-6.1-sol:2,openrouter/google/gemini-4-argon:1`. At most 5 extra forecasts, and never more than the bot's own. |
 | `RESEARCH_WEB_FETCH` | On (Rob's own key only): research may open two pages a question. `false` turns it off, leaving web search alone. |
+| `RESEARCH_TOOLS` | `direct:5` (Rob's own key only): Sonnet 5.5 calls web search and fetch directly, up to five searches a question. Written mode:searches, 1 to 6. `basic:N` uses the older tool versions. `filtered:N` uses dynamic filtering; `filtered:4` is the setup before 2026-11-04, the one that lost results. A mistyped value stops the run at startup. |
+| `RESEARCH_TOOL_NOTE` | On (Rob's own key only): research gets a short note with its allowance and order. `false` removes it. `filtered` never sends one. |
 | `FORECASTER_EFFORT` | `high` (Anthropic's own API, and the extra forecasters as OpenRouter's reasoning effort). `low` or `medium` sets that level; `default` sends none, which is `medium` on Opus 5.5 and `high` on Sonnet 5.5. |
 | `PREDICTIONS_PER_REPORT` | 5 (Metaculus Cup only) |
 | `ASKNEWS_STRATEGY` | `latest`: one latest-news search per question, covering the past day or two. `archive` searches the AskNews archive (about two months) instead; `both` does both, 12 seconds apart. Archive searches may count as several calls against AskNews's quota: confirm with AskNews first. |
@@ -389,12 +403,12 @@ The main architectural choices and the reasons behind them. Each links to where 
     - GitHub fired this repo's 20-minute schedule only about five times a day: 45 runs between Sep 23 and Oct 2, a median of 5 hours apart. That would miss roughly half the questions.
     - A Worker's cron trigger is a reliable clock that needs no server, and its token can touch only this repo's Actions.
     - Rob chose it over a workflow that re-triggers itself, which needs no token but keeps a GitHub runner busy around the clock.
-  - **Why no storage.** Metaculus keeps the forecasts, and OpenRouter keeps the spend.
+  - **Why no storage.** Metaculus keeps the forecasts, and OpenRouter keeps the spend. One exception since 2026-11-04: the last 12 research outcomes, 0s and 1s with no question text, sit in the Actions cache so the research watch can see across runs. Losing them only shortens the window.
   - **Why off by default.** Runs the clocks start stay off until `BOT_ENABLED`, so they can't fail every 20 minutes before the secrets exist.
   - **Why the backup clock is a workflow of its own.** GitHub disables a scheduled workflow in a public repo after 60 days without a commit, and the disable refuses every trigger, `workflow_dispatch` included. With the backup schedule inside the tournament workflow, that pause (about Dec 23 from the Oct 24 commit, two weeks before the season ends) would have stopped the Worker's runs too. The tournament workflow now has no schedule; only the backup can lapse.
   - **Why a watchdog.** When GitHub turns the Worker away, the error shows only in Cloudflare's logs and the bot drops to the backup clock, every four hours or so, missing a third to two thirds of FutureEval questions with every run green. `clock_watchdog.py` opens an issue when no Worker run is under two hours old.
 
-  — [rc_trader's 2026-09-23 audit](https://github.com/robcam55/rc_trader/blob/main/docs/audit/2026-09-23-AUDIT.md) (§8, Rob's hosting choice, 2026-09-23). The Cloudflare clock is Rob's choice of 2026-10-02, built in [#3](https://github.com/robcam55/metaculus-bot/pull/3). The question windows are from [Metaculus's resources page](https://www.metaculus.com/notebooks/38928/ai-benchmark-resources/), and the `BOT_ENABLED` gate from [the workflow](.github/workflows/run_bot_on_tournament.yaml). No storage is *inferred*. The backup clock's own workflow and the watchdog came from Claude's health review of 2026-10-28, with Rob's go-ahead that day, in [#13](https://github.com/robcam55/metaculus-bot/pull/13).
+  — [rc_trader's 2026-09-23 audit](https://github.com/robcam55/rc_trader/blob/main/docs/audit/2026-09-23-AUDIT.md) (§8, Rob's hosting choice, 2026-09-23). The Cloudflare clock is Rob's choice of 2026-10-02, built in [#3](https://github.com/robcam55/metaculus-bot/pull/3). The question windows are from [Metaculus's resources page](https://www.metaculus.com/notebooks/38928/ai-benchmark-resources/), and the `BOT_ENABLED` gate from [the workflow](.github/workflows/run_bot_on_tournament.yaml). No storage is *inferred*. The backup clock's own workflow and the watchdog came from Claude's health review of 2026-10-28, with Rob's go-ahead that day, in [#13](https://github.com/robcam55/metaculus-bot/pull/13). The Actions cache exception is Claude's proposal, not ratified until Rob approves the PR; see the 2026-11-04 entry.
 - **Claude models: Opus 5.5 on Metaculus's credits and on Rob's key after them, Sonnet 5.5 on the Cup's personal key; Sonnet 5.5 searches and Haiku 5.5 parses.** The bot is the external check on rc_trader's forecasting engine, which runs on Claude, and Metaculus's credits cover Anthropic models. — [rc_trader's 2026-09-23 audit](https://github.com/robcam55/rc_trader/blob/main/docs/audit/2026-09-23-AUDIT.md) (§8, D-14: "upgrade it as the §4 engine lands"). The switch to Opus 5.5 was Claude's, in [f4dfc32](https://github.com/robcam55/metaculus-bot/commit/f4dfc32), and Rob's credit application of 2026-09-24 described it. Sonnet 5.5 (same price as Sonnet 5) and Haiku 5.5 (a tenth of Haiku 4.5's price) replaced Sonnet 5 and Haiku 4.5 on 2026-10-28, at Rob's request to run the newest version of each model, in [#13](https://github.com/robcam55/metaculus-bot/pull/13). Opus 5.5 was already the newest Opus. Claude Fable 5.1, a tier above Opus at 2.5 times its price, was left as Rob's call.
 - **Metaculus's credits pay first, and never for the Metaculus Cup.**
   - **Cup on a personal key.** Metaculus gives the credits for FutureEval and MiniBench only, so the Cup, and any experiment run there, needs a personal key.
@@ -421,14 +435,14 @@ The main architectural choices and the reasons behind them. Each links to where 
   - **Why.** At the measured costs Metaculus's first $100 runs out around the end of October, and the season runs to Jan 6. Without more credit the bot would sit dark for about nine weeks. On 2026-10-06 Rob said he would fund the bot himself if Metaculus didn't.
   - **How.** Once the credits can't pay for another question above the $2 reserve and `ANTHROPIC_API_KEY` is set, both tournaments run on Rob's key at the pinned tier (`opus-3` without a pin), with the same two research sources: Sonnet 5 calls Anthropic's web search tool where the credits use OpenRouter's `:online`. A top-up moves the bot back onto the credits at the next run.
   - **Why "can't pay for another question", not "under $2".** The run cap spends only while the balance above $2 covers a question, so a balance can come to rest above $2 (up to $2.65 at `opus-3`) and stay there. The first version switched only under $2, so the bot would have sat idle in that band, on neither key, until a top-up. A pre-launch review caught this on 2026-10-15. The same review moved the run cap from the pacing estimates to measured costs, because capping at $0.30 a question let a burst plan about twice what lay above the reserve, so OpenRouter could refuse the key mid-question. The pacing estimates themselves are unchanged (Rob's choice of 2026-10-06).
-  - **The cap lives at Anthropic.** A plain key can't read what its workspace has spent, and the bot keeps no storage, so the cap is the workspace's monthly spend limit in the Claude Console. Anthropic enforces it, and it can't drift the way a count the bot kept itself could. One tiny request before the first question of a run tells a key at its limit, or a rejected one, from a working one. The bot then pauses quietly and opens one issue, without spending AskNews calls or research.
+  - **The cap lives at Anthropic.** A plain key can't read what its workspace has spent, and the bot keeps no spend record of its own, so the cap is the workspace's monthly spend limit in the Claude Console. Anthropic enforces it, and it can't drift the way a count the bot kept itself could. One tiny request before the first question of a run tells a key at its limit, or a rejected one, from a working one. The bot then pauses quietly and opens one issue, without spending AskNews calls or research.
 
   — Rob's choice of option (b) in chat on 2026-10-11, after Claude's status review that day. The design (the tier, Anthropic's web search, the cap as a workspace spend limit, the key check) is Claude's, in [#6](https://github.com/robcam55/metaculus-bot/pull/6). The "can't pay for another question" rule and the measured run cap are Claude's, in [#8](https://github.com/robcam55/metaculus-bot/pull/8). None of it is otherwise ratified.
-- **Alerts as GitHub issues, one per event.** The bot runs every 20 minutes, so a run that fails to get attention would email Rob every 20 minutes until fixed. Instead `alerts.py` opens one issue, mentioning the owner, the first time the credits fall below $15, when they run out, and when Rob's key hits its spend limit or is rejected. An issue with the same title, open or closed, stops a repeat. Titles carry the credit limit, or the month for Rob's key, so a new limit or month alerts again. The workflow's token gets `issues: write` for this and nothing more.
+- **Alerts as GitHub issues, one per event.** The bot runs every 20 minutes, so a run that fails to get attention would email Rob every 20 minutes until fixed. Instead `alerts.py` opens one issue, mentioning the owner, the first time the credits fall below $15, when they run out, when Rob's key hits its spend limit or is rejected, and when 6 of the last 12 research reports are degraded (titled by ISO week). An issue with the same title, open or closed, stops a repeat. Titles carry the credit limit, or the month for Rob's key, so a new limit or month alerts again. The workflow's token gets `issues: write` for this and nothing more.
   - **Rob's key's alerts, and the stopped clock's, count only while open.** After he raises a limit or replaces a key and closes the issue, a second stop the same month would otherwise stay silent, the bot paused with every run green.
   - **Read twice before opening.** On 2026-10-22 one list read in about 590 came back without the existing issue, and #10 duplicated #9.
 
-  — Rob approved a low-credit warning in chat on 2026-10-11. Claude proposed failing the run; the issue form replaced that on finding the email stream it would cause, in [#6](https://github.com/robcam55/metaculus-bot/pull/6); not otherwise ratified. The open-only rule and the second read are from Claude's 2026-10-28 health review, with Rob's go-ahead that day, in [#13](https://github.com/robcam55/metaculus-bot/pull/13).
+  — Rob approved a low-credit warning in chat on 2026-10-11. Claude proposed failing the run; the issue form replaced that on finding the email stream it would cause, in [#6](https://github.com/robcam55/metaculus-bot/pull/6); not otherwise ratified. The open-only rule and the second read are from Claude's 2026-10-28 health review, with Rob's go-ahead that day, in [#13](https://github.com/robcam55/metaculus-bot/pull/13). The research alert is Claude's proposal, not ratified until Rob approves the PR; see the 2026-11-04 entry.
 - **Two independent research sources, several forecasts, a trimmed mean.**
   - **Two sources.** Search luck drove most of the night-to-night noise in rc_trader's own forecasts. So each question gets AskNews latest news and Sonnet 5.5 with native web search, and if one source fails, the other still feeds the forecast.
   - **One AskNews call by default.** AskNews's free tier allows 1,000 calls a month, so it gets one latest-news call per question. `ASKNEWS_STRATEGY` and `ASKNEWS_ARTICLES` raise that without a code change once AskNews confirms its quota.
@@ -462,11 +476,20 @@ The main architectural choices and the reasons behind them. Each links to where 
   - **What the bot's own record showed.** Its 61 scored questions (mostly one MiniBench round, made by the older setup) scored +2.3 a question on yes/no (+1.0 on MiniBench's 35), against +9 to +18 on discrete and multiple choice. Status-on-a-date questions averaged about −1. Four of the five worst yes/no misses were Yes outcomes forecast at 13-42%. The binary forecasts averaged 36% against 41% resolved Yes, so no Yes lean showed for the one-sided step to correct.
   - **Yes/no rules.** The criteria restatement, the trajectory question and the soft clock come from nostreambot (10th in Spring 2026, about +12.7 a question in Summer 2026). Its 815-record audit, on its older models, found announced-target questions forecast at 44% for events that happened 8% of the time, about 19 points worse; the other rules each come from a single named miss. The market rule follows the Spring 2026 survey (checking markets r=+0.34, correlational) with nostreambot's caution that thin or stale prices don't anchor. Honest expectation: 0 to +0.5 a question, about $0.02-0.05 more.
   - **Numeric width and price floor.** The evidence on width is thin: the bot's 9 resolved forecaster ranges (3 questions, one model) all held the outcome inside their 10th to 90th percentiles, which a calibrated forecaster would manage about half the time on so few. nostreambot found its non-financial ranges 22% too wide, and its blanket widening moved calibration the wrong way in every segment it measured. So width now follows forecastability, with room for revised reports. The one place ranges ran too narrow was a traded price (XTND, −57.6, the worst question), hence the random-walk floor for prices only. It is defined on the standard deviation of daily moves: a median or average move runs 20-50% smaller for fat-tailed prices and would make the floor that much too narrow.
-  - **Research.** Spring 2026's winner read its resolution links; several losses here turned on a source's state (a grid connection, a tide gauge). Web fetch lets the researcher open them. The searched base rate and the venue-by-venue market lines replace a base rate from memory and discourage invented market numbers. About $0.04-0.10 a question more.
+  - **Research.** Spring 2026's winner read its resolution links; several losses here turned on a source's state (a grid connection, a tide gauge). Web fetch lets the researcher open them. The searched base rate and the venue-by-venue market lines replace a base rate from memory and discourage invented market numbers. About $0.04-0.10 a question more. `web_fetch` and search now run directly; see the 2026-11-04 entry.
   - **Measurement.** Per-question peer scores can't tell +3 from +6 this season (about 700 questions a setup would be needed). The model tags make paired, member-by-member comparisons possible once a second model family is added, and the kinds table shows where points go. bot-review moves to 0.1.2, which reads Metaculus's archived comments in full; with 0.1.1 the members of only 13 of 61 questions survived, likely for that reason.
-  - **Judging and backing out.** Judge the rules by the scorecard's "since 2026-10-30" rows (by setup, binary calibration by setup, kinds), against the "before" rows, not by rank, and only once a few dozen new questions have resolved. Width in particular: under about 75% of outcomes inside the 10th to 90th percentile over 20 or more new numeric questions means putting a widening line back. `RESEARCH_WEB_FETCH=false` stops the page fetches. To drop the prompt rules alone, revert the prompt text in main.py (the binary, multiple-choice, numeric and date prompts, the research brief's added lines, `WIDTH_RULE` and `DAILY_VOLATILITY`) by hand: reverting the whole change would also remove the scorecard tables and the model tags, and move bot-review back to 0.1.1.
+  - **Judging and backing out.** Judge the rules by the scorecard's "since 2026-10-30" rows (by setup, binary calibration by setup, kinds), against the "before" rows, not by rank, and only once a few dozen new questions have resolved. Width in particular: under about 75% of outcomes inside the 10th to 90th percentile over 20 or more new numeric questions means putting a widening line back. `RESEARCH_WEB_FETCH=false` stops the page fetches. `RESEARCH_TOOLS` and `RESEARCH_TOOL_NOTE` change the tools and the note. To drop the prompt rules alone, revert the prompt text in main.py (the binary, multiple-choice, numeric and date prompts, the research brief's added lines, `WIDTH_RULE` and `DAILY_VOLATILITY`) by hand: reverting the whole change would also remove the scorecard tables and the model tags, and move bot-review back to 0.1.1.
 
   — Claude's 2026-10-30 research into the leading bots; Rob's go-ahead that day in chat ("Let's move forward with these changes ... If they don't seem to meaningfully enhance prediction accuracy, we can back down").
+- **Research tools called directly, not from code (2026-11-04).** `web_search_20260209` and `web_fetch_20260209` can run inside code execution, where Claude reads a result only through what its own script prints, and Sonnet 5.5 opened all 4 replies traced in the trial that way. In production that lost most of what was paid for. In 46 of the 71 reports from 10-31 to 11-03, no search reached the writer, though 42 of those were billed all four searches and their Sources lists held the pages. Runs stayed green, because any reply with text counted as worked.
+  - **The fault.** The Test Bot's raw trace of 4 replies (2026-11-04) shows it. All 14 billed searches returned pages. Inside code `web_search` returns a JSON string, first scripts treated it as a list and crashed, scripts queued up to 6 searches on a limit of 4, and the first over-limit call ended the script with "Server tool use limit exceeded during code execution." Direct retries were then refused with `max_uses_exceeded`. At most 2 of the 14 searches reached the writer, each as a 1,500-character slice. In the live reports a full blackout wrote about as many cache tokens as a call that ran no search, and 72 Opus reasonings stated "no market" for a lookup that had failed. That a killed script loses what it had printed is *inferred*, because that output is encrypted in the response. That the live runs of 10-31 to 11-03 failed this way is also *inferred*.
+  - **Why direct.** Direct search is the only setup with a clean record here, and a result that returns has reached the model by construction. Rewriting the brief alone can't fix a script that loses its output, and more allowance only moves the limit. In the trial, on bot-testing-area questions, all 32 direct searches brought back pages, with no code runs and 0 of 8 reports degraded. A research call cost about $0.20 against $0.12.
+  - **Why five searches and two fetches.** Five restores the figure cut on 2026-10-30. With the final answer that is 8 of the server's 10 rounds, and a paused reply is thrown away whole because litellm can't continue it. Six would cost about $0.04 more and leave one round spare. The trial never reached that limit: a direct reply took at most 5 rounds of tool calls.
+  - **A note only on this route.** The shared brief goes to `:online` and Perplexity too, so the allowance and the order sit in a system note built from the tools' own numbers. Two searches cover the four venues, and "lookup failed" gives a failure its own word, so it can't read as "no market".
+  - **A watch across runs (`research_watch.py`).** A report counts as degraded if it stopped early, its searches failed, its billed searches left under 15,000 fresh tokens, or its own tally says most lookups failed. A call that raised counts too, unless Anthropic refused it at the spend limit: that isn't lost research, and its own alert says so. 6 of the last 12 opens one issue a week. Most runs carry one question, so a per-run rule rarely sees enough: simulated on real run sizes, it took a median 35 hours to notice against 10. In filtered mode the token rule caught 1 of 3 failed reports in the trial, so a rollback to `filtered:4` is watched less well.
+  - **Backing out.** `RESEARCH_TOOLS=filtered:4` sends the old request exactly; `basic:5` tries the older tool versions; `direct:4` cuts cost and rounds.
+
+  — Rob's go-ahead of 2026-11-04 ("Yes, fix it"), built in [#17](https://github.com/robcam55/metaculus-bot/pull/17), with the Test Bot's results there. The mechanism is from the trial's trace; its match to the live fault is *inferred*. Five searches, the note, the 15,000-token rule, the 6-of-12 alert (with spend-limit refusals left out of it), keeping its window in the Actions cache and logging code output on the Test Bot are Claude's proposals, not ratified until Rob approves the PR.
 - **New Claude models flagged daily, never switched to automatically (`model_watch.py`).** Rob asked on 2026-10-28 to evaluate each new Claude release so the bot doesn't fall behind, by auto-update or at least a notice. A notice was chosen over an automatic switch for four reasons. Anthropic's model ids are fixed versions with no "latest" alias. Haiku 5.5 and Sonnet 5.5 each rejected a setting the bot sent, which would have failed every question until fixed. A new tier can cost far more (Fable 5.1 is 2.5 times Opus 5.5). And litellm must know a new model's price before the spend figures work. The check lists models through Anthropic's Models API, which costs nothing, and opens one issue per model released after 2026-10-28. The Test Bot's trial inputs let a new model be tried on bot-testing-area questions, which the rules allow, before a switch. Quality isn't judged by backtests, because a newer model may have seen the outcomes in training. In [#13](https://github.com/robcam55/metaculus-bot/pull/13).
 
   — Claude's 2026-10-28 health review; Rob's go-ahead that day, built in [#13](https://github.com/robcam55/metaculus-bot/pull/13).

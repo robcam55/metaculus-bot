@@ -30,7 +30,9 @@ No forecasting-tools import here, so the offline checks can exercise it directly
 from __future__ import annotations
 
 import functools
+import json
 import logging
+import os
 import re
 import time
 from collections import Counter
@@ -62,6 +64,12 @@ ANTHROPIC_SEARCH_FEE = 0.01
 PARSING = "Parsing and summary"
 OTHER = "Other"
 
+# Set by the Test Bot alone: logs each research reply's block types, tool inputs and the
+# first 400 characters code printed (log_trace)
+TRACE_VARIABLE = "TRIAL_RAW_TRACE"
+# The line the research note asks each report to end with
+TALLY = re.compile(r"Lookups:\**\s*(\d+)\s+worked,\s*(\d+)\s+failed", re.I)
+
 
 @dataclass
 class Call:
@@ -76,6 +84,15 @@ class Call:
     searches: int = 0  # web searches the provider ran for this call
     cache_reads: int = 0  # of prompt_tokens, those read from the prompt cache
     cache_writes: int = 0  # and those written to it
+    search_tries: int = 0  # web searches the reply called, as its tool calls show
+    search_pages: int = 0  # search results that held pages
+    search_errors: tuple[str, ...] = ()  # the error code of each that failed
+    fetch_tries: int = 0  # web fetches the reply called
+    code_runs: int = 0  # calls to any other server tool: code execution
+    stop: str = ""  # the stop reason, as litellm reports it
+    answered: bool = True  # False for a reply with no text
+    tally: tuple[int, int] | None = None  # the report's own "Lookups: N worked, M failed"
+    seconds: float = 0.0  # how long the call took
 
 
 class Ledger:
@@ -270,8 +287,46 @@ def _cache_tokens(usage: Any) -> tuple[int, int]:
     )
 
 
+def tool_use(response: Any) -> dict[str, Any]:
+    """What a reply's web tools did, as Call fields. litellm 1.80.10 keeps the server's tool
+    calls as tool_calls and search results in provider_specific_fields, and drops fetch and
+    code results, so a fetch that failed can't be told apart here."""
+    choices = getattr(response, "choices", None)
+    if not choices:
+        return {}
+    message = choices[0].message
+    names = [_field(_field(c, "function"), "name") for c in _field(message, "tool_calls") or []]
+    pages, errors = 0, []
+    fields = _field(message, "provider_specific_fields") or {}
+    for block in fields.get("web_search_results") or []:
+        if _field(block, "type") != "web_search_tool_result":
+            continue  # a newer litellm keeps fetch results here too
+        content = _field(block, "content")
+        if isinstance(content, list) and content:
+            pages += 1
+        elif isinstance(content, dict):
+            errors.append(str(content.get("error_code") or "unknown"))
+    content = _field(message, "content")
+    text = content if isinstance(content, str) else ""
+    tallies = TALLY.findall(text)
+    return {
+        "search_tries": names.count("web_search"),
+        "search_pages": pages,
+        "search_errors": tuple(errors),
+        "fetch_tries": names.count("web_fetch"),
+        "code_runs": sum(name not in ("web_search", "web_fetch") for name in names),
+        "stop": str(choices[0].finish_reason or ""),
+        "answered": bool(text.strip()),
+        "tally": (int(tallies[-1][0]), int(tallies[-1][1])) if tallies else None,
+    }
+
+
 def call_from_response(
-    model: str, response: Any, question: str | None = None, part: str = "other"
+    model: str,
+    response: Any,
+    question: str | None = None,
+    part: str = "other",
+    seconds: float = 0.0,
 ) -> Call:
     usage = getattr(response, "usage", None)
     figure = openrouter_figure(
@@ -300,6 +355,8 @@ def call_from_response(
         searches=searches,
         cache_reads=_cache_tokens(usage)[0],
         cache_writes=_cache_tokens(usage)[1],
+        seconds=seconds,
+        **tool_use(response),
     )
 
 
@@ -318,23 +375,34 @@ def _cache_note(call: Call) -> str:
     return f" ({call.cache_reads:,} cache reads, {call.cache_writes:,} cache writes)"
 
 
+def _tools_note(call: Call) -> str:
+    if not (call.search_tries or call.fetch_tries or call.code_runs):
+        return ""
+    return (
+        f" | tools: {call.search_tries} searches tried, {call.search_pages} with pages,"
+        f" {call.fetch_tries} fetches tried, {call.code_runs} code runs,"
+        f" errors {', '.join(call.search_errors) or 'none'}, tally {call.tally or '-'},"
+        f" stop {call.stop}, {call.seconds:.0f}s"
+    )
+
+
 def _log(call: Call) -> None:
     cost = "no figure yet" if call.cost is None else f"${call.cost:.4f} ({call.basis})"
     logger.info(
         f"Spend: {label(call.question)} | {call.part} | {call.model} | {cost}"
         f" | {call.prompt_tokens:,} in{_cache_note(call)}, {call.completion_tokens:,} out"
-        f" | {call.searches} web searches | {call.generation or '-'}"
+        f" | {call.searches} web searches | {call.generation or '-'}{_tools_note(call)}"
     )
 
 
-def record_response(model: str, response: Any) -> None:
+def record_response(model: str, response: Any, seconds: float = 0.0) -> None:
     """Records one model response in the current pass's ledger. Never raises: measuring
     must not break forecasting."""
     ledger = _ledger.get()
     if ledger is None:
         return
     try:
-        call = call_from_response(model, response, _question.get(), _part.get() or "other")
+        call = call_from_response(model, response, _question.get(), _part.get() or "other", seconds)
         ledger.calls.append(call)
         _log(call)
     except Exception as e:
@@ -352,20 +420,74 @@ def record_raised(model: str, error: BaseException) -> None:
         )
 
 
+def log_trace(text: str) -> None:
+    """One raw research reply's shape, for the Test Bot's log: its block types, the tools'
+    inputs, and the first 400 characters code execution printed, which is how its error
+    text shows. The repo and its logs are public, so never encrypted content or a fetched
+    document. Code output is the one exception: with `filtered` tools the script prints from
+    what it found, so that output can hold page text."""
+    reply = json.loads(text)
+    blocks = []
+    for block in reply.get("content") or []:
+        entry = {"type": block.get("type")}
+        for name in ("name", "caller"):
+            if name in block:
+                entry[name] = block[name]
+        if "input" in block:
+            entry["input"] = str(block["input"])[:400]
+        content = block.get("content")
+        if isinstance(content, list):
+            entry["results"] = len(content)
+        elif isinstance(content, dict):
+            entry["result_type"] = content.get("type")
+            for name in ("error_code", "return_code"):
+                if name in content:
+                    entry[name] = content[name]
+            for name in ("stdout", "stderr"):
+                if name in content:
+                    entry[name] = str(content[name])[:400]
+        blocks.append(entry)
+    summary = {
+        "stop_reason": reply.get("stop_reason"),
+        "container": bool(reply.get("container")),
+        "usage": reply.get("usage"),
+        "blocks": blocks,
+    }
+    logger.info("Research trace: " + json.dumps(summary))
+
+
 def metered(acompletion: Callable[..., Any]) -> Callable[..., Any]:
-    """`acompletion`, recording every response, and every call that raised."""
+    """`acompletion`, recording every response, and every call that raised. A research
+    call on the Test Bot also logs the raw reply's shape: litellm drops the fetch and code
+    blocks, and its logger_fn is the one place that sees them."""
     if getattr(acompletion, "_spend_metered", False):
         return acompletion
 
     @functools.wraps(acompletion)
     async def call(*args: Any, **kwargs: Any) -> Any:
         model = str(kwargs.get("model") or "unknown model")
+        raw: list[str] = []
+        if kwargs.get("tools") and os.getenv(TRACE_VARIABLE):
+
+            def keep_raw(details: dict) -> None:
+                # Only this key: the same dict holds api_key
+                reply = details.get("original_response")
+                if isinstance(reply, str):
+                    raw.append(reply)
+
+            kwargs["logger_fn"] = keep_raw
+        started = time.monotonic()
         try:
             response = await acompletion(*args, **kwargs)
         except BaseException as e:  # a timeout or cancellation may still have been billed
             record_raised(model, e)
             raise
-        record_response(model, response)
+        record_response(model, response, time.monotonic() - started)
+        try:
+            if raw:
+                log_trace(raw[-1])
+        except Exception as e:
+            logger.warning(f"Spend: could not trace a reply ({type(e).__name__})")
         return response
 
     call._spend_metered = True  # type: ignore[attr-defined]

@@ -58,6 +58,15 @@ jobs:
       #     key: venv-${{ runner.os }}-${{ steps.setup-python.outputs.python-version }}-${{ hashFiles('**/poetry.lock') }}
       - name: Install dependencies
         run: poetry install --no-interaction --no-root
+      # The last 12 research outcomes, kept between runs (research_watch.py). Losing them
+      # only shortens the window, so neither cache step can fail the run.
+      - name: Restore the research watch
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        continue-on-error: true
+        with:
+          path: research_watch.json
+          key: research-watch-${{ github.run_id }}
+          restore-keys: research-watch-
       - name: Run bot
         run: |
           poetry run python main.py
@@ -71,6 +80,7 @@ jobs:
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }} # pays once the credits are under $2
           GITHUB_TOKEN: ${{ github.token }} # opens the alert issues; nothing else
+          RESEARCH_WATCH_FILE: research_watch.json
           ASKNEWS_CLIENT_ID: ${{ secrets.ASKNEWS_CLIENT_ID }}
           ASKNEWS_SECRET: ${{ secrets.ASKNEWS_SECRET }}
           ASKNEWS_API_KEY: ${{ secrets.ASKNEWS_API_KEY }}
@@ -81,6 +91,8 @@ jobs:
           FORECASTER_MODEL: ${{ vars.FORECASTER_MODEL }}
           FORECASTER_EFFORT: ${{ vars.FORECASTER_EFFORT }}
           RESEARCH_WEB_FETCH: ${{ vars.RESEARCH_WEB_FETCH }}
+          RESEARCH_TOOLS: ${{ vars.RESEARCH_TOOLS }}
+          RESEARCH_TOOL_NOTE: ${{ vars.RESEARCH_TOOL_NOTE }}
           # A second model family, on Rob's own OpenRouter key (off unless both are set)
           OPENROUTER_OWN_API_KEY: ${{ secrets.OPENROUTER_OWN_API_KEY }}
           EXTRA_FORECASTERS: ${{ vars.EXTRA_FORECASTERS }}
@@ -90,3 +102,10 @@ jobs:
           SEARCH_MODEL: ${{ vars.SEARCH_MODEL }}
           RESEARCH_REPORTS: ${{ vars.RESEARCH_REPORTS }}
           PREDICTIONS_PER_REPORT: ${{ vars.PREDICTIONS_PER_REPORT }}
+      - name: Save the research watch
+        if: always() && hashFiles('research_watch.json.updated') != ''
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        continue-on-error: true
+        with:
+          path: research_watch.json
+          key: research-watch-${{ github.run_id }}-${{ github.run_attempt }}
