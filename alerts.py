@@ -150,13 +150,13 @@ def own_key_rejected(error: str) -> bool:
     )
 
 
-def missed_questions(links: list[str]) -> bool:
+def missed_questions(links: list[str], days: int) -> bool:
     """Tournament questions that closed without a forecast (missed_check.py), once a week."""
     shown = links[:MISSED_SHOWN]
     more = f"\n- and {len(links) - len(shown)} more on the review's page" if len(links) > len(shown) else ""
     return raise_alert(
         f"Questions missed ({_week()})",
-        f"{len(links)} tournament question(s) closed in the last week without a forecast from"
+        f"{len(links)} tournament question(s) closed in the last {days} days without a forecast from"
         " the bot. A missed question scores nothing.\n\n"
         + "\n".join(f"- {link}" for link in shown) + more + "\n\n"
         "The weekly review's run page says how to trace each one. This issue opens at most"

@@ -13,7 +13,7 @@ ways:
 - It falls in a gap between runs.
 
 Each week this lists every FutureEval and MiniBench question that closed in the last
-MISSED_DAYS days without a forecast from the bot's account. It opens one issue that week if
+DAYS days without a forecast from the bot's account. It opens one issue that week if
 there is any. It only reads from Metaculus, and a failure here never fails the review:
 `python missed_check.py`.
 """
@@ -151,7 +151,7 @@ def main() -> int:
     found = [q for t in tallies for q in t.missed]
     if found:
         with contextlib.redirect_stdout(sys.stderr):
-            alerts.missed_questions([_link(q) for q in found])
+            alerts.missed_questions([_link(q) for q in found], DAYS)
     return 0
 
 
