@@ -67,6 +67,8 @@ OTHER = "Other"
 # Set by the Test Bot alone: logs each research reply's block types, tool inputs and the
 # first 400 characters code printed (log_trace)
 TRACE_VARIABLE = "TRIAL_RAW_TRACE"
+# The research reply's own tools; a call to any other is counted by name (Call.other_tools)
+WEB_TOOLS = ("web_search", "web_fetch")
 # The line the research note asks each report to end with
 TALLY = re.compile(r"Lookups:\**\s*(\d+)\s+worked,\s*(\d+)\s+failed", re.I)
 
@@ -88,7 +90,8 @@ class Call:
     search_pages: int = 0  # search results that held pages
     search_errors: tuple[str, ...] = ()  # the error code of each that failed
     fetch_tries: int = 0  # web fetches the reply called
-    code_runs: int = 0  # calls to any other server tool: code execution
+    code_runs: int = 0  # calls to any other tool: code execution, or one the bot doesn't run
+    other_tools: tuple[str, ...] = ()  # those calls' tool names, in order
     stop: str = ""  # the stop reason, as litellm reports it
     answered: bool = True  # False for a reply with no text
     tally: tuple[int, int] | None = None  # the report's own "Lookups: N worked, M failed"
@@ -314,7 +317,8 @@ def tool_use(response: Any) -> dict[str, Any]:
         "search_pages": pages,
         "search_errors": tuple(errors),
         "fetch_tries": names.count("web_fetch"),
-        "code_runs": sum(name not in ("web_search", "web_fetch") for name in names),
+        "code_runs": sum(name not in WEB_TOOLS for name in names),
+        "other_tools": tuple(str(name) for name in names if name not in WEB_TOOLS),
         "stop": str(choices[0].finish_reason or ""),
         "answered": bool(text.strip()),
         "tally": (int(tallies[-1][0]), int(tallies[-1][1])) if tallies else None,
@@ -380,7 +384,9 @@ def _tools_note(call: Call) -> str:
         return ""
     return (
         f" | tools: {call.search_tries} searches tried, {call.search_pages} with pages,"
-        f" {call.fetch_tries} fetches tried, {call.code_runs} code runs,"
+        f" {call.fetch_tries} fetches tried, {call.code_runs} code runs"
+        + (f" ({', '.join(call.other_tools)})" if call.other_tools else "")
+        + ","
         f" errors {', '.join(call.search_errors) or 'none'}, tally {call.tally or '-'},"
         f" stop {call.stop}, {call.seconds:.0f}s"
     )

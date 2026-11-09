@@ -468,6 +468,7 @@ def run_main(
     fail_urls=(),
     cost_each=0.25,
     deferred_urls=(),
+    waiting_urls=(),
     limit_urls=(),
     key_check=None,
     own_research=False,
@@ -527,6 +528,9 @@ def run_main(
                 results.append(ExceptionGroup("question failed", [RuntimeError(SPEND_LIMIT_ERROR)]))
             elif q.page_url in deferred_urls:
                 results.append(research_deferral(q.page_url))
+            elif q.page_url in waiting_urls:
+                bot.research_health.waited_for_web.append(q.page_url)
+                results.append(ExceptionGroup("question failed", [main.WebResearchEmpty("empty")]))
             else:
                 results.append("report")
         return results
@@ -716,6 +720,24 @@ def check_run_loop() -> None:
     ), exited
     assert "- 1 question(s) not forecast: every research source failed." in summary, summary
     assert "| fake-search | 4 | 3 | 1 (RuntimeError) |" in summary, summary
+    # a question waiting once for web research that came back empty leaves the run green,
+    # and the run page names it; beside a red failure it isn't counted as one
+    url = "https://example.invalid/q/4"
+    calls, waited, exited, _ = run_main(
+        "tournament", 100.0, questions, waiting_urls=(url,), OPENROUTER_API_KEY="sk-fake"
+    )
+    assert exited is None, exited
+    assert f"- Waiting once for web research that came back empty: {url}." in waited, waited
+    assert "every research source failed" not in waited, waited
+    assert f"| [4]({url}) | waits for research |" in waited, waited
+    calls, waited, exited, _ = run_main(
+        "tournament", 100.0, questions, waiting_urls=(url,),
+        deferred_urls=("https://example.invalid/q/5",), OPENROUTER_API_KEY="sk-fake",
+    )  # fmt: skip
+    assert exited == (
+        "1 question(s) failed (1 for lack of research; the next run retries them);"
+        " see the log above"
+    ), exited
     # what a question that waits or fails spent still shows, against its status
     assert "| [4](https://example.invalid/q/4) | waits for research | $0.250 |" in summary, summary
     assert "| [5](https://example.invalid/q/5) | failed | $0.250 |" in summary, summary
@@ -1905,12 +1927,13 @@ def check_tool_census() -> None:
             call = ledger.calls[0]
             assert (call.search_tries, call.search_pages, call.search_errors) == (3, 1, ("max_uses_exceeded",)), call
             assert (call.fetch_tries, call.code_runs, call.tally) == (1, 1, (1, 2)), call
+            assert call.other_tools == ("code_execution",), call
             assert call.answered and call.stop == "stop" and call.searches == 4, call
             assert not any("Research trace:" in r.getMessage() for r in records), "trace is off here"
             spend_line = next(r.getMessage() for r in records if r.getMessage().startswith("Spend: "))
             assert (
-                " | tools: 3 searches tried, 1 with pages, 1 fetches tried, 1 code runs, errors"
-                " max_uses_exceeded, tally (1, 2), stop stop, " in spend_line
+                " | tools: 3 searches tried, 1 with pages, 1 fetches tried, 1 code runs"
+                " (code_execution), errors max_uses_exceeded, tally (1, 2), stop stop, " in spend_line
             ), spend_line
 
             # the watch's first rule, from real replies: one cut short or with no text is
@@ -1926,6 +1949,29 @@ def check_tool_census() -> None:
                 call = watched(anthropic_search_reply(stop))
                 assert call.stop == {"max_tokens": "length"}.get(stop, stop), call
                 assert research_watch.reason(call) == "stopped early", call
+            # a reply that stops to call a tool the bot doesn't run, as on 11-05 and 11-06:
+            # litellm reports tool_calls, the census names the tool, and with narration
+            # before it the research still comes back empty, naming the tool in the log
+            stray = {"type": "tool_use", "id": "t1", "name": "bash", "input": {"command": "ls"}}
+            for text in ([], [{"type": "text", "text": "I'll compute the volatility."}]):
+                asked = {**anthropic_search_reply("tool_use")}
+                asked["content"] = [*asked["content"][1:3], *text, stray]
+                call = watched(asked)
+                assert (call.stop, call.code_runs, call.other_tools) == ("tool_calls", 1, ("bash",)), call
+                assert research_watch.reason(call) == "stopped early", call
+                with spend.collecting() as replied:
+                    assert asyncio.run(llm.invoke("Research this question.")) == "", text
+                assert replied.calls[0].other_tools == ("bash",)
+            # the log names the tool it called
+            NS = types.SimpleNamespace
+            called = NS(function=NS(name="bash", arguments="{}"))
+            choice = NS(finish_reason="tool_calls", message=NS(tool_calls=[called], provider_specific_fields={}))
+            try:
+                main.AnthropicSearchLlm._extract_citations(None, [choice])
+            except main.ResearchCutShort as e:
+                assert str(e) == "The research reply stopped early (tool_calls, calling bash)", e
+            else:
+                raise AssertionError("a reply that stopped to call a tool is cut short")
             for blocks in ([{"type": "thinking", "thinking": "t", "signature": "s"}], [{"type": "text", "text": " \n"}]):
                 call = watched({**anthropic_search_reply(), "content": blocks})
                 assert call.answered is False and call.stop == "stop", call
@@ -2431,6 +2477,38 @@ def check_research_watch() -> None:
     # without a file (the Test Bot and the Cup) the window is this run alone
     assert research_watch.update([good, good], 0).window == 2
 
+    # the questions that waited once for web research: kept beside the window, by URL,
+    # through the window's own updates, the newest WAITED_KEPT only
+    with tempfile.TemporaryDirectory() as folder:
+        path = os.path.join(folder, "watch.json")
+        url = "https://www.metaculus.com/questions/46340/"
+        assert research_watch.waited(path) == [] and research_watch.waited("") == []
+        research_watch.mark_waited(path, url)
+        assert research_watch.waited(path) == [url] and os.path.exists(path + ".updated")
+        assert research_watch._read(path) == []
+        research_watch.mark_waited(path, url)  # once only
+        assert research_watch.waited(path) == [url]
+        assert research_watch.update([bad], 0, path).window == 1
+        assert research_watch.waited(path) == [url], "the window's update keeps the list"
+        research_watch.mark_waited(path, "https://www.metaculus.com/questions/2/")
+        assert research_watch._read(path) == [1], "marking keeps the window"
+        for n in range(research_watch.WAITED_KEPT):
+            research_watch.mark_waited(path, f"https://example.invalid/q/{n}")
+        kept = research_watch.waited(path)
+        assert len(kept) == research_watch.WAITED_KEPT and url not in kept, len(kept)
+        assert kept[-1] == f"https://example.invalid/q/{research_watch.WAITED_KEPT - 1}"
+        # an old file (window only) or a bad list reads as none waited, and keeps the window
+        Path(path).write_text(json.dumps({"window": [0, 1]}), encoding="utf-8")
+        assert research_watch.waited(path) == []
+        for corrupt in ('{"window": [0], "waited": "x"}', '{"window": [0], "waited": [1]}'):
+            Path(path).write_text(corrupt, encoding="utf-8")
+            assert research_watch.waited(path) == [], corrupt
+            research_watch.mark_waited(path, url)
+            assert research_watch.waited(path) == [url] and research_watch._read(path) == [0], corrupt
+        # with no file to keep it in, nothing is remembered and nothing is written
+        research_watch.mark_waited("", url)
+        assert not os.path.exists(".updated")
+
     # through main: a cut-short reply is a call and "returned nothing", and counts once
     health = main.ResearchHealth()
     name = "anthropic/claude-sonnet-5-5 + web search and fetch"
@@ -2758,6 +2836,103 @@ def _research_policy() -> None:
     )
     assert main.deferred_for_research(main.ResearchUnavailable("x"))
     assert not main.deferred_for_research("report")
+
+
+def check_web_research_wait() -> None:
+    """Web research that came back empty while AskNews found something: on a run that
+    remembers it, the question waits once for the next run, unless it closes within the
+    margin; the second time it goes ahead on what was found. A run without the file, a
+    question with several reports, or a spend-limit refusal never waits."""
+    with tempfile.TemporaryDirectory() as folder:
+        path = os.path.join(folder, "watch.json")
+        with env(OPENROUTER_API_KEY="x", ASKNEWS_API_KEY="y", RESEARCH_WATCH_FILE=path):
+            _web_research_wait(path)
+    print("web research wait: ok")
+
+
+def _web_research_wait(path: str) -> None:
+    url = "https://example.invalid/q/77"
+    web = "openrouter/anthropic/claude-sonnet-5.5:online"
+
+    def bot_whose_web(answer, **kwargs):
+        bot = main.RcForecastBot(publish_reports_to_metaculus=False, **kwargs)
+
+        async def research(source, prompt, question):
+            if source == main.ASKNEWS_RESEARCHER:
+                return "Latest news: the agency delayed its bulletin (2026-11-01)."
+            if isinstance(answer, BaseException):
+                raise answer
+            return answer
+
+        bot._run_one_research_source = research  # type: ignore[method-assign]
+        return bot
+
+    later = timed_question(closes_in=timedelta(hours=2))
+    # the first empty report waits, and is remembered
+    bot = bot_whose_web("")
+    assert bot.research_memory == path
+    try:
+        asyncio.run(bot.run_research(later))
+    except main.ResearchUnavailable as e:
+        assert "came back empty" in str(e) and "next run tries again" in str(e), e
+        assert main.deferred_for_research(e)
+    else:
+        raise AssertionError("empty web research must wait once for the next run")
+    assert bot.research_health.waited_for_web == [url], bot.research_health
+    assert research_watch.waited(path) == [url]
+    assert dict(bot.research_health.sources[web].failures) == {"returned nothing": 1}
+    try:
+        asyncio.run(bot_whose_web("").run_research(later.model_copy(update={"page_url": "https://example.invalid/q/76"})))
+    except main.ResearchUnavailable as e:
+        wrapped = ExceptionGroup("question failed", [e])
+        assert main.waiting_for_web(e) and main.waiting_for_web(wrapped), e
+        assert main.deferred_for_research(wrapped), e
+    assert not main.waiting_for_web(research_deferral(url)) and not main.waiting_for_web(RuntimeError())
+    # the next run's report comes back empty too: it goes ahead on AskNews
+    again = bot_whose_web("")
+    research = asyncio.run(again.run_research(later))
+    assert "Research from asknews" in research and "came back empty" not in research, research
+    assert again.research_health.waited_for_web == []
+    # with web research this time, both sources go into it
+    fresh = later.model_copy(update={"page_url": "https://example.invalid/q/78"})
+    found = asyncio.run(bot_whose_web("Claude found the bulletin.").run_research(fresh))
+    assert found.count("## Research from") == 2, found
+    assert "https://example.invalid/q/78" not in research_watch.waited(path)
+    # a failed web researcher waits too; a spend-limit refusal doesn't
+    for answer, waits in ((RuntimeError("overloaded"), True), (RuntimeError(SPEND_LIMIT_ERROR), False)):
+        fresh = later.model_copy(update={"page_url": f"https://example.invalid/q/{79 + waits}"})
+        bot = bot_whose_web(answer)
+        try:
+            asyncio.run(bot.run_research(fresh))
+        except main.ResearchUnavailable:
+            assert waits, answer
+        else:
+            assert not waits, answer
+    # closing within the margin: no wait, and nothing remembered
+    soon = timed_question(closes_in=timedelta(minutes=30)).model_copy(
+        update={"page_url": "https://example.invalid/q/90"}
+    )
+    assert "Research from asknews" in asyncio.run(bot_whose_web("").run_research(soon))
+    assert "https://example.invalid/q/90" not in research_watch.waited(path)
+    # several reports per question: the others carry it
+    several = bot_whose_web("", research_reports_per_question=2, predictions_per_research_report=1)
+    fresh = later.model_copy(update={"page_url": "https://example.invalid/q/91"})
+    assert "Research from asknews" in asyncio.run(several.run_research(fresh))
+    # a run without the file (the Test Bot, the Cup): never waits
+    with env(OPENROUTER_API_KEY="x", ASKNEWS_API_KEY="y"):
+        unremembered = bot_whose_web("")
+        assert unremembered.research_memory == ""
+        fresh = later.model_copy(update={"page_url": "https://example.invalid/q/92"})
+        assert "Research from asknews" in asyncio.run(unremembered.run_research(fresh))
+
+    # the run page says which questions wait, apart from those whose every source failed
+    health = main.ResearchHealth(waited_for_web=[url, url])
+    waits = [main.WebResearchEmpty("web"), main.ResearchUnavailable("all")]
+    notes = "\n".join(main.run_report([], [], health, waits))
+    assert f"Waiting once for web research that came back empty: {url}. The next run" in notes, notes
+    assert "1 question(s) not forecast: every research source failed" in notes, notes
+    only = "\n".join(main.run_report([], [], main.ResearchHealth(waited_for_web=[url]), waits[:1]))
+    assert "every research source failed" not in only and "Waiting once" in only, only
 
 
 def _research_policy_with_several_reports() -> None:
@@ -3354,6 +3529,7 @@ if __name__ == "__main__":
     check_research_survives_one_failure()
     check_prompts()
     check_research_policy()
+    check_web_research_wait()
     check_run_report()
     check_health_warnings()
     check_comment_sections()

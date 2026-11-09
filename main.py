@@ -102,6 +102,16 @@ NO_RESEARCH_SETTINGS = ("None", "no_research")
 # questions at about 35 seconds each), so a question closing sooner than this gets no
 # further try and is forecast without research instead, with the forecaster told so.
 RESEARCH_RETRY_MARGIN = timedelta(minutes=45)
+# Web research that comes back empty (or fails) while AskNews found something used to go
+# ahead on AskNews alone: on 11-05 and 11-06 two of the first 12 reports after the direct
+# tools did, and AskNews gives no reading of the resolution source or a price's volatility.
+# Such a question now waits once for the next run and fresh research, unless it closes
+# within RESEARCH_RETRY_MARGIN. Once only, remembered between runs in the research watch's
+# file (research_watch.waited), so a fault that empties every reply costs one extra
+# research round per question at most (about $0.19 and one AskNews call), never a run of
+# them. Only runs with that file (the scheduled tournament runs) wait: a Test Bot or Cup
+# run has no later run to wait for. Rob approved the wait on 2026-11-08 ("All
+# recommended"); waiting once and leaving the run green were Claude's choices (README, Why).
 NO_RESEARCH_NOTE = (
     "No research is available: every research source failed, and the question closes"
     " before the bot can try again. Forecast from your own knowledge and base rates, say"
@@ -383,14 +393,30 @@ class ResearchUnavailable(RuntimeError):
     """Every research source failed for a question that a later run can still forecast."""
 
 
-def deferred_for_research(result: object) -> bool:
-    """Whether a question's result is a failure caused only by missing research."""
-    if isinstance(result, ResearchUnavailable):
+class WebResearchEmpty(ResearchUnavailable):
+    """Web research came back empty for a question that waits once for the next run
+    (RcForecastBot._wait_for_web_research). Unlike every source failing, it leaves the run
+    green: it is expected now and then, and the research watch counts every such report
+    toward its alert."""
+
+
+def _only(result: object, kind: type[BaseException]) -> bool:
+    if isinstance(result, kind):
         return True
     if isinstance(result, BaseExceptionGroup):
-        matched, rest = result.split(ResearchUnavailable)
+        matched, rest = result.split(kind)
         return matched is not None and rest is None
     return False
+
+
+def deferred_for_research(result: object) -> bool:
+    """Whether a question's result is a failure caused only by missing research."""
+    return _only(result, ResearchUnavailable)
+
+
+def waiting_for_web(result: object) -> bool:
+    """Whether a question's result is a wait for web research that came back empty."""
+    return _only(result, WebResearchEmpty)
 
 
 @dataclass
@@ -408,6 +434,9 @@ class ResearchHealth:
     sources: dict[str, SourceTally] = field(default_factory=dict)
     # Questions (by question_key) whose forecast went ahead with no research
     without_research: list[str] = field(default_factory=list)
+    # Questions (by question_key) that wait for the next run: their web research came
+    # back empty though another source found something (RcForecastBot._wait_for_web_research)
+    waited_for_web: list[str] = field(default_factory=list)
     # The extra forecasters' forecasts, by model: a failed one only thins the question's
     # members, so it would otherwise show nowhere but the log
     forecasters: dict[str, SourceTally] = field(default_factory=dict)
@@ -639,9 +668,11 @@ class AnthropicSearchLlm(GeneralLlm):
         # The one hook GeneralLlm gives on the raw response, so the stop reason is
         # checked here too, before the text is taken as research
         reason = getattr(choices[0], "finish_reason", None)
-        if reason in CUT_SHORT:
-            raise ResearchCutShort(f"The research reply stopped early ({reason})")
         message = choices[0].message
+        if reason in CUT_SHORT:
+            called = [name for name in _tool_names(message) if name not in spend.WEB_TOOLS]
+            asked = f", calling {', '.join(called)}" if called else ""
+            raise ResearchCutShort(f"The research reply stopped early ({reason}{asked})")
         fields = getattr(message, "provider_specific_fields", None) or {}
         urls: list[str] = []
         cited_page = False  # a citation of a fetched page (it carries no URL)
@@ -674,6 +705,14 @@ class AnthropicSearchLlm(GeneralLlm):
 NO_TEXT_ASSERTION = "Answer is not a string"
 # Citation types that point into a fetched page (a document) rather than a search result
 FETCH_CITATIONS = ("char_location", "page_location", "content_block_location")
+
+
+def _tool_names(message) -> list[str]:
+    """The names of the tools a reply called, in order."""
+    return [
+        str(getattr(getattr(call, "function", None), "name", None))
+        for call in getattr(message, "tool_calls", None) or []
+    ]
 
 
 def _fetched_urls(message) -> list[str]:
@@ -1045,6 +1084,9 @@ class RcForecastBot(ForecastBot):
         # research for (RESEARCH_REPORTS can run several reports for one question)
         self._reports_tried: Counter[str] = Counter()
         self._research_found: set[str] = set()
+        # Where questions that waited once for web research are remembered; "" means no
+        # later run to wait for, so none waits (see RESEARCH_RETRY_MARGIN)
+        self.research_memory = os.getenv("RESEARCH_WATCH_FILE", "")
         # Per question: forecasts started, to number them in the spend breakdown
         self._forecasts_started: Counter[str] = Counter()
 
@@ -1065,6 +1107,7 @@ class RcForecastBot(ForecastBot):
             sources = research_sources(self._llms)
             parts: list[str] = []
             refused: BaseException | None = None  # a source Anthropic wouldn't pay for
+            lost: list[str] = []  # web researchers (models) that failed or came back empty
             for source in sources:
                 name = self._source_name(source)
                 try:
@@ -1079,12 +1122,16 @@ class RcForecastBot(ForecastBot):
                     self.research_health.record(name, "spend limit" if limited else type(e).__name__)
                     if limited:
                         refused = e
+                    elif isinstance(source, GeneralLlm):
+                        lost.append(name)
                     continue
                 if not (text and text.strip()):
                     logger.warning(
                         f"Research source {name} returned nothing for {question.page_url}"
                     )
                     self.research_health.record(name, "returned nothing")
+                    if isinstance(source, GeneralLlm):
+                        lost.append(name)
                     continue
                 self.research_health.record(name)
                 parts.append(f"## Research from {name}\n{flatten_headings(text)}")
@@ -1097,6 +1144,12 @@ class RcForecastBot(ForecastBot):
             if sources and not parts:
                 research = self._without_research(question)
             else:
+                if lost and self._wait_for_web_research(question):
+                    raise WebResearchEmpty(
+                        f"Web research from {', '.join(lost)} came back empty for"
+                        f" {question.page_url}. Not forecast now; the next run tries again"
+                        " (once)."
+                    )
                 research = "\n\n".join(parts)
             logger.info(f"Found Research for URL {question.page_url}:\n{research}")
             return research
@@ -1127,6 +1180,25 @@ class RcForecastBot(ForecastBot):
         )
         self.research_health.without_research.append(key)
         return NO_RESEARCH_NOTE
+
+    def _wait_for_web_research(self, question: MetaculusQuestion) -> bool:
+        """Whether a question whose web research came back empty, while another source
+        found something, waits for the next run instead of going ahead without it: once
+        per question, only on a run that remembers it (research_memory), only with one
+        research report per question (with more, the others carry it), and not when it
+        closes within RESEARCH_RETRY_MARGIN. Waiting is remembered before it happens."""
+        key = question.page_url
+        if not (self.research_memory and key) or self.research_reports_per_question != 1:
+            return False
+        if not self._can_retry(question):
+            logger.warning(f"Web research came back empty for {key}, which closes before another try")
+            return False
+        if key in research_watch.waited(self.research_memory):
+            logger.warning(f"Web research came back empty again for {key}: going ahead without it")
+            return False
+        research_watch.mark_waited(self.research_memory, key)
+        self.research_health.waited_for_web.append(key)
+        return True
 
     async def summarize_research(self, question: MetaculusQuestion, research: str) -> str:
         """The template's summary for the comment, its headings kept as bold lines: on
@@ -2000,11 +2072,17 @@ def run_report(
         lines += ["", "| Extra forecaster | Forecasts | Worked | Failed |", "|---|---|---|---|"]
         lines += _tally_rows(health.forecasters)
     notes: list[str] = []
-    deferred = sum(deferred_for_research(r) for r in results)
+    deferred = sum(deferred_for_research(r) and not waiting_for_web(r) for r in results)
+    waited = list(dict.fromkeys(health.waited_for_web))
     if deferred:
         notes.append(
             f"- {deferred} question(s) not forecast: every research source failed. The next"
             " run tries again."
+        )
+    if waited:
+        notes.append(
+            f"- Waiting once for web research that came back empty: {', '.join(waited)}."
+            " The next run tries again."
         )
     # Only questions whose forecast then went through, each once
     forecast = {
@@ -2431,11 +2509,12 @@ def main() -> None:
     budget.write_step_summary(lines)
     for warning in health_warnings(health):
         print(warning)
-    failed = len(failures) - limited
+    # a question waiting once for web research leaves the run green (WebResearchEmpty)
+    failed = len(failures) - limited - sum(waiting_for_web(r) for r in failures)
     if failed:
         # a failed question turns the Actions run red; one that waits for research too,
         # so a source that keeps failing doesn't go unnoticed
-        deferred = sum(deferred_for_research(r) for r in failures)
+        deferred = sum(deferred_for_research(r) and not waiting_for_web(r) for r in failures)
         why = f" ({deferred} for lack of research; the next run retries them)" if deferred else ""
         sys.exit(f"{failed} question(s) failed{why}; see the log above")
 
