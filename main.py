@@ -19,6 +19,7 @@ import dotenv
 import budget
 
 # What each run spends, call by call, by question and part of the work.
+import setups
 import spend
 
 # GitHub issues that tell Rob when the credits run low or his own key stops.
@@ -2065,6 +2066,8 @@ def run_report(
     sources, so a newly added key (AskNews's, say) shows on the next run."""
     lines = ["### This run", "", *passes]
     lines.append(f"- Research sources: {', '.join(configured) if configured else 'none'}.")
+    # which version of the bot made this run's forecasts (setups.py, JUDGING.md)
+    lines.append(f"- Setup: {setups.describe(setups.current())}.")
     if health.sources:
         lines += ["", "| Research source | Searches | Worked | Failed |", "|---|---|---|---|"]
         lines += _tally_rows(health.sources)
