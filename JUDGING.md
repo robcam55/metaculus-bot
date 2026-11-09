@@ -4,8 +4,9 @@ Written on 2026-11-08, before the weekly review of Monday 2026-11-09 (06:00 UTC)
 anyone read a scorecard row for a forecast made after 2026-10-31. These rules say in advance
 which numbers mean keep, revert or wait, so a lucky or unlucky first week can't drive a
 change. They were Claude's proposal. Rob approved writing them on 2026-11-08 ("All recommended")
-and ratified them in chat that evening ("Merged, all ratified"), the thresholds and rule A's
-start at s4 included, before any review with the by-setup rows ran.
+and ratified them in chat at about 01:56 UTC on 2026-11-09 (8:56 PM ET on 11-08; "Merged, all
+ratified"), the thresholds and rule A's start at s4 included, before any review run with the
+by-setup rows.
 
 ## Why most comparisons can only say "wait"
 
