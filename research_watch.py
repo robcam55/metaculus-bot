@@ -4,8 +4,10 @@ Whether research on Rob's key is reaching its reports, across runs.
 A reply with text counted as research that worked, so from 10-31 to 11-03 most reports lost
 their searches with every run green (README, Why). Each Sonnet 5.5 research reply is now
 read for signs of that, and the last WINDOW outcomes are kept between runs: most runs carry
-one question, so a rule within one run rarely sees enough. The file holds only 0s and 1s,
-never a question's text, and losing it only shortens the window.
+one question, so a rule within one run rarely sees enough. The same file remembers which
+questions already waited once for web research that came back empty (main.py,
+RcForecastBot._wait_for_web_research). It holds 0s and 1s and those questions' page URLs,
+never a question's text, and losing it only shortens the window and allows a second wait.
 
 No forecasting-tools import here, so the offline checks can exercise it directly.
 """
@@ -22,13 +24,19 @@ import spend
 logger = logging.getLogger(__name__)
 
 # Stop reasons (as litellm reports them) for a research reply that ended before its
-# answer: a server-side search loop paused, the reply ran out of tokens, or a safety
-# classifier stopped it
-CUT_SHORT = ("pause_turn", "length", "refusal")
+# answer: a server-side search loop paused, the reply ran out of tokens, a safety
+# classifier stopped it, or it called a tool the bot doesn't run (tool_calls). Every tool
+# the research reply is given runs on Anthropic's side and ends as "stop" (each research
+# line on the run log through 11-08), so tool_calls means the reply asked the bot to run
+# something: on 11-05 and 11-06 two replies did so and came back empty
+CUT_SHORT = ("pause_turn", "length", "refusal", "tool_calls")
 
 # Reports kept, and how many of them degraded open an issue
 WINDOW = 12
 TRIP = 6
+# Questions remembered as having waited once for web research. A FutureEval question is
+# open about 3 hours and MiniBench rounds bring a few dozen, so 200 covers several days
+WAITED_KEPT = 200
 # Fresh input tokens (the prompt less cache reads) under which billed searches can't have
 # reached the reply. In 10-31 to 11-03's blackouts the most any reply wrote was 14,443
 FRESH_FLOOR = 15000
@@ -63,30 +71,65 @@ def reason(call: spend.Call) -> str | None:
     return None
 
 
-def _read(path: str) -> list[int]:
-    """The kept window; a missing or corrupt file starts empty."""
+def _load(path: str) -> dict:
+    """The file's contents; a missing or unreadable file reads as empty."""
     if not path:
-        return []
+        return {}
     try:
         with open(path, encoding="utf-8") as file:
-            window = json.load(file)["window"]
+            kept = json.load(file)
     except FileNotFoundError:
-        return []
-    except (OSError, ValueError, KeyError, TypeError) as e:
+        return {}
+    except (OSError, ValueError) as e:
         logger.warning(f"Research watch: starting empty, unreadable file ({type(e).__name__})")
+        return {}
+    if not isinstance(kept, dict):
+        logger.warning("Research watch: starting empty, unexpected values in the file")
+        return {}
+    return kept
+
+
+def _read(path: str) -> list[int]:
+    """The kept window; a missing or corrupt file starts empty."""
+    kept = _load(path)
+    if not kept:
         return []
+    window = kept.get("window")
     if not isinstance(window, list) or any(type(v) is not int or v not in (0, 1) for v in window):
         logger.warning("Research watch: starting empty, unexpected values in the file")
         return []
     return window
 
 
-def _write(path: str, window: list[int]) -> None:
-    """Saves the window. The empty marker beside it tells the workflow there's something
-    to save, so an idle run saves nothing."""
+def waited(path: str) -> list[str]:
+    """The questions (page URLs) that already waited once for web research, oldest first.
+    Without a file the bot remembers none, and RcForecastBot doesn't wait at all."""
+    found = _load(path).get("waited")
+    if not isinstance(found, list) or any(not isinstance(v, str) for v in found):
+        return []
+    return found
+
+
+def mark_waited(path: str, question: str) -> None:
+    """Remembers that a question waited once for web research. Saved at once, not at the
+    end of the run, so a run that then fails still remembers it."""
+    if not path:
+        return
+    kept = waited(path)
+    if question not in kept:
+        kept = (kept + [question])[-WAITED_KEPT:]
+    _write(path, _read(path), kept)
+
+
+def _write(path: str, window: list[int], waited_for: list[str] | None = None) -> None:
+    """Saves the window, and the questions that waited (kept as they are when not given).
+    The empty marker beside it tells the workflow there's something to save, so an idle
+    run saves nothing."""
+    if waited_for is None:
+        waited_for = waited(path)
     try:
         with open(path, "w", encoding="utf-8") as file:
-            json.dump({"window": window}, file)
+            json.dump({"window": window, **({"waited": waited_for} if waited_for else {})}, file)
         with open(path + ".updated", "w", encoding="utf-8"):
             pass
     except OSError as e:

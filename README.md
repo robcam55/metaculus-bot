@@ -111,9 +111,12 @@ The changes are in `main.py` (`RcForecastBot`), `budget.py`, `spend.py`, `alerts
   Every prompt, the search-backed model's and the forecasters', carries today's date and
   the question's close and resolution times.
 
-  If one source fails, the other still feeds the forecast. Research that came back with
-  text also counts as degraded when its tools failed (below), though it still feeds the
-  forecast. If every source fails (an AskNews search that finds nothing, or a web search
+  If one source fails, the other still feeds the forecast, with one exception: when the
+  web research (Claude with search) fails or comes back empty, a question that a later
+  run can still reach waits once for that run and fresh research, and the run stays
+  green. The second time, it goes ahead on what AskNews found. Research that came back
+  with text also counts as degraded when its tools failed (below), though it still feeds
+  the forecast. If every source fails (an AskNews search that finds nothing, or a web search
   cut short, counts as failed), the question isn't forecast blind:
   - It waits for the next run, 20 minutes later, and turns this run red.
   - A question closing within 45 minutes gets no further try. It is forecast without
@@ -490,6 +493,14 @@ The main architectural choices and the reasons behind them. Each links to where 
   - **Backing out.** `RESEARCH_TOOLS=filtered:4` sends the old request exactly; `basic:5` tries the older tool versions; `direct:4` cuts cost and rounds.
 
   — Rob's go-ahead of 2026-11-04 ("Yes, fix it"), built in [#17](https://github.com/robcam55/metaculus-bot/pull/17), with the Test Bot's results there. The mechanism is from the trial's trace; its match to the live fault is *inferred*. Five searches, the note, the 15,000-token rule, the 6-of-12 alert (with spend-limit refusals left out of it), keeping its window in the Actions cache and logging code output on the Test Bot were Claude's proposals, which Rob ratified on 2026-11-04 ("All recommended"). The tally's limit came from the first live report and was also Claude's, built in [#18](https://github.com/robcam55/metaculus-bot/pull/18); Rob approved it that day ("Go ahead and merge the corrections").
+- **Empty web research waits once for the next run (2026-11-08).** In the first 12 live reports after the direct tools, 2 (46340 on 11-05, 46344 on 11-06) ended with a call to a tool the bot doesn't run, stopped at `tool_calls` and came back empty, so those questions were forecast on AskNews alone. AskNews gives no reading of the resolution source and no volatility for a price. Now such a question waits for the next run, 20 minutes later, unless it closes within 45 minutes, the same margin as the no-blind-forecast rule.
+  - **Why a wait, not other tools.** Switching every question to the older tool versions (`RESEARCH_TOOLS=basic:5`) would change research on the questions that work too, on versions this bot had never run. A wait touches only the questions that failed.
+  - **Once per question.** The questions that waited are kept by URL in the research watch's file in the Actions cache, so a fault that emptied every reply would cost each question one extra research round (about $0.19 and one AskNews call), not one every run until it closed. Only the scheduled tournament runs keep that file, so a Test Bot or Cup run never waits: it has no later run to wait for.
+  - **Failed counts as empty.** Web research that raised an error waits too; a refusal at the spend limit doesn't, since the forecasts on that key would fail as well.
+  - **The run stays green.** A wait is expected now and then, and a red run emails Rob. The research watch still counts each empty report toward its 6-of-12 alert, and the run page names the questions that wait.
+  - **The tool's name is logged.** Each research line on the run log now names any tool called besides web search and fetch, and a reply that stops at `tool_calls` counts as stopped early, even with text before the call.
+
+  — Rob's go-ahead of 2026-11-08 ("All recommended") to the wait-and-retry on the [next-steps page](https://claude.ai/artifact/7Lazv9L3zN6bP3sif7z3xi), which replaced Claude's earlier `basic:5` recommendation. That page described the wait, the 45-minute margin and logging the tool's name. Waiting only once, remembering it in the watch's file, counting a failed reply as empty and leaving the run green were Claude's design choices, not yet ratified.
 - **New Claude models flagged daily, never switched to automatically (`model_watch.py`).** Rob asked on 2026-10-28 to evaluate each new Claude release so the bot doesn't fall behind, by auto-update or at least a notice. A notice was chosen over an automatic switch for four reasons. Anthropic's model ids are fixed versions with no "latest" alias. Haiku 5.5 and Sonnet 5.5 each rejected a setting the bot sent, which would have failed every question until fixed. A new tier can cost far more (Fable 5.1 is 2.5 times Opus 5.5). And litellm must know a new model's price before the spend figures work. The check lists models through Anthropic's Models API, which costs nothing, and opens one issue per model released after 2026-10-28. The Test Bot's trial inputs let a new model be tried on bot-testing-area questions, which the rules allow, before a switch. Quality isn't judged by backtests, because a newer model may have seen the outcomes in training. In [#13](https://github.com/robcam55/metaculus-bot/pull/13).
 
   — Claude's 2026-10-28 health review; Rob's go-ahead that day, built in [#13](https://github.com/robcam55/metaculus-bot/pull/13).
