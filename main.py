@@ -112,7 +112,9 @@ RESEARCH_RETRY_MARGIN = timedelta(minutes=45)
 # research round per question at most (about $0.19 and one AskNews call), never a run of
 # them. Only runs with that file (the scheduled tournament runs) wait: a Test Bot or Cup
 # run has no later run to wait for. Rob approved the wait on 2026-11-08 ("All
-# recommended"); waiting once and leaving the run green were Claude's choices (README, Why).
+# recommended"); waiting once, waiting on a failure too and leaving the run green were
+# Claude's choices, which he ratified that evening. Keeping the waits as page URLs in the
+# watch's file is Claude's, not yet ratified (README, Why).
 NO_RESEARCH_NOTE = (
     "No research is available: every research source failed, and the question closes"
     " before the bot can try again. Forecast from your own knowledge and base rates, say"

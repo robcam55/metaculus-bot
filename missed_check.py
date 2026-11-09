@@ -151,7 +151,7 @@ def main() -> int:
     found = [q for t in tallies for q in t.missed]
     if found:
         with contextlib.redirect_stdout(sys.stderr):
-            alerts.missed_questions([_link(q) for q in found])
+            alerts.missed_questions([_link(q) for q in found], DAYS)
     return 0
 
 

@@ -3,8 +3,9 @@
 Written on 2026-11-08, before the weekly review of Monday 2026-11-09 (06:00 UTC) and before
 anyone read a scorecard row for a forecast made after 2026-10-31. These rules say in advance
 which numbers mean keep, revert or wait, so a lucky or unlucky first week can't drive a
-change. They are Claude's proposal. Rob approved writing them on 2026-11-08 ("All recommended")
-but has not yet ratified these thresholds.
+change. They were Claude's proposal. Rob approved writing them on 2026-11-08 ("All recommended")
+and ratified them in chat that evening ("Merged, all ratified"), the thresholds and rule A's
+start at s4 included, before any review with the by-setup rows ran.
 
 ## Why most comparisons can only say "wait"
 
@@ -16,7 +17,7 @@ the same questions) and in process checks (did research arrive, were questions m
 
 ## The setups
 
-The scorecard's "By setup" rows group each forecast by the setup live when its run started,
+The scorecard's "By setup" rows group each forecast by the setup live when its scored run posted it,
 from the dated list in `setups.py`.
 
 | Setup | Live from (UTC) | What changed |

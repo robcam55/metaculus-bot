@@ -58,8 +58,9 @@ jobs:
       #     key: venv-${{ runner.os }}-${{ steps.setup-python.outputs.python-version }}-${{ hashFiles('**/poetry.lock') }}
       - name: Install dependencies
         run: poetry install --no-interaction --no-root
-      # The last 12 research outcomes, kept between runs (research_watch.py). Losing them
-      # only shortens the window, so neither cache step can fail the run.
+      # The last 12 research outcomes and the questions that waited once for web research,
+      # kept between runs (research_watch.py). Losing them only shortens the window and lets
+      # a question wait again, so neither cache step can fail the run.
       - name: Restore the research watch
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         continue-on-error: true

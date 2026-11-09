@@ -1099,12 +1099,12 @@ def check_missed() -> None:
             return [missed_check.Tally("FutureEval", 2, never[:1], 0, False)]
 
         missed_check.check = noisy_check
-        alerts.missed_questions = lambda links: alerted.append(links) or True  # type: ignore[assignment]
+        alerts.missed_questions = lambda links, days: alerted.append((links, days)) or True  # type: ignore[assignment]
         printed = io.StringIO()
         with contextlib.redirect_stdout(printed):
             assert missed_check.main() == 0
         assert "library noise" not in printed.getvalue() and "1 missed" in printed.getvalue(), printed.getvalue()
-        assert alerted == [[missed_check._link(never[0])]], alerted
+        assert alerted == [([missed_check._link(never[0])], 8)], alerted
     finally:
         missed_check.check, missed_check._setup, alerts.missed_questions = real_check, real_setup, real_alert  # type: ignore[assignment]
 
@@ -1113,13 +1113,13 @@ def check_missed() -> None:
     real = alerts.raise_alert
     alerts.raise_alert = lambda title, body, **kw: seen.append((title, body)) or True  # type: ignore[assignment]
     try:
-        assert alerts.missed_questions([f"[q{i}](u{i})" for i in range(25)])
+        assert alerts.missed_questions([f"[q{i}](u{i})" for i in range(25)], 8)
     finally:
         alerts.raise_alert = real  # type: ignore[assignment]
     title, body = seen[0]
     year, week, _ = datetime.now(timezone.utc).isocalendar()
     assert title == f"Questions missed ({year}-W{week:02d})", title
-    assert body.startswith("25 tournament question(s) closed") and "- [q19](u19)" in body and "[q20]" not in body, body
+    assert body.startswith("25 tournament question(s) closed in the last 8 days without") and "- [q19](u19)" in body and "[q20]" not in body, body
     assert "- and 5 more on the review's page" in body, body
     print("missed questions: ok")
 
