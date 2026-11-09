@@ -14,14 +14,18 @@ concurrency:
   group: ${{ github.workflow }}
   cancel-in-progress: false
 
-# Scores how the bot's resolved forecasts turned out. Read-only: it makes no
-# forecasts, spends nothing on LLMs, and publishes nothing.
+# Scores how the bot's resolved forecasts turned out, and lists tournament questions it
+# missed. Read-only on Metaculus: it makes no forecasts, spends nothing on LLMs, and posts
+# nothing there. Its one write is an issue in this repository when a question was missed.
 # The weekly run is off by default: set the repository variable REVIEW_BOT_ENABLED to
 # true to turn it on. Running it by hand always works.
 jobs:
   review_job:
     if: vars.REVIEW_BOT_ENABLED == 'true' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write # the missed-questions alert (missed_check.py); nothing else
     steps:
       - name: Check out repository
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
@@ -51,6 +55,16 @@ jobs:
         run: |
           echo >> review.md
           poetry run python scorecard.py review.json >> review.md
+      - name: Look for missed questions
+        continue-on-error: true # never at the cost of bot-review's summary or the artifact
+        run: |
+          echo >> review.md
+          poetry run python missed_check.py >> review.md
+        env:
+          METACULUS_TOKEN: ${{ secrets.METACULUS_TOKEN }}
+          GITHUB_TOKEN: ${{ github.token }} # opens the missed-questions issue; nothing else
+          AIB_TOURNAMENT_ID: ${{ vars.AIB_TOURNAMENT_ID }}
+          MINIBENCH_ID: ${{ vars.MINIBENCH_ID }}
       - name: Show the summary in the run page
         run: cat review.md >> $GITHUB_STEP_SUMMARY
       - name: Keep the review

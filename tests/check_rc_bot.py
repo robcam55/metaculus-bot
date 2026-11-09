@@ -1028,6 +1028,102 @@ def check_own_key() -> None:
     print("own key: ok")
 
 
+def check_missed() -> None:
+    """missed_check.py: which questions count as missed, what the page says, the API filter
+    it reads with, and that a failure there still leaves the review a section."""
+    import missed_check
+
+    now = datetime(2026, 11, 9, 6, 0, tzinfo=timezone.utc)
+    NS = types.SimpleNamespace
+
+    def q(n, closed_ago, forecast, text="Will it happen?"):
+        return NS(question_text=text, page_url=f"https://www.metaculus.com/questions/{n}/",
+                  close_time=None if closed_ago is None else now - closed_ago, already_forecasted=forecast)  # fmt: skip
+
+    hours = lambda h: timedelta(hours=h)  # noqa: E731
+    found = [
+        q(1, hours(3), True), q(2, hours(30), False), q(3, hours(50), None),
+        q(4, timedelta(days=9), False),  # before the window
+        q(5, -hours(1), False),  # closes later: can still be forecast
+        q(6, None, False),  # no close time
+        q(7, hours(5), False, "A | piped " + "long " * 30),
+    ]
+    naive = q(8, hours(2), False)
+    naive.close_time = naive.close_time.replace(tzinfo=None)
+    closed, never, unknown = missed_check.missed(found + [naive], now)
+    assert [x.page_url[-3:-1] for x in closed] == ["/1", "/2", "/3", "/7", "/8"], closed
+    assert [x.page_url[-3:-1] for x in never] == ["/2", "/7", "/8"] and unknown == 1, (never, unknown)
+
+    tallies = [missed_check.Tally("FutureEval", 5, never, 1, False), missed_check.Tally("MiniBench", 0, [], 0, True)]
+    text = "\n".join(missed_check.lines(tallies))
+    assert "without a forecast from the bot: 3. It should read 0." in text, text
+    assert "- FutureEval: 5 closed, 3 missed (1 whose forecast status didn't come back)." in text, text
+    assert "- MiniBench: 0 closed, 0 missed (read stopped at 1000 questions, so this may be incomplete)." in text, text
+    assert "  - [Will it happen?](https://www.metaculus.com/questions/2/) (closed Sun 11-08 00:00 UTC)" in text, text
+    assert "| piped" not in text and "A / piped" in text and "...](" in text, text
+    assert "find its runs in the tournament workflow's log" in text, text
+    quiet = "\n".join(missed_check.lines([missed_check.Tally("FutureEval", 4, [], 0, False)]))
+    assert "the bot: 0. It should read 0." in quiet and "find its runs" not in quiet, quiet
+
+    # the read: closed and resolved questions of each tournament, subquestions unpacked,
+    # opened within 30 days, as many pages as there are
+    asked = []
+
+    class FakeClient:
+        async def get_questions_matching_filter(self, api_filter, num_questions=None, error_if_question_target_missed=True):
+            asked.append((api_filter, num_questions, error_if_question_target_missed))
+            return found if api_filter.allowed_tournaments == [33121] else []
+
+    tallies = missed_check.check(FakeClient(), [("FutureEval", 33121), ("MiniBench", "minibench")], now)
+    api_filter, count, strict = asked[0]
+    assert api_filter.allowed_statuses == ["closed", "resolved"] and api_filter.group_question_mode == "unpack_subquestions"
+    assert api_filter.open_time_gt == now - timedelta(days=30) and count == missed_check.CAP and strict is False
+    assert [(t.label, t.closed, len(t.missed), t.unknown, t.capped) for t in tallies] == [
+        ("FutureEval", 4, 2, 1, False), ("MiniBench", 0, 0, 0, False)
+    ], tallies
+
+    # a check that can't run still gives the review its section, and the step succeeds;
+    # one that finds misses alerts, with nothing but the page on stdout
+    real_check, real_setup, real_alert = missed_check.check, missed_check._setup, alerts.missed_questions
+    alerted = []
+    try:
+        missed_check._setup = lambda: (None, [])
+        missed_check.check = lambda *a: (_ for _ in ()).throw(RuntimeError("Metaculus down"))
+        printed = io.StringIO()
+        with contextlib.redirect_stdout(printed):
+            assert missed_check.main() == 0
+        assert printed.getvalue().startswith("## Missed questions\n\nThe check couldn't run (RuntimeError: Metaculus down)."), printed.getvalue()
+
+        def noisy_check(*a):
+            print("library noise")
+            return [missed_check.Tally("FutureEval", 2, never[:1], 0, False)]
+
+        missed_check.check = noisy_check
+        alerts.missed_questions = lambda links: alerted.append(links) or True  # type: ignore[assignment]
+        printed = io.StringIO()
+        with contextlib.redirect_stdout(printed):
+            assert missed_check.main() == 0
+        assert "library noise" not in printed.getvalue() and "1 missed" in printed.getvalue(), printed.getvalue()
+        assert alerted == [[missed_check._link(never[0])]], alerted
+    finally:
+        missed_check.check, missed_check._setup, alerts.missed_questions = real_check, real_setup, real_alert  # type: ignore[assignment]
+
+    # the issue: titled by the week, listing at most MISSED_SHOWN
+    seen = []
+    real = alerts.raise_alert
+    alerts.raise_alert = lambda title, body, **kw: seen.append((title, body)) or True  # type: ignore[assignment]
+    try:
+        assert alerts.missed_questions([f"[q{i}](u{i})" for i in range(25)])
+    finally:
+        alerts.raise_alert = real  # type: ignore[assignment]
+    title, body = seen[0]
+    year, week, _ = datetime.now(timezone.utc).isocalendar()
+    assert title == f"Questions missed ({year}-W{week:02d})", title
+    assert body.startswith("25 tournament question(s) closed") and "- [q19](u19)" in body and "[q20]" not in body, body
+    assert "- and 5 more on the review's page" in body, body
+    print("missed questions: ok")
+
+
 def check_alerts() -> None:
     """One issue per alert title, mentioning the owner; nothing leaks into the log."""
     secret = "ghs_FAKE-never-logged"
@@ -3529,6 +3625,7 @@ if __name__ == "__main__":
     check_research_survives_one_failure()
     check_prompts()
     check_research_policy()
+    check_missed()
     check_web_research_wait()
     check_run_report()
     check_health_warnings()
