@@ -1659,11 +1659,37 @@ def check_scorecard() -> None:
     # members; the members still count for the models
     later = {**q1, **run([tagged(30.0, opus), tagged(30.0, opus)], posted="2026-11-02T09:00:00Z")}
     assert "Aggregate" not in "\n".join(scorecard.members([later])), scorecard.members([later])
-    # setups: the "Model:" line marks the 2026-10-30 rules; untagged runs are older
-    assert scorecard.setup(q1) == "since 2026-10-30" and scorecard.setup(old) == "before 2026-10-30"
-    text = "\n".join(scorecard.scorecard({"questions": [q1, q2, old]}))
-    assert "| since 2026-10-30 | binary | 2 | +3.0 ± 1.0 |" in text and "| before 2026-10-30 | binary | 1 | +0.0 |" in text, text
-    assert "- since 2026-10-30: 2 resolved: mean forecast 45%" in text, text
+    # setups (setups.py): untagged runs are s1 whatever their time; tagged ones by the
+    # scored run's time, s2 at the earliest
+    assert scorecard.setup(q1) == "s2" and scorecard.setup(old) == "s1"
+    assert scorecard.setup({**old, **run([{"prediction": "40.0%"}], at="2026-11-06T00:00:00Z")}) == "s1"
+    for at, expected in (
+        ("2026-11-01T13:17:36Z", "s2"), ("2026-11-01T13:17:37Z", "s3"), ("2026-11-04T17:03:40Z", "s3"),
+        ("2026-11-04T17:03:41Z", "s4"), ("2026-11-04T12:03:41-05:00", "s4"), ("2026-11-05T09:00:00", "s4"),
+        ("not a time", "s2"),
+    ):  # fmt: skip
+        dated = {**q1, **run([tagged(60.0, opus)], at=at)}
+        assert scorecard.setup(dated) == expected, (at, scorecard.setup(dated))
+    q4 = {**binary(0.9, "yes", 8.0), **run([tagged(90.0, opus), tagged(85.0, gpt)], at="2026-11-06T10:00:00Z")}
+    text = "\n".join(scorecard.scorecard({"questions": [q1, q2, old, q4]}))
+    assert "| s2 | binary | 2 | +3.0 ± 1.0 |" in text and "| s1 | binary | 1 | +0.0 |" in text, text
+    assert "| s4 | all types | 1 | +8.0 |" in text and "| s4 on | all types | 1 | +8.0 |" in text, text
+    assert "- s2: 2 resolved: mean forecast 45%" in text, text
+    assert "- s3: No resolved binary forecasts yet." in text, text
+    assert "- s2 on: 3 resolved: mean forecast 60%" in text, text
+    assert "- s4 (since 2026-11-04 17:03 UTC): research tools called directly (#17)" in text, text
+    # the dated list itself: in order, each from a later time, the first undated; the run
+    # page names the setup live now
+    import setups
+    times = [s.since for s in setups.SETUPS[1:]]
+    assert setups.SETUPS[0].since is None and times == sorted(times) and len(set(times)) == len(times)
+    assert [s.name for s in setups.SETUPS] == [f"s{i + 1}" for i in range(len(setups.SETUPS))]
+    assert setups.COMPARED_FROM in setups.from_("s2") and setups.from_("s4")[0] == "s4"
+    assert setups.current().name == setups.SETUPS[-1].name
+    assert setups.current(datetime(2026, 11, 2, tzinfo=timezone.utc)).name == "s3"
+    idle = "\n".join(main.run_report([], [], main.ResearchHealth(), []))
+    assert f"- Setup: {setups.describe(setups.SETUPS[-1])}." in idle, idle
+    assert "| Status on a date | s2 on |" not in text and "| Other | s2 on | 3 |" in text, text
     print("scorecard: ok")
 
 

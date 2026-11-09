@@ -12,12 +12,14 @@ forecasts can show earlier is bias:
   than 80% inside means the ranges run too narrow.
 - Multiple choice: the mean probability given to the option that won, and how often it
   was the forecast's favourite.
-- By setup: forecasts from before the 2026-10-30 prompt and research rules against those
-  after, told apart by the "Model:" line that arrived with them. The tables above mix
-  both; judge the rules by these rows.
+- By setup: each forecast under the setup live when its run posted it, from the dated
+  list in setups.py (s1 for comments without the "Model:" line that arrived with s2).
+  The tables above mix them all; JUDGING.md says which rows judge which change, with a
+  row for s4 and later (rule A) and a calibration line for s2 and later (rule B).
 - By kind of question, from the title: prices and markets, status on a date, sports and
-  so on, to show where the points are won and lost, per setup. Descriptive only: at a
-  dozen questions a kind, a gap under about 12 points is noise.
+  so on, to show where the points are won and lost, before and under the 2026-10-30
+  rules. Descriptive only: at a dozen questions a kind, a gap under about 12 points is
+  noise.
 - The aggregate against its own members, and each model against the most common one on
   the questions both forecast, in log score (100 x ln of the probability given to what
   happened, the peer score's units). Paired on the same questions, these have far less
@@ -36,8 +38,10 @@ import re
 import statistics
 import sys
 from collections import defaultdict
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any
+
+import setups as dated
 
 BINS = ((0.0, 0.1), (0.1, 0.3), (0.3, 0.5), (0.5, 0.7), (0.7, 0.9), (0.9, 1.0001))
 # forecasting-tools prints values with str(round(v, 6)), so small ones come as "1e-05"
@@ -142,12 +146,15 @@ def binary_calibration(questions: list[dict]) -> list[str]:
 
 
 def binary_by_setup(questions: list[dict]) -> list[str]:
-    """The binary calibration summary line, once per setup."""
+    """The binary calibration summary line, once per setup, then for everything under the
+    2026-10-30 rules (JUDGING.md rule B)."""
     lines = []
-    for name in ("before 2026-10-30", "since 2026-10-30"):
+    for name in [s.name for s in dated.SETUPS]:
         group = [q for q in questions if setup(q) == name]
-        line = binary_calibration(group)[0]
-        lines.append(f"- {name}: {line}")
+        lines.append(f"- {name}: {binary_calibration(group)[0]}")
+    since = set(dated.from_(dated.RULES_FROM))
+    group = [q for q in questions if setup(q) in since]
+    lines.append(f"- {dated.RULES_FROM} on: {binary_calibration(group)[0]}")
     return lines
 
 
@@ -193,9 +200,20 @@ def _same_run(q: dict) -> bool:
 
 
 def setup(q: dict) -> str:
-    """Which setup forecast it: the "Model:" line arrived with the 2026-10-30 rules."""
+    """Which setup forecast it (setups.py): the one live when the scored run posted it,
+    and s1 for a comment without the "Model:" line that arrived with s2."""
     tagged = any(_MODEL.search(text) for text in _forecasters(q))
-    return "since 2026-10-30" if tagged else "before 2026-10-30"
+    trace = _scored_trace(q)
+    at = _time(trace.get("run_time")) if trace else None
+    if at is not None and at.tzinfo is None:
+        at = at.replace(tzinfo=timezone.utc)
+    return dated.setup_at(at, tagged).name
+
+
+def era(q: dict) -> str:
+    """Before or under the 2026-10-30 rules, for the kinds table: per setup it would split
+    a dozen questions a kind into rows of two or three."""
+    return f"{dated.RULES_FROM} on" if setup(q) in dated.from_(dated.RULES_FROM) else "s1"
 
 
 def _canonical(model: str) -> str:
@@ -276,11 +294,15 @@ def kind(q: dict) -> str:
 
 
 def setups(questions: list[dict]) -> list[str]:
+    """Rows per setup, then for the setups that JUDGING.md rule A compares with s1."""
     groups: dict[tuple[str, str], list[float]] = defaultdict(list)
+    compared = set(dated.from_(dated.COMPARED_FROM))
     for q in _scored(questions):
         score = q["scores"]["spot_peer_score"]
-        groups[(setup(q), "all types")].append(score)
-        groups[(setup(q), q.get("question_type") or "?")].append(score)
+        names = [setup(q)] + ([f"{dated.COMPARED_FROM} on"] if setup(q) in compared else [])
+        for name in names:
+            groups[(name, "all types")].append(score)
+            groups[(name, q.get("question_type") or "?")].append(score)
     if not groups:
         return ["No scored questions yet."]
     lines = ["| Setup | Type | Scored | Mean spot peer ± SE |", "|---|---|---|---|"]
@@ -289,10 +311,14 @@ def setups(questions: list[dict]) -> list[str]:
     return lines
 
 
+def setup_legend() -> list[str]:
+    return [f"- {dated.describe(s)}" for s in dated.SETUPS]
+
+
 def kinds(questions: list[dict]) -> list[str]:
     groups: dict[tuple[str, str], list[float]] = defaultdict(list)
     for q in _scored(questions):
-        groups[(kind(q), setup(q))].append(q["scores"]["spot_peer_score"])
+        groups[(kind(q), era(q))].append(q["scores"]["spot_peer_score"])
     if not groups:
         return ["No scored questions yet."]
     lines = ["| Kind of question | Setup | Scored | Mean spot peer ± SE |", "|---|---|---|---|"]
@@ -412,7 +438,9 @@ def scorecard(review: dict[str, Any]) -> list[str]:
         "",
         *multiple_choice(questions),
         "",
-        "**By setup** (the 2026-10-30 prompt and research rules against the setup before them)",
+        "**By setup** (dated in setups.py; JUDGING.md says which rows judge which change)",
+        "",
+        *setup_legend(),
         "",
         *setups(questions),
         "",
