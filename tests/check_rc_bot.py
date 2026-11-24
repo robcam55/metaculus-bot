@@ -1378,6 +1378,56 @@ def check_watchdog() -> None:
     print("watchdog: ok")
 
 
+def check_poetry_install() -> None:
+    """How every job gets Poetry: with pip, from a committed file that pins Poetry and each
+    package it needs to one version and to sha256 hashes. No action or installer script
+    fetches them fresh in a job that holds the keys."""
+    root = Path(__file__).resolve().parents[1]
+    install = "python -m pip install --require-hashes --only-binary=:all: -r .github/poetry-requirements.txt"
+    settings = ("virtualenvs.create true", "virtualenvs.in-project true", "installer.parallel true")
+    workflows = sorted((root / ".github" / "workflows").glob("*.y*ml"))
+    with_poetry = 0
+    for path in workflows:
+        text = path.read_text(encoding="utf-8")
+        assert "snok/install-poetry" not in text and "install.python-poetry.org" not in text, path.name
+        commands = [line.strip() for line in text.splitlines() if not line.strip().startswith("#")]
+        pip_installs = [line for line in commands if "pip install" in line]
+        uses = [i for i, line in enumerate(commands) if re.search(r"\bpoetry (config|install|run)\b", line)]
+        if not uses:  # a workflow that never runs Poetry (none today) installs nothing with pip
+            assert not pip_installs, path.name
+            continue
+        with_poetry += 1
+        # the hash-checked install is the only pip install, and Poetry isn't used before it
+        assert pip_installs == [install], path.name
+        assert commands.index(install) < uses[0], path.name
+        # the settings the install action used to set, so .venv stays in the project
+        for setting in settings:
+            assert f"poetry config {setting}" in commands, (path.name, setting)
+        assert sum(line.startswith("run: poetry install --no-interaction --no-root") for line in commands) == 1, path.name
+    assert with_poetry >= 7, with_poetry  # all seven of today's workflows
+
+    # the file: nothing but comments and exact pins, each with at least one sha256 hash
+    text = (root / ".github" / "poetry-requirements.txt").read_text(encoding="utf-8")
+    entries = [entry for entry in text.replace("\\\n", " ").splitlines() if entry.strip() and not entry.startswith("#")]
+    pins: dict[str, str] = {}
+    for entry in entries:
+        requirement, *options = entry.split()
+        pin = re.fullmatch(r"([a-z0-9]+(?:-[a-z0-9]+)*)==([0-9][0-9a-z.]*)", requirement)
+        assert pin, entry  # one exact version: no range, URL, option or included file
+        assert options and all(re.fullmatch(r"--hash=sha256:[0-9a-f]{64}", option) for option in options), entry
+        assert pin.group(1) not in pins, entry
+        pins[pin.group(1)] = pin.group(2)
+    assert pins["poetry"] == "2.5.1", pins.get("poetry")
+    # made for the servers (Linux, CPython 3.11): plain pip leaves out the first two on
+    # Windows and the third on Python 3.12, and on Windows adds colorama and pywin32-ctypes
+    assert {"secretstorage", "jeepney", "importlib-metadata", "poetry-core", "virtualenv"} <= set(pins), sorted(pins)
+    assert not {"colorama", "pywin32-ctypes"} & set(pins), sorted(pins)
+    assert "python .github/pin_poetry.py 2.5.1" in text, "the file says how it is regenerated"
+    readme = (root / "README.md").read_text(encoding="utf-8")
+    assert ".github/poetry-requirements.txt" in readme and ".github/pin_poetry.py" in readme
+    print("poetry install: ok")
+
+
 def check_model_watch() -> None:
     """model_watch.py: the daily check for new Claude models and retired ones."""
     import model_watch
@@ -3809,6 +3859,7 @@ if __name__ == "__main__":
     check_own_key()
     check_alerts()
     check_watchdog()
+    check_poetry_install()
     check_model_watch()
     check_model_tags()
     check_extra_forecasters()
