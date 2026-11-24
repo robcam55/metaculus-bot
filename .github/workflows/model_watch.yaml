@@ -5,15 +5,23 @@ name: Model watch
 # the issue says how to try the new one on the Test Bot first. Listing models costs
 # nothing. Like the backup clock, GitHub disables this schedule after 60 days without a
 # commit; Actions -> Model watch -> Enable workflow brings it back.
+#
+# Since 2026-11-23 the same daily run also looks for missed questions (missed_check.py),
+# the check the Monday review makes: a stop that leaves the forecasting runs green would
+# otherwise go unseen for up to a week. It only reads from Metaculus.
 on:
   schedule:
     - cron: "41 15 * * *" # once a day, off the hour
   workflow_dispatch:
+    inputs:
+      missed_days:
+        description: "Missed questions: read this many days back and only list them (empty = the usual 8 days, with an issue)"
+        default: ""
 
 jobs:
   watch:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 30
     permissions:
       contents: read
       issues: write # the alert issues
@@ -37,3 +45,23 @@ jobs:
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }} # lists models only
           GITHUB_TOKEN: ${{ github.token }} # opens the alert issues
+      # Last, and whatever the model check did. Not continue-on-error: with
+      # MISSED_CHECK_STRICT a check that can't run turns this run red, because a dead check
+      # would otherwise read the same as one that found nothing
+      - name: Look for missed questions
+        if: ${{ !cancelled() }}
+        # The page goes to the run's summary and to its log: the summary shows only to
+        # signed-in readers, and `gh run view --log` reads the log
+        run: |
+          status=0
+          poetry run python missed_check.py > missed.md || status=$?
+          cat missed.md
+          cat missed.md >> "$GITHUB_STEP_SUMMARY"
+          exit $status
+        env:
+          METACULUS_TOKEN: ${{ secrets.METACULUS_TOKEN }} # reads questions; forecasts nothing
+          GITHUB_TOKEN: ${{ github.token }} # opens the missed-questions issue
+          AIB_TOURNAMENT_ID: ${{ vars.AIB_TOURNAMENT_ID }}
+          MINIBENCH_ID: ${{ vars.MINIBENCH_ID }}
+          MISSED_CHECK_STRICT: "1"
+          MISSED_DAYS: ${{ inputs.missed_days }} # read from the environment, never put into the script

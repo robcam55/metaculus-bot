@@ -69,6 +69,8 @@ KEYS = (
     "RESEARCH_REPORTS",
     "GITHUB_STEP_SUMMARY",
     "PAY_WITH",
+    "MISSED_DAYS",
+    "MISSED_CHECK_STRICT",
     "GITHUB_TOKEN",
     "GITHUB_REPOSITORY",
     "GITHUB_REPOSITORY_OWNER",
@@ -1072,6 +1074,13 @@ def check_missed() -> None:
     assert "find its runs in the tournament workflow's log" in text, text
     quiet = "\n".join(missed_check.lines([missed_check.Tally("FutureEval", 4, [], 0, False)]))
     assert "the bot: 0. It should read 0." in quiet and "find its runs" not in quiet, quiet
+    assert "Questions read" not in quiet and "hand read" not in quiet, quiet
+    # how many questions each list returned, so an empty list can't pass for "none missed";
+    # and a hand read over a wider window says that it only lists
+    counted = [missed_check.Tally("FutureEval", 4, [], 0, False, 146), missed_check.Tally("MiniBench", 0, [], 0, False, 0)]
+    wide = "\n".join(missed_check.lines(counted, 60))
+    assert "Questions read: FutureEval 146, MiniBench 0." in wide, wide
+    assert "closed in the last 60 days" in wide and "A hand read over 60 days: it only lists, and opens no issue." in wide, wide
 
     # the read: closed and resolved questions of each tournament, subquestions unpacked,
     # opened within 30 days, as many pages as there are
@@ -1086,9 +1095,27 @@ def check_missed() -> None:
     api_filter, count, strict = asked[0]
     assert api_filter.allowed_statuses == ["closed", "resolved"] and api_filter.group_question_mode == "unpack_subquestions"
     assert api_filter.open_time_gt == now - timedelta(days=30) and count == missed_check.CAP and strict is False
-    assert [(t.label, t.closed, len(t.missed), t.unknown, t.capped) for t in tallies] == [
-        ("FutureEval", 4, 2, 1, False), ("MiniBench", 0, 0, 0, False)
+    assert [(t.label, t.closed, len(t.missed), t.unknown, t.capped, t.read) for t in tallies] == [
+        ("FutureEval", 4, 2, 1, False, 7), ("MiniBench", 0, 0, 0, False, 0)
     ], tallies
+    # a wider window reads that much further back, and counts the question 9 days old
+    asked.clear()
+    tallies = missed_check.check(FakeClient(), [("FutureEval", 33121)], now, 60)
+    assert asked[0][0].open_time_gt == now - timedelta(days=82), asked[0][0].open_time_gt
+    assert (tallies[0].closed, len(tallies[0].missed)) == (5, 3), tallies
+    # MISSED_DAYS: whole days only, so a typo can't pass for a clean result
+    with env(MISSED_DAYS=""):
+        assert missed_check.window() == missed_check.DAYS
+    with env(MISSED_DAYS="60"):
+        assert missed_check.window() == 60
+    for bad in ("0", "sixty", "8; rm", "400"):
+        with env(MISSED_DAYS=bad):
+            try:
+                missed_check.window()
+            except ValueError as e:
+                assert "MISSED_DAYS must be" in str(e), e
+            else:
+                raise AssertionError(f"{bad!r} must stop the check")
 
     # a check that can't run still gives the review its section, and the step succeeds;
     # one that finds misses alerts, with nothing but the page on stdout
@@ -1107,12 +1134,40 @@ def check_missed() -> None:
             return [missed_check.Tally("FutureEval", 2, never[:1], 0, False)]
 
         missed_check.check = noisy_check
-        alerts.missed_questions = lambda links, days: alerted.append((links, days)) or True  # type: ignore[assignment]
+        alerts.missed_questions = lambda links, days, week=None: alerted.append((links, days, week)) or True  # type: ignore[assignment]
         printed = io.StringIO()
         with contextlib.redirect_stdout(printed):
             assert missed_check.main() == 0
         assert "library noise" not in printed.getvalue() and "1 missed" in printed.getvalue(), printed.getvalue()
-        assert alerted == [([missed_check._link(never[0])], 8)], alerted
+        # the issue is titled by the week the question closed in (30 hours before Monday
+        # 2026-11-09 06:00 UTC is Sunday of week 45), so every later run names it the same
+        assert alerted == [([missed_check._link(never[0])], 8, "2026-W45")], alerted
+
+        # misses that closed in two weeks open one issue each, oldest first
+        def two_weeks(*a):
+            return [missed_check.Tally("FutureEval", 2, [q(11, hours(3), False), q(12, hours(40), False)], 0, False)]
+
+        alerted.clear()
+        missed_check.check = two_weeks
+        with contextlib.redirect_stdout(io.StringIO()):
+            assert missed_check.main() == 0
+        assert [(len(links), week) for links, _, week in alerted] == [(1, "2026-W45"), (1, "2026-W46")], alerted
+
+        # a hand read over a wider window lists and opens no issue
+        alerted.clear()
+        printed = io.StringIO()
+        with env(MISSED_DAYS="60"), contextlib.redirect_stdout(printed):
+            assert missed_check.main() == 0
+        assert alerted == [] and "A hand read over 60 days" in printed.getvalue(), (alerted, printed.getvalue())
+
+        # the daily run's setting: a check that can't run, or a mistyped window, exits 1
+        missed_check.check = lambda *a: (_ for _ in ()).throw(RuntimeError("Metaculus down"))
+        with env(MISSED_CHECK_STRICT="1"), contextlib.redirect_stdout(io.StringIO()):
+            assert missed_check.main() == 1
+        with env(MISSED_DAYS="soon"), contextlib.redirect_stdout(io.StringIO()):
+            assert missed_check.main() == 0
+        with env(MISSED_DAYS="soon", MISSED_CHECK_STRICT="1"), contextlib.redirect_stdout(io.StringIO()):
+            assert missed_check.main() == 1
     finally:
         missed_check.check, missed_check._setup, alerts.missed_questions = real_check, real_setup, real_alert  # type: ignore[assignment]
 
@@ -1127,6 +1182,23 @@ def check_missed() -> None:
     title, body = seen[0]
     year, week, _ = datetime.now(timezone.utc).isocalendar()
     assert title == f"Questions missed ({year}-W{week:02d})", title
+    alerts.raise_alert = lambda title, body, **kw: seen.append((title, body)) or True  # type: ignore[assignment]
+    try:
+        alerts.missed_questions(["[q](u)"], 8, "2026-W45")
+    finally:
+        alerts.raise_alert = real  # type: ignore[assignment]
+    assert seen[-1][0] == "Questions missed (2026-W45)", seen[-1]
+    # where it runs: last in the daily model-watch job, strict, with the hand-run window
+    # read from the environment; and in the review even after a failed review step
+    workflows = Path(__file__).resolve().parents[1] / ".github" / "workflows"
+    daily = (workflows / "model_watch.yaml").read_text(encoding="utf-8")
+    step = daily[daily.index("- name: Look for missed questions"):]
+    assert "if: ${{ !cancelled() }}" in step and "continue-on-error" not in step, step
+    assert 'MISSED_CHECK_STRICT: "1"' in step and "MISSED_DAYS: ${{ inputs.missed_days }}" in step, step
+    assert "poetry run python missed_check.py > missed.md || status=$?" in step and "exit $status" in step, step
+    assert "inputs.missed_days" not in step.split("env:")[0], step
+    weekly = (workflows / "review_bot.yaml").read_text(encoding="utf-8")
+    assert weekly.count("if: ${{ !cancelled() }}") == 3 and "MISSED_CHECK_STRICT" not in weekly, weekly
     assert body.startswith("25 tournament question(s) closed in the last 8 days without") and "- [q19](u19)" in body and "[q20]" not in body, body
     assert "- and 5 more on the review's page" in body, body
     print("missed questions: ok")

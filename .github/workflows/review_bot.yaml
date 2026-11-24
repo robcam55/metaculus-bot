@@ -56,6 +56,7 @@ jobs:
           echo >> review.md
           poetry run python scorecard.py review.json >> review.md
       - name: Look for missed questions
+        if: ${{ !cancelled() }} # also when the review step failed: this check doesn't need it
         continue-on-error: true # never at the cost of bot-review's summary or the artifact
         run: |
           echo >> review.md
@@ -66,8 +67,10 @@ jobs:
           AIB_TOURNAMENT_ID: ${{ vars.AIB_TOURNAMENT_ID }}
           MINIBENCH_ID: ${{ vars.MINIBENCH_ID }}
       - name: Show the summary in the run page
+        if: ${{ !cancelled() }}
         run: cat review.md >> $GITHUB_STEP_SUMMARY
       - name: Keep the review
+        if: ${{ !cancelled() }}
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: review
