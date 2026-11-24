@@ -2548,6 +2548,126 @@ def check_research_tools() -> None:
     print("research tools: ok")
 
 
+def workflow_scripts(text: str) -> list[str]:
+    """Every `run:` script in a workflow file, as written: the rest of its line and the
+    more-indented lines under it. A commented-out step and `run-name:` are not scripts."""
+    lines = text.splitlines()
+    scripts: list[str] = []
+    for i, line in enumerate(lines):
+        found = re.match(r"(\s*(?:- )?)run:(.*)", line)
+        if not found:
+            continue
+        script = [found.group(2)]
+        for below in lines[i + 1:]:
+            if below.strip() and len(below) - len(below.lstrip()) <= len(found.group(1)):
+                break
+            script.append(below)
+        scripts.append("\n".join(script))
+    return scripts
+
+
+def workflow_permissions(text: str) -> set[str] | None:
+    """What a workflow file's `permissions:` blocks grant its token, comments dropped. None
+    when a job is left without a block, which gives its token the repository's default."""
+    jobs = re.split(r"^  (?=[\w-]+:\s*$)", text.split("\njobs:\n", 1)[1], flags=re.MULTILINE)[1:]
+    whole_file = re.search(r"^permissions:", text, re.MULTILINE)
+    if not whole_file and not all(re.search(r"^    permissions:", job, re.MULTILINE) for job in jobs):
+        return None
+    lines = text.splitlines()
+    granted: set[str] = set()
+    for i, line in enumerate(lines):
+        found = re.match(r"(\s*)permissions:(.*)", line)
+        if not found:
+            continue
+        granted.add(found.group(2).split("#")[0].strip())
+        for below in lines[i + 1:]:
+            if below.strip() and len(below) - len(below.lstrip()) <= len(found.group(1)):
+                break
+            granted.add(below.split("#")[0].strip())
+    return granted - {""}
+
+
+def check_workflows() -> None:
+    """Every workflow: nothing GitHub fills in (`${{ ... }}`: an input, a variable, a field
+    of the event) is written into a script, where its text would run as commands; and each
+    job's token is cut down to what the job uses. An alert issue needs both the token in a
+    step's environment and `issues: write` (alerts.py), so the two must come together."""
+    # the reader of scripts sees both ways of writing one, and nothing that isn't one
+    sample = (
+        "run-name: Review (${{ inputs.title }})\n"
+        "jobs:\n"
+        "  job:\n"
+        "    steps:\n"
+        "      # - run: echo ${{ inputs.commented }}\n"
+        "      - run: echo ${{ inputs.one }}\n"
+        "        env:\n"
+        "          QUOTED: ${{ inputs.safe }}\n"
+        "      - name: Several lines\n"
+        "        run: |\n"
+        "          echo first\n"
+        "\n"
+        "          echo ${{ github.event.inputs.two }}\n"
+        "        env:\n"
+        "          DAYS: ${{ inputs.days }}\n"
+    )
+    scripts = workflow_scripts(sample)
+    assert len(scripts) == 2 and "inputs.one" in scripts[0] and "inputs.two" in scripts[1], scripts
+    assert not any(word in "".join(scripts) for word in ("title", "commented", "safe", "days")), scripts
+    assert workflow_permissions(sample) is None
+    assert workflow_permissions(sample.replace("    steps:", "    permissions:\n      contents: read # code\n    steps:")) == {"contents: read"}
+    assert workflow_permissions("permissions:\n  issues: write\n" + sample) == {"issues: write"}
+
+    workflows = Path(__file__).resolve().parents[1] / ".github" / "workflows"
+    files = {file.name: file.read_text(encoding="utf-8") for file in sorted(workflows.glob("*.y*ml"))}
+    assert {"test_bot.yaml", "run_bot_on_metaculus_cup.yaml", "run_bot_on_tournament.yaml"} <= set(files), sorted(files)
+    for name, text in files.items():
+        scripts = workflow_scripts(text)
+        assert scripts, name
+        for script in scripts:
+            # the safe form: NAME: ${{ ... }} under the step's env:, and "$NAME" in the script
+            assert "${{" not in script, f"{name} writes a GitHub value into a script: {script!r}"
+        granted = workflow_permissions(text)
+        assert granted is not None, f"{name}: a job declares no permissions"
+        assert "write-all" not in granted, (name, granted)
+        # a step gets the token only by being handed it (GITHUB_TOKEN, or the gh tool's
+        # GH_TOKEN), and every workflow that hands it over opens alert issues with it:
+        # handed over without issues: write, an alert would fail with only a log line
+        hands_token = "github.token" in text.split("\njobs:\n", 1)[1] or "secrets.GITHUB_TOKEN" in text
+        assert hands_token == ("issues: write" in granted), (name, granted)
+    # the two hand-started forecasting workflows read the code and nothing more: no step
+    # gets the token, so an alert there is logged, not opened (check_alerts, "only logged")
+    for name in ("test_bot.yaml", "run_bot_on_metaculus_cup.yaml"):
+        assert workflow_permissions(files[name]) == {"contents: read"}, (name, workflow_permissions(files[name]))
+    assert workflow_permissions(files["run_bot_on_tournament.yaml"]) == {"contents: read", "issues: write"}
+    print("workflows: ok")
+
+
+def check_review_skill() -> None:
+    """The hand review's instructions (.claude/skills/review-bot/SKILL.md) name the fields
+    bot-review 0.1.2 writes, pick the scored run as the scorecard does, and give the weekly
+    workflow's window."""
+    import scorecard
+
+    root = Path(__file__).resolve().parents[1]
+    skill = " ".join((root / ".claude" / "skills" / "review-bot" / "SKILL.md").read_text(encoding="utf-8").split())
+    # review.json has a `traces` list on every question and no `trace` field: read as first
+    # written, "`traces` non-empty but `trace` null" matched every question
+    assert not re.search(r"`trace[`.]", skill.replace("There is no single `trace` field.", "")), skill
+    assert "the entry of `traces` with the latest `run_time` at or before the question's `spot_scoring_time`" in skill, skill
+    for field in ("comment_id", "run_time", "forecasters", "truncated"):
+        assert f"`{field}`" in skill, field
+    runs = [
+        {"comment_id": 1, "run_time": "2026-11-01T10:00:00Z", "forecasters": [{"key": "R1:F1", "prediction": "40%"}]},
+        {"comment_id": 2, "run_time": "2026-11-01T12:00:00Z", "forecasters": [{"key": "R1:F1", "prediction": "60%"}]},
+    ]
+    question = {"spot_scoring_time": "2026-11-01T11:00:00Z", "traces": runs[::-1]}
+    assert scorecard._scored_trace(question)["comment_id"] == 1
+    review = (root / ".github" / "workflows" / "review_bot.yaml").read_text(encoding="utf-8")
+    days = re.search(r"DAYS: \$\{\{ inputs\.days \|\| (\d+) \}\}", review)
+    assert days and f"the weekly workflow, `review_bot.yaml`, reads {days.group(1)}" in skill, skill
+    print("review skill: ok")
+
+
 def check_tool_rules() -> None:
     """The system note: built from the tools' own numbers, on this route alone, and never
     in the way of the cache marker."""
@@ -3825,6 +3945,8 @@ if __name__ == "__main__":
     check_comment_sections()
     check_asknews()
     check_research_tools()
+    check_workflows()
+    check_review_skill()
     check_tool_rules()
     check_research_watch()
     with fixed_anthropic_prices():
