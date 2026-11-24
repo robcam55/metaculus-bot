@@ -1,5 +1,6 @@
 """
-The tournament questions the bot never forecast, for the weekly review's run page.
+The tournament questions the bot never forecast, for the weekly review's run page and a
+daily run of its own.
 
 A missed question scores nothing, so it costs the tournament points a forecast would have
 had a fair chance of earning. One bot maker reported losing about 150 points to 10 missed
@@ -12,10 +13,19 @@ ways:
 - Its forecast fails.
 - It falls in a gap between runs.
 
-Each week this lists every FutureEval and MiniBench question that closed in the last
-DAYS days without a forecast from the bot's account. It opens one issue that week if
-there is any. It only reads from Metaculus, and a failure here never fails the review:
+This lists every FutureEval and MiniBench question that closed in the last DAYS days
+without a forecast from the bot's account, and opens one issue for each week that has
+any. It runs in the Monday review and, since 2026-11-23, once a day beside the model
+watch: a stop that leaves runs green (a switch left off, a pause, a stale tournament id)
+would otherwise go unseen for up to a week. It only reads from Metaculus:
 `python missed_check.py`.
+
+Two settings, both from the environment:
+- MISSED_DAYS: a hand read over a wider window, say 60, to see that the check lists a
+  miss it should know about. It only lists: no issue opens.
+- MISSED_CHECK_STRICT=1: a check that can't run exits 1, so the daily run turns red. A
+  check that is dead would otherwise read the same as one that found nothing. The review
+  leaves it unset: there a failure never fails the review.
 """
 
 from __future__ import annotations
@@ -49,6 +59,7 @@ class Tally:
     missed: list  # those the bot never forecast (MetaculusQuestion)
     unknown: int  # those whose forecast status didn't come back
     capped: bool  # the read stopped at CAP
+    read: int = 0  # questions the tournament's list returned, in or out of the window
 
 
 def missed(questions: list, now: datetime, days: int = DAYS) -> tuple[list, list, int]:
@@ -68,14 +79,15 @@ def _utc(moment: datetime | None) -> datetime | None:
     return moment
 
 
-def _read(client, tid: int | str, now: datetime) -> list:
+def _read(client, tid: int | str, now: datetime, days: int = DAYS) -> list:
     from forecasting_tools.helpers.metaculus_client import ApiFilter
 
+    # a wider window (a hand read) reaches as much further back for when a question opened
     api_filter = ApiFilter(
         allowed_statuses=["closed", "resolved"],
         allowed_tournaments=[tid],
         group_question_mode="unpack_subquestions",
-        open_time_gt=now - OPENED_WITHIN,
+        open_time_gt=now - OPENED_WITHIN - timedelta(days=max(0, days - DAYS)),
     )
     return asyncio.run(
         client.get_questions_matching_filter(
@@ -108,6 +120,12 @@ def lines(tallies: list[Tally], days: int = DAYS) -> list[str]:
         extra = f" ({'; '.join(notes)})" if notes else ""
         out.append(f"- {t.label}: {t.closed} closed, {len(t.missed)} missed{extra}.")
         out += [f"  - {_link(q)}" for q in t.missed]
+    if any(t.read for t in tallies):
+        # how many questions each list returned: a list that comes back short or empty
+        # would otherwise read as "nothing missed"
+        out += ["", "Questions read: " + ", ".join(f"{t.label} {t.read}" for t in tallies) + "."]
+    if days != DAYS:
+        out += ["", f"A hand read over {days} days: it only lists, and opens no issue."]
     if total:
         out += [
             "",
@@ -118,13 +136,37 @@ def lines(tallies: list[Tally], days: int = DAYS) -> list[str]:
     return out
 
 
-def check(client, tournaments: list[tuple[str, int | str]], now: datetime) -> list[Tally]:
+def check(
+    client, tournaments: list[tuple[str, int | str]], now: datetime, days: int = DAYS
+) -> list[Tally]:
     tallies = []
     for label, tid in tournaments:
-        found = _read(client, tid, now)
-        closed, never, unknown = missed(found, now)
-        tallies.append(Tally(label, len(closed), never, unknown, len(found) >= CAP))
+        found = _read(client, tid, now, days)
+        closed, never, unknown = missed(found, now, days)
+        tallies.append(Tally(label, len(closed), never, unknown, len(found) >= CAP, len(found)))
     return tallies
+
+
+def window() -> int:
+    """DAYS, or MISSED_DAYS for a hand read. A value that isn't a whole number of days
+    from 1 to 365 stops the check, so a typo can't pass for a clean result."""
+    raw = os.getenv("MISSED_DAYS", "").strip()
+    if not raw:
+        return DAYS
+    if not raw.isdigit() or not 1 <= int(raw) <= 365:
+        raise ValueError(f"MISSED_DAYS must be a whole number of days from 1 to 365; got {raw!r}")
+    return int(raw)
+
+
+def by_close_week(questions: list) -> dict[str, list]:
+    """Missed questions under the ISO week they closed in, oldest week first. The issue is
+    titled by that week, so the daily run and the Monday review name a miss the same way
+    and it is announced once, however many runs see it."""
+    weeks: dict[str, list] = {}
+    for q in sorted(questions, key=lambda q: _utc(q.close_time)):
+        year, week, _ = _utc(q.close_time).isocalendar()
+        weeks.setdefault(f"{year}-W{week:02d}", []).append(q)
+    return weeks
 
 
 def _setup():
@@ -141,17 +183,20 @@ def _setup():
 
 def main() -> int:
     logging.basicConfig(level=logging.INFO)  # to stderr: stdout is the review's page
+    strict = os.getenv("MISSED_CHECK_STRICT", "").strip() == "1"
     try:
+        days = window()
         with contextlib.redirect_stdout(sys.stderr):
-            tallies = check(*_setup(), datetime.now(timezone.utc))
+            tallies = check(*_setup(), datetime.now(timezone.utc), days)
     except Exception as e:  # the review's own summary matters more than this section
         print(f"## Missed questions\n\nThe check couldn't run ({type(e).__name__}: {e}).")
-        return 0
-    print("\n".join(lines(tallies)))
+        return 1 if strict else 0
+    print("\n".join(lines(tallies, days)))
     found = [q for t in tallies for q in t.missed]
-    if found:
+    if found and days == DAYS:
         with contextlib.redirect_stdout(sys.stderr):
-            alerts.missed_questions([_link(q) for q in found], DAYS)
+            for week, questions in by_close_week(found).items():
+                alerts.missed_questions([_link(q) for q in questions], days, week)
     return 0
 
 
