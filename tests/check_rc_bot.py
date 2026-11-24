@@ -2120,8 +2120,9 @@ def check_guards() -> None:
 def check_short_answers() -> None:
     """A number or date answer whose stated percentiles stop short of the 10th or the 90th
     (the 2026-11-12 design review's "short number answers"): one warning line in the run
-    log names it, and the question's forecast is combined exactly as before. Rob chose the
-    warning alone on 2026-11-24: none had been seen in 328 number forecasts on record."""
+    log reports it, and nothing is left out for being short, so the question's forecast is
+    what it was before. Rob chose the warning alone on 2026-11-24 ("Warn only"). None had
+    been seen in 328 number forecasts on record."""
     import forecast_guards as fg
     from forecasting_tools import NumericDistribution, Percentile
 
@@ -2149,6 +2150,9 @@ def check_short_answers() -> None:
     assert fg.short_answer(dist(without(0.1))) == why.format(20, 90)
     assert fg.short_answer(dist(without(0.6, 0.8, 0.9))) == why.format(10, 40)
     assert fg.short_answer(dist({0.25: 450, 0.5: 500, 0.75: 550})) == why.format(25, 75)
+    assert fg.short_answer(dist({0.15: 420, 0.5: 500, 0.85: 580})) == why.format(15, 85)
+    assert fg.short_answer(dist({0.1: 400, 0.5: 500, 0.85: 580})) == why.format(10, 85)
+    assert fg.short_answer(dist({0.15: 420, 0.5: 500, 0.9: 600})) == why.format(15, 90)
 
     def heights(d) -> list[float]:
         return [p.percentile for p in d.get_cdf()]
@@ -2182,12 +2186,19 @@ def check_short_answers() -> None:
             return [r.getMessage() for r in records if r.levelno == logging.WARNING]
 
         # one short answer of five: still combined with the others, exactly as before,
-        # and the log says which levels it had
+        # and the log gives its lowest and highest stated level
         assert same(mix(a, b, cut, c, d), mean_of(a, b, cut, c, d))
         assert warnings() == [
-            f"Numeric mixture: 1 short forecast(s) for {url}, combined as before:"
+            f"Numeric mixture: 1 short forecast(s) for {url}, handled as before:"
             f' ["{why.format(10, 40)}"]'
         ], warnings()
+        # the same in the last place of five (where an extra forecaster's answer sits),
+        # and with two short of five
+        assert same(mix(a, b, c, d, cut), mean_of(a, b, c, d, cut))
+        assert len(warnings()) == 1 and "1 short forecast(s)" in warnings()[0], warnings()
+        also_cut = dist(without(0.9), shift=15)
+        assert same(mix(a, cut, b, c, also_cut), mean_of(a, cut, b, c, also_cut))
+        assert len(warnings()) == 1 and "2 short forecast(s)" in warnings()[0], warnings()
         # one of three, with a missing 10th: the same
         no_10th = dist(without(0.1), shift=5)
         assert same(mix(a, no_10th, b), mean_of(a, no_10th, b))
@@ -2211,7 +2222,12 @@ def check_short_answers() -> None:
         assert same(mix(a, no_10th, b, far_1, far_2), mean_of(a, no_10th, b))
         assert len(warnings()) == 1 and "1 short forecast(s)" in warnings()[0], warnings()
         assert same(mix(a, b, c, far_1), mean_of(a, b, c)) and not warnings()
-        # the telling can't fail a forecast: if reading the levels raises, the mixture is
+        # an answer both short and far: that step leaves it out for being far, as it
+        # would have before, and the line still reports that it was short
+        far_cut = dist({0.1: 850, 0.2: 870, 0.4: 890})
+        assert same(mix(a, b, c, far_cut), mean_of(a, b, c))
+        assert len(warnings()) == 1 and "from 10 to 40" in warnings()[0], warnings()
+        # the report can't fail a forecast: if reading the levels raises, the mixture is
         # the same and the log says the levels could not be read
         real_short_answer = fg.short_answer
 

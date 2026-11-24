@@ -20,7 +20,7 @@ every forecast are paid for. The 2026-10-28 review reproduced each case offline:
   80th percentile so puts 10% beyond an open upper bound, not 5%. `short_answer` names
   such an answer, and `mixture` writes one warning line when it meets any. Nothing that
   is posted changes: none has been seen on record, so the line is there to show the
-  first one.
+  first one (Rob's choice of 2026-11-24, "Warn only").
 
 Numeric forecasts are combined with `mixture`, the mean of the forecasters' CDFs, rather
 than the package's pointwise median. The median keeps the spread of a single forecast,
@@ -221,9 +221,9 @@ def mixture(
     place (the median ignores it). Ordinary disagreement, overlapping ranges, is what the
     mixture is for and stays in. With fewer than three forecasts nothing is left out,
     since there's no majority to judge by.
-    A short answer (see short_answer) is only told: one warning line names the levels each
-    one stated. It stays in the mixture exactly as before, and the telling can't fail the
-    forecast."""
+    A short answer (see short_answer) is only reported: one warning line gives the lowest
+    and highest level each one stated. Nothing is left out for being short, so the mixture
+    is exactly what it was before, and the report can't fail the forecast."""
     cdfs = [prediction.get_cdf() for prediction in predictions]
     x_axis = [p.value for p in cdfs[0]]
     heights = np.array([[p.percentile for p in cdf] for cdf in cdfs])
@@ -241,15 +241,18 @@ def mixture(
                 f" from the others for {question.page_url}"
             )
             kept = inside
-    try:  # telling only: every forecast is combined as before, short or not
+    try:  # report only: `kept` is not touched, so nothing is left out for being short
         short = [why for prediction in predictions if (why := short_answer(prediction))]
         if short:
             logger.warning(
                 f"Numeric mixture: {len(short)} short forecast(s) for {question.page_url},"
-                f" combined as before: {short}"
+                f" handled as before: {short}"
             )
     except Exception as e:
-        logger.warning(f"Numeric mixture: could not read a forecast's levels ({type(e).__name__})")
+        try:
+            logger.warning(f"Numeric mixture: could not read a forecast's levels ({type(e).__name__})")
+        except Exception:
+            pass
     mean = heights[kept].mean(axis=0)
     return NumericDistribution.from_question(
         [Percentile(value=x, percentile=h) for x, h in zip(x_axis, mean.tolist())], question
