@@ -15,6 +15,10 @@ every forecast are paid for. The 2026-10-28 review reproduced each case offline:
   fails, and the same parsing prompt fails the same way on every retry. `option_list`
   parses leniently instead and floors each option at 1%, which the validator then accepts
   unchanged.
+- Numeric and date: the package accepts any two percentiles, and puts an open bound
+  halfway between the outermost stated level and 0% or 100%. An answer that stops at the
+  80th percentile so puts 10% beyond an open upper bound, not 5%. `short_answer` names
+  such an answer, and `mixture` leaves it out while most of the answers are complete.
 
 Numeric forecasts are combined with `mixture`, the mean of the forecasters' CDFs, rather
 than the package's pointwise median. The median keeps the spread of a single forecast,
@@ -185,6 +189,20 @@ def spread_repeats(
     return spread
 
 
+def short_answer(prediction: NumericDistribution) -> str | None:
+    """Why a number or date forecast is short: its stated percentile levels don't reach
+    down to 10 and up to 90 (the prompts ask for 10, 20, 40, 60, 80 and 90). None when the
+    lowest level is 10 or less and the highest 90 or more, whatever the levels between, so
+    5/25/50/75/95 is complete. The package builds each tail from the outermost stated
+    level, so a short answer moves probability toward or beyond a bound that its
+    forecaster never put there."""
+    levels = [p.percentile for p in prediction.declared_percentiles]
+    low, high = min(levels), max(levels)
+    if low <= 0.1 + 1e-9 and high >= 0.9 - 1e-9:
+        return None
+    return f"The forecast's percentiles run from {low * 100:g} to {high * 100:g}, not from 10 to 90"
+
+
 def _band(heights: np.ndarray, x_axis: list[float]) -> tuple[float, float]:
     """Where a CDF crosses 10% and 90%."""
     low, high = np.interp([0.1, 0.9], heights, x_axis)
@@ -200,7 +218,24 @@ def mixture(
     first: that is a misread unit, say, which would put a third of the mass in the wrong
     place (the median ignores it). Ordinary disagreement, overlapping ranges, is what the
     mixture is for and stays in. With fewer than three forecasts nothing is left out,
-    since there's no majority to judge by."""
+    since there's no majority to judge by.
+    Before that, a short answer (see short_answer) is left out, while more than half of
+    the forecasts are complete. That fails the one forecast here, after the question has
+    passed its success bar, so it can't cost the question its forecast. When half or more
+    are short, all are kept, as before: a posted imperfect forecast usually scores better
+    than none, and nothing says which answers to trust."""
+    short = [why for prediction in predictions if (why := short_answer(prediction))]
+    if short and 2 * len(short) < len(predictions):
+        logger.warning(
+            f"Numeric mixture: left out {len(short)} short forecast(s) for"
+            f" {question.page_url}: {short}"
+        )
+        predictions = [prediction for prediction in predictions if not short_answer(prediction)]
+    elif short:
+        logger.warning(
+            f"Numeric mixture: kept {len(short)} short forecast(s) for {question.page_url},"
+            f" too few complete ones to leave them out: {short}"
+        )
     cdfs = [prediction.get_cdf() for prediction in predictions]
     x_axis = [p.value for p in cdfs[0]]
     heights = np.array([[p.percentile for p in cdf] for cdf in cdfs])

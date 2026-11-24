@@ -2117,6 +2117,149 @@ def check_guards() -> None:
     print("guards: ok")
 
 
+def check_short_answers() -> None:
+    """A number or date answer whose stated percentiles stop short of the 10th or the 90th
+    (the 2026-11-12 design review's "short number answers"): left out of the question's
+    forecast while more than half of the answers are complete, and otherwise kept, so the
+    guard never costs a question its forecast."""
+    import forecast_guards as fg
+    from forecasting_tools import NumericDistribution, Percentile
+
+    url = "https://example.invalid/q/6"
+    q = timed_question("numeric").model_copy(
+        update={"page_url": url, "upper_bound": 1000, "open_lower_bound": True}
+    )
+    full = {0.1: 400, 0.2: 440, 0.4: 480, 0.6: 520, 0.8: 560, 0.9: 600}
+
+    def dist(answer: dict, question=q, shift: float = 0):
+        stated = [Percentile(percentile=level, value=value + shift) for level, value in answer.items()]
+        return NumericDistribution.from_question(stated, question)
+
+    def without(*levels: float) -> dict:
+        return {level: value for level, value in full.items() if level not in levels}
+
+    # the rule: the lowest stated level is 10 or less and the highest 90 or more. Other
+    # levels in between are fine, and so is a parser's rounding
+    assert fg.short_answer(dist(full)) is None
+    assert fg.short_answer(dist({0.05: 380, 0.25: 450, 0.5: 500, 0.75: 550, 0.95: 620})) is None
+    assert fg.short_answer(dist({0.1: 400, 0.9: 600})) is None
+    assert fg.short_answer(dist({0.1 + 1e-12: 400, 0.5: 500, 0.9 - 1e-12: 600})) is None
+    why = "The forecast's percentiles run from {} to {}, not from 10 to 90"
+    assert fg.short_answer(dist(without(0.9))) == why.format(10, 80)
+    assert fg.short_answer(dist(without(0.1))) == why.format(20, 90)
+    assert fg.short_answer(dist(without(0.6, 0.8, 0.9))) == why.format(10, 40)
+    assert fg.short_answer(dist({0.25: 450, 0.5: 500, 0.75: 550})) == why.format(25, 75)
+
+    def heights(d) -> list[float]:
+        return [p.percentile for p in d.get_cdf()]
+
+    def mean_of(*members) -> list[float]:
+        return [sum(column) / len(members) for column in zip(*(heights(m) for m in members))]
+
+    def same(mixed, expected: list[float]) -> bool:
+        return all(abs(m.percentile - x) < 1e-9 for m, x in zip(mixed.declared_percentiles, expected))
+
+    # what the package makes of an answer that stops at the 40th percentile: 30% beyond the
+    # open upper bound, where a complete answer puts 5%; one that stops at the 80th, 10%
+    a, b, c, d = (dist(full, shift=s) for s in (0, 10, 20, 30))
+    cut = dist(without(0.6, 0.8, 0.9))
+    assert abs((1 - heights(cut)[-1]) - 0.30) < 0.01 and abs((1 - heights(a)[-1]) - 0.05) < 0.01
+    assert abs((1 - heights(dist(without(0.9)))[-1]) - 0.10) < 0.01
+
+    with env(ANTHROPIC_API_KEY="x"):
+        bot = main.RcForecastBot(publish_reports_to_metaculus=False)
+    records: list[logging.LogRecord] = []
+    handler = logging.Handler()
+    handler.emit = records.append  # type: ignore[method-assign]
+    fg.logger.addHandler(handler)
+
+    def mix(*members, question=q):
+        records.clear()
+        return asyncio.run(bot._aggregate_predictions(list(members), question))
+
+    try:
+        # one short answer of five: left out, and the log says which levels it had
+        assert same(mix(a, b, cut, c, d), mean_of(a, b, c, d))
+        assert [r.getMessage() for r in records] == [
+            f'Numeric mixture: left out 1 short forecast(s) for {url}: ["{why.format(10, 40)}"]'
+        ], [r.getMessage() for r in records]
+        # one of three, and a missing 10th: left out too
+        assert same(mix(a, dist(without(0.1)), b), mean_of(a, b))
+        # complete answers are untouched, whatever their levels, and nothing is logged
+        other = dist({0.05: 380, 0.25: 450, 0.5: 500, 0.75: 550, 0.95: 620})
+        assert same(mix(a, b, other), mean_of(a, b, other)) and not records
+        assert same(mix(a, b, c, d), mean_of(a, b, c, d)) and not records
+        # half or more short: nothing says which answers to trust, so all are kept, as
+        # before the guard, and the log says so
+        short = dist(without(0.9), shift=5)
+        for members in ((a, cut), (a, cut, short), (a, b, cut, short)):
+            assert same(mix(*members), mean_of(*members)), len(members)
+            assert len(records) == 1 and "kept" in records[0].getMessage(), records
+            assert "too few complete ones to leave them out" in records[0].getMessage()
+        # dates run through the same mixture
+        when = timed_question("date")
+        days = {0.1: 2, 0.2: 5, 0.4: 9, 0.6: 14, 0.8: 20, 0.9: 27}
+
+        def date_dist(answer: dict, shift: int = 0):
+            stamps = {
+                level: datetime(2026, 11, day + shift, tzinfo=timezone.utc).timestamp()
+                for level, day in answer.items()
+            }
+            return dist(stamps, when)
+
+        e, f = date_dist(days), date_dist(days, shift=1)
+        late = date_dist({level: day for level, day in days.items() if level >= 0.4})
+        assert same(mix(e, late, f, question=when), mean_of(e, f))
+        assert "from 40 to 90" in records[0].getMessage(), records
+    finally:
+        fg.logger.removeHandler(handler)
+
+    # whole questions: a short answer never costs the question its forecast. Its text stays
+    # in the comment, and with two of three short the question posts as it did before
+    answers = {"full": full, "higher": {level: value + 10 for level, value in full.items()},
+               "cut": without(0.6, 0.8, 0.9), "low": without(0.1)}  # fmt: skip
+
+    async def fake_parse(text, *args, **kwargs):
+        return [Percentile(percentile=level, value=value) for level, value in answers[text].items()]
+
+    async def research(question):
+        return "notes"
+
+    async def summary(question, research):
+        return "summary"
+
+    real_parse = main.parse
+    try:
+        main.parse = fake_parse
+        for replies, counted in ((["full", "cut", "higher"], ["full", "higher"]), (["cut", "full", "low"], ["cut", "full", "low"])):  # fmt: skip
+            with env(ANTHROPIC_API_KEY="x"):
+                bot = main.RcForecastBot(
+                    publish_reports_to_metaculus=False, skip_previously_forecasted_questions=False,
+                    predictions_per_research_report=3,
+                )  # fmt: skip
+            said = iter(replies)
+
+            def llm(name, kind="llm", said=said):
+                forecaster = FakeLlm(model="anthropic/claude-opus-5-5")
+
+                async def answer(prompt, system_prompt=None):
+                    return next(said)
+
+                forecaster.invoke = answer  # type: ignore[method-assign]
+                return forecaster
+
+            bot.get_llm = llm  # type: ignore[method-assign]
+            bot.run_research = research  # type: ignore[method-assign]
+            bot.summarize_research = summary  # type: ignore[method-assign]
+            [report] = asyncio.run(bot.forecast_questions([q], return_exceptions=True))
+            assert not isinstance(report, BaseException), report
+            assert same(report.prediction, mean_of(*(dist(answers[name]) for name in counted))), replies
+            assert report.explanation.count("*Forecaster") == 3 and not report.errors, report.explanation
+    finally:
+        main.parse = real_parse
+    print("short answers: ok")
+
+
 def anthropic_search_reply(stop_reason: str = "end_turn") -> dict:
     """A web-search reply as Anthropic's API sends it: narration, a search, cited text."""
     url = "https://www.reuters.com/world/example-2026-10-27/"
@@ -3815,6 +3958,7 @@ if __name__ == "__main__":
     check_scorecard()
     check_aggregation()
     check_guards()
+    check_short_answers()
     check_research_survives_one_failure()
     check_prompts()
     check_research_policy()
