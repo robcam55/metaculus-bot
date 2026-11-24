@@ -219,23 +219,14 @@ def mixture(
     place (the median ignores it). Ordinary disagreement, overlapping ranges, is what the
     mixture is for and stays in. With fewer than three forecasts nothing is left out,
     since there's no majority to judge by.
-    Before that, a short answer (see short_answer) is left out, while more than half of
-    the forecasts are complete. That fails the one forecast here, after the question has
-    passed its success bar, so it can't cost the question its forecast. When half or more
-    are short, all are kept, as before: a posted imperfect forecast usually scores better
-    than none, and nothing says which answers to trust."""
-    short = [why for prediction in predictions if (why := short_answer(prediction))]
-    if short and 2 * len(short) < len(predictions):
-        logger.warning(
-            f"Numeric mixture: left out {len(short)} short forecast(s) for"
-            f" {question.page_url}: {short}"
-        )
-        predictions = [prediction for prediction in predictions if not short_answer(prediction)]
-    elif short:
-        logger.warning(
-            f"Numeric mixture: kept {len(short)} short forecast(s) for {question.page_url},"
-            f" too few complete ones to leave them out: {short}"
-        )
+    After that, a short answer (see short_answer) is left out of what was kept, while more
+    than half of the kept forecasts are complete. That fails the one forecast here, after
+    the question has passed its success bar, so it can't cost the question its forecast.
+    When half or more are short, all are kept, as before: a posted imperfect forecast
+    usually scores better than none, and nothing says which answers to trust. The order
+    matters: the far-from-the-others step judges by the majority, so it sees every
+    forecast, short ones too, and decides exactly as it did before short answers were
+    looked at."""
     cdfs = [prediction.get_cdf() for prediction in predictions]
     x_axis = [p.value for p in cdfs[0]]
     heights = np.array([[p.percentile for p in cdf] for cdf in cdfs])
@@ -253,6 +244,18 @@ def mixture(
                 f" from the others for {question.page_url}"
             )
             kept = inside
+    short = [why for i in kept if (why := short_answer(predictions[i]))]
+    if short and 2 * len(short) < len(kept):
+        logger.warning(
+            f"Numeric mixture: left out {len(short)} short forecast(s) for"
+            f" {question.page_url}: {short}"
+        )
+        kept = [i for i in kept if not short_answer(predictions[i])]
+    elif short:
+        logger.warning(
+            f"Numeric mixture: kept {len(short)} short forecast(s) for {question.page_url},"
+            f" too few complete ones to leave them out: {short}"
+        )
     mean = heights[kept].mean(axis=0)
     return NumericDistribution.from_question(
         [Percentile(value=x, percentile=h) for x, h in zip(x_axis, mean.tolist())], question

@@ -2196,6 +2196,18 @@ def check_short_answers() -> None:
             assert same(mix(*members), mean_of(*members)), len(members)
             assert len(records) == 1 and "kept" in records[0].getMessage(), records
             assert "too few complete ones to leave them out" in records[0].getMessage()
+        # the far-from-the-others step decides first, on every answer, as it did before
+        # the guard: taking the short answer out first would leave two answers against
+        # two (or two in all), no majority, and the misread ones would stay in
+        no_10th = dist(without(0.1), shift=5)
+        far_1 = dist({0.1: 850, 0.2: 870, 0.4: 890, 0.6: 910, 0.8: 930, 0.9: 950})
+        far_2 = dist({0.1: 860, 0.2: 880, 0.4: 900, 0.6: 920, 0.8: 940, 0.9: 960})
+        assert same(mix(a, no_10th, b, far_1, far_2), mean_of(a, b))
+        assert any("left out 1 short forecast(s)" in r.getMessage() for r in records), records
+        # and the short answer leaves only while more than half of what that step kept
+        # is complete: one of the two kept here is short, so both stay
+        assert same(mix(a, no_10th, far_1), mean_of(a, no_10th))
+        assert any("kept 1 short forecast(s)" in r.getMessage() for r in records), records
         # dates run through the same mixture
         when = timed_question("date")
         days = {0.1: 2, 0.2: 5, 0.4: 9, 0.6: 14, 0.8: 20, 0.9: 27}
