@@ -79,7 +79,11 @@ jobs:
           EXA_API_KEY: ${{ secrets.EXA_API_KEY }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
-          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }} # pays once the credits are under $2
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }} # pays every run while PAY_WITH below is own-key
+          # Rob's key pays even when Metaculus tops up its credits (his choice of 2026-11-23),
+          # so a top-up can't change how the bot forecasts unasked. Going back to the credits
+          # is a pull request that changes this line (README, "Why it's built this way")
+          PAY_WITH: own-key
           GITHUB_TOKEN: ${{ github.token }} # opens the alert issues; nothing else
           RESEARCH_WATCH_FILE: research_watch.json
           ASKNEWS_CLIENT_ID: ${{ secrets.ASKNEWS_CLIENT_ID }}

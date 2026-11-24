@@ -25,8 +25,10 @@ The changes are in `main.py` (`RcForecastBot`), `budget.py`, `spend.py`, `alerts
     `opus-3` (or the tier `BUDGET_TIER` pins), with the same research. The cap is the
     monthly spend limit on the key's workspace in the Claude Console, which Anthropic
     enforces; at the limit the bot pauses quietly until the 1st. Each run checks the key
-    with one tiny request before it spends anything else on it. A Metaculus top-up moves
-    the bot back onto the credits at the next run. A run that can't read the credits'
+    with one tiny request before it spends anything else on it. Since 2026-11-23 the
+    tournament workflow sets `PAY_WITH: own-key`, so a Metaculus top-up no longer moves the
+    bot back onto the credits: one issue says it arrived, and going back is a one-line pull
+    request (see "Why it's built this way"). A run that can't read the credits'
     balance, or has no OpenRouter key at all, also runs on your key, the same way.
 
   Haiku 5.5 parses in every case, at low effort. These models reject sampling parameters,
@@ -68,7 +70,9 @@ The changes are in `main.py` (`RcForecastBot`), `budget.py`, `spend.py`, `alerts
     absorbs a costly question. When the balance can't pay for one more question at the
     tier, the credits stop: your own key takes over if it is set, and otherwise the bot
     pauses and says so. A balance that can't be read is tried once more.
-  - **Top-ups apply at once.** When Metaculus raises the key, the next run sees it.
+  - **Top-ups are seen at once and used when you say.** When Metaculus raises the key,
+    the next run sees it and opens one issue. The tournament runs stay on your own key
+    until the workflow's `PAY_WITH: own-key` line is changed (2026-11-23).
   - **Measured spend.** Each run's page on GitHub shows the balance, what each tier cost
     per question, and a table per tournament of what each question cost: each research
     source, each forecast, and parsing with the research summary (`spend.py`).
@@ -443,11 +447,17 @@ The main architectural choices and the reasons behind them. Each links to where 
   — Rob's go-ahead of 2026-10-12 for measurement only, built in [#7](https://github.com/robcam55/metaculus-bot/pull/7). Pricing Rob's key as tokens plus searches is Claude's fix in [#8](https://github.com/robcam55/metaculus-bot/pull/8), found by the 2026-10-15 review; not otherwise ratified.
 - **Rob's own Anthropic key after the credits, capped by a workspace spend limit.**
   - **Why.** At the measured costs Metaculus's first $100 runs out around the end of October, and the season runs to Jan 6. Without more credit the bot would sit dark for about nine weeks. On 2026-10-06 Rob said he would fund the bot himself if Metaculus didn't.
-  - **How.** Once the credits can't pay for another question above the $2 reserve and `ANTHROPIC_API_KEY` is set, both tournaments run on Rob's key at the pinned tier (`opus-3` without a pin), with the same two research sources: Sonnet 5 calls Anthropic's web search tool where the credits use OpenRouter's `:online`. A top-up moves the bot back onto the credits at the next run.
+  - **How.** Once the credits can't pay for another question above the $2 reserve and `ANTHROPIC_API_KEY` is set, both tournaments run on Rob's key at the pinned tier (`opus-3` without a pin), with the same two research sources: Sonnet 5 calls Anthropic's web search tool where the credits use OpenRouter's `:online`. Until 2026-11-23 a top-up moved the bot back onto the credits at the next run; the next entry changes that.
   - **Why "can't pay for another question", not "under $2".** The run cap spends only while the balance above $2 covers a question, so a balance can come to rest above $2 (up to $2.65 at `opus-3`) and stay there. The first version switched only under $2, so the bot would have sat idle in that band, on neither key, until a top-up. A pre-launch review caught this on 2026-10-15. The same review moved the run cap from the pacing estimates to measured costs, because capping at $0.30 a question let a burst plan about twice what lay above the reserve, so OpenRouter could refuse the key mid-question. The pacing estimates themselves are unchanged (Rob's choice of 2026-10-06).
   - **The cap lives at Anthropic.** A plain key can't read what its workspace has spent, and the bot keeps no spend record of its own, so the cap is the workspace's monthly spend limit in the Claude Console. Anthropic enforces it, and it can't drift the way a count the bot kept itself could. One tiny request before the first question of a run tells a key at its limit, or a rejected one, from a working one. The bot then pauses quietly and opens one issue, without spending AskNews calls or research.
 
   — Rob's choice of option (b) in chat on 2026-10-11, after Claude's status review that day. The design (the tier, Anthropic's web search, the cap as a workspace spend limit, the key check) is Claude's, in [#6](https://github.com/robcam55/metaculus-bot/pull/6). The "can't pay for another question" rule and the measured run cap are Claude's, in [#8](https://github.com/robcam55/metaculus-bot/pull/8). None of it is otherwise ratified.
+- **Tournament runs pinned to Rob's key; a top-up is used only on purpose (2026-11-23).** The credits ran out on 2026-10-25, and every forecasting change since (high effort, the direct research tools, the research watch, the empty-report wait) was built and watched on Rob's key. The credits route differs: OpenRouter's `:online` search in place of Anthropic's tools, no effort setting, no reply cap, and no research watch. Without a pin, a top-up would have moved the next run, 20 minutes later, onto a combination that has never forecast a tournament question, and the scorecard's by-setup rows would have mixed two methods under one name. On 2026-11-09 the donated balance stood at $2.59, and credits pay again from about $2.66.
+  - **How.** `PAY_WITH: own-key` is written into the tournament workflow, not read from a variable, so a mistyped setting can't stop the runs and a change of route is a pull request. Each run still reads the credits' balance and shows it on the run page. Once the balance is back above $15, one issue per credit limit says a top-up arrived.
+  - **Going back to the credits.** Try the route first with a Test Bot run (`pay_with` set to `credits`), then change the workflow line by pull request and add a setup to `setups.py`, since the route changes research and effort. Which route scores better is not known: the first setup's score was earned on the credits, under older prompts and research.
+  - **What it costs.** Nothing while Rob's key is paying anyway. After a top-up, each question keeps costing his key about $0.45 until he switches.
+
+  — Rob's choice of 2026-11-23 in chat ("All recommended"), option A of decision 1 on the [design review](https://claude.ai/artifact/S74Ts4ARAnva1rCqqYopcZ), which put the pin to him. It changes two earlier entries: credits pay first when both keys are set (never ratified) and a top-up applies at the next run. Writing the value into the workflow, the top-up issue and its $15 line were Claude's design choices; not otherwise ratified.
 - **Alerts as GitHub issues, one per event.** The bot runs every 20 minutes, so a run that fails to get attention would email Rob every 20 minutes until fixed. Instead `alerts.py` opens one issue, mentioning the owner, the first time the credits fall below $15, when they run out, when Rob's key hits its spend limit or is rejected, and when 6 of the last 12 research reports are degraded (titled by ISO week). The weekly review opens one when a tournament question closed without a forecast (also titled by ISO week). An issue with the same title, open or closed, stops a repeat. Titles carry the credit limit, or the month for Rob's key, so a new limit or month alerts again. Each of the two workflows' tokens gets `issues: write` for this and nothing more.
   - **Rob's key's alerts, and the stopped clock's, count only while open.** After he raises a limit or replaces a key and closes the issue, a second stop the same month would otherwise stay silent, the bot paused with every run green.
   - **Read twice before opening.** On 2026-10-22 one list read in about 590 came back without the existing issue, and #10 duplicated #9.

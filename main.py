@@ -2125,8 +2125,9 @@ def question_statuses(
 
 
 def pay_with() -> str:
-    """PAY_WITH (the Test Bot's input): credits, the default, or own-key, which makes Rob's
-    own Anthropic key pay even while Metaculus's credits last."""
+    """PAY_WITH: credits, the default, or own-key, which makes Rob's own Anthropic key pay
+    even while Metaculus's credits last. The tournament workflow sets own-key (2026-11-23),
+    and the Test Bot has it as an input."""
     value = os.getenv("PAY_WITH", "").strip().lower() or "credits"
     if value not in ("credits", "own-key"):
         raise SystemExit(f"PAY_WITH must be credits or own-key; got {value!r}")
@@ -2179,6 +2180,18 @@ def credit_alerts(meter: budget.SpendMeter, plan: budget.Plan) -> list[str]:
     else:
         opened = alerts.credits_low(left, limit, own_key)
     return ["- Opened an issue to tell Rob about the credits."] if opened else []
+
+
+def topup_alert(meter: budget.SpendMeter) -> list[str]:
+    """With PAY_WITH=own-key, opens one issue per credit limit once Metaculus's credits are
+    back above LOW_CREDIT: the bot stays on Rob's key, so nothing else would tell him a
+    top-up arrived. Lines for the run page."""
+    left = budget.remaining_of(meter.start)
+    if left is None or math.isinf(left) or left < budget.LOW_CREDIT:
+        return []
+    limit = (meter.start or {}).get("limit")
+    opened = alerts.credits_topped_up(left, None if limit is None else float(limit))
+    return ["- Opened an issue to tell Rob that Metaculus's credits were topped up."] if opened else []
 
 
 def watch_research(calls: list[spend.Call], health: ResearchHealth, notes: list[str]) -> None:
@@ -2299,6 +2312,8 @@ def main() -> None:
         notes += credit_alerts(meter, plan)
         reason = own_key_reason(meter.remaining(), plan)
         spent = credits_spent(meter.remaining(), plan)
+        if reason == "PAY_WITH=own-key":
+            notes += topup_alert(meter)
         if reason:
             route = "anthropic"
             own_key = OwnKey()
