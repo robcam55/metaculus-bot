@@ -1052,11 +1052,13 @@ def check_no_model_key() -> None:
             raise AssertionError("a run with no model key went on to read the questions")
 
     # The ways both keys can be absent: no variable at all (a local run), an empty one
-    # (how GitHub passes a secret that isn't set), and an OpenAI key alone, which is not
-    # one of the bot's routes: forecasting-tools' default model would have used it
+    # (how GitHub passes a secret that isn't set), the same with PAY_WITH=credits (what the
+    # Test Bot workflow passes by default), and an OpenAI key alone, which is not one of
+    # the bot's routes: forecasting-tools' default model would have used it
     absent = (
         {},
         dict(OPENROUTER_API_KEY="", ANTHROPIC_API_KEY=""),
+        dict(OPENROUTER_API_KEY="", ANTHROPIC_API_KEY="", PAY_WITH="credits"),
         dict(OPENAI_API_KEY="sk-other"),
     )
     for mode in ("tournament", "test_questions"):
