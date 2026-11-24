@@ -845,7 +845,8 @@ def spend_on(calls: list, models: set[str]) -> float:
 
 def llm_route() -> str | None:
     """Which key pays: Metaculus's donated OpenRouter credits before a personal
-    Anthropic key. None leaves forecasting-tools' own defaults in charge."""
+    Anthropic key. None means neither is set: build_llms then returns forecasting-tools'
+    own defaults, so main() stops a tournament or Test Bot run before using them."""
     if os.getenv("OPENROUTER_API_KEY"):
         return "openrouter"
     if os.getenv("ANTHROPIC_API_KEY"):
@@ -2294,6 +2295,14 @@ def main() -> None:
                 " OpenRouter credits are for FutureEval and MiniBench."
             )
         route = "anthropic"
+    elif route is None:
+        # Neither model key: forecasting-tools would forecast with its own default models,
+        # which nobody chose, unpaced and with no key check. Stop before a question is read
+        sys.exit(
+            "No model key: OPENROUTER_API_KEY and ANTHROPIC_API_KEY are both missing or"
+            " empty. Stopped before reading any question, rather than forecast with"
+            " forecasting-tools' default models."
+        )
 
     # Pacing applies to Metaculus's credits. Once they can't pay for another question,
     # Rob's own Anthropic key takes over, capped by its workspace's monthly spend limit;

@@ -1038,6 +1038,63 @@ def check_own_key() -> None:
     print("own key: ok")
 
 
+def check_no_model_key() -> None:
+    """With neither model key, a tournament or Test Bot run stops at start-up, red, before
+    it reads a question or builds a model, rather than forecast with forecasting-tools'
+    default models (design review of 2026-11-12, card 5). One missing key changes nothing."""
+
+    class Unread(dict):
+        """Questions that must not be read. The fake Metaculus client reads them with
+        get(), and a run builds its models only after that, so reaching it means the run
+        went past start-up."""
+
+        def get(self, *args):
+            raise AssertionError("a run with no model key went on to read the questions")
+
+    # The ways both keys can be absent: no variable at all (a local run), an empty one
+    # (how GitHub passes a secret that isn't set), and an OpenAI key alone, which is not
+    # one of the bot's routes: forecasting-tools' default model would have used it
+    absent = (
+        {},
+        dict(OPENROUTER_API_KEY="", ANTHROPIC_API_KEY=""),
+        dict(OPENAI_API_KEY="sk-other"),
+    )
+    for mode in ("tournament", "test_questions"):
+        for keys in absent:
+            printed = io.StringIO()
+            with contextlib.redirect_stdout(printed):
+                calls, summary, exited, reads = run_main(mode, 100.0, Unread(), **keys)
+            assert calls == [] and reads == 0 and summary == "", (mode, keys, calls, reads, summary)
+            # a message, not a number: Python then exits with status 1 and the run is red
+            assert exited and exited.startswith("No model key:"), (mode, keys, exited)
+            # it names both variables, and never a value
+            assert "OPENROUTER_API_KEY" in exited and "ANTHROPIC_API_KEY" in exited, exited
+            assert "sk-other" not in exited, exited
+            assert LAST["alerts"] == [], LAST  # no issue, like the other start-up stops
+            # and the log no longer says the run will go on through Metaculus's proxy
+            assert "fall back" not in printed.getvalue(), printed.getvalue()
+
+    # The stops that were there before still name the one key they need: the Cup runs
+    # only on Rob's key, and so does PAY_WITH=own-key, which the tournament workflow sets
+    with contextlib.redirect_stdout(io.StringIO()):
+        calls, _, exited, reads = run_main("metaculus_cup", 100.0, Unread())
+    assert calls == [] and reads == 0, (calls, reads)
+    assert exited and exited.startswith("The Metaculus Cup runs only on your own ANTHROPIC_API_KEY"), exited
+    for mode in ("tournament", "test_questions"):
+        with contextlib.redirect_stdout(io.StringIO()):
+            calls, _, exited, reads = run_main(mode, 100.0, Unread(), PAY_WITH="own-key")
+        assert calls == [] and reads == 0, (mode, calls, reads)
+        assert exited == "PAY_WITH=own-key needs the ANTHROPIC_API_KEY secret", (mode, exited)
+
+    # One key missing is not a stop: the other route pays, as before
+    questions = {"minibench": [open_question(1, 5)], "bot-testing-area": [open_question(2, 5)]}
+    for mode in ("tournament", "test_questions"):
+        for key in (dict(OPENROUTER_API_KEY="sk-fake"), dict(ANTHROPIC_API_KEY="x")):
+            calls, _, exited, _ = run_main(mode, 100.0, questions, **key)
+            assert exited is None and len(calls) == 1, (mode, key, exited, calls)
+    print("no model key: ok")
+
+
 def check_missed() -> None:
     """missed_check.py: which questions count as missed, what the page says, the API filter
     it reads with, and that a failure there still leaves the review a section."""
@@ -3807,6 +3864,7 @@ if __name__ == "__main__":
     check_key_status()
     check_run_loop()
     check_own_key()
+    check_no_model_key()
     check_alerts()
     check_watchdog()
     check_model_watch()
