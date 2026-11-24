@@ -443,12 +443,22 @@ class ResearchHealth:
     # The extra forecasters' forecasts, by model: a failed one only thins the question's
     # members, so it would otherwise show nowhere but the log
     forecasters: dict[str, SourceTally] = field(default_factory=dict)
+    # The same forecasts by question (question_key), then by model: a question forecast
+    # with none of them opens one issue (extras_alert)
+    extras_by_question: dict[str, dict[str, SourceTally]] = field(default_factory=dict)
 
     def record(self, source: str, error: str | None = None) -> None:
         self._count(self.sources, source, error)
 
-    def record_forecast(self, model: str, error: str | None = None) -> None:
+    def record_forecast(
+        self, model: str, error: str | None = None, question: str | None = None
+    ) -> None:
         self._count(self.forecasters, model, error)
+        if question is not None:
+            try:  # counting for the alert only: never a reason for a forecast to fail
+                self._count(self.extras_by_question.setdefault(question, {}), model, error)
+            except Exception as e:
+                logger.warning(f"Could not count an extra forecast ({type(e).__name__})")
 
     @staticmethod
     def _count(tallies: dict[str, SourceTally], name: str, error: str | None) -> None:
@@ -1270,12 +1280,12 @@ class RcForecastBot(ForecastBot):
                 prediction = await super()._make_prediction(question, research)
         except Exception as e:
             if extra is not None:
-                self.research_health.record_forecast(extra.model, type(e).__name__)
+                self.research_health.record_forecast(extra.model, type(e).__name__, key)
             raise
         finally:
             _EXTRA_FORECASTER.reset(token)
         if extra is not None:
-            self.research_health.record_forecast(extra.model)
+            self.research_health.record_forecast(extra.model, question=key)
         else:
             self._own_succeeded[key] += 1
         return prediction
@@ -1971,12 +1981,41 @@ def one_of_each_type(
     return (firsts + rest)[:limit]
 
 
+class CommentWatchClient(MetaculusClient):
+    """forecasting-tools' client, remembering each comment it could not post. The package
+    posts a question's forecast first and its comment second, as two requests. When the
+    comment still fails after the package's three retries, the forecast stands without
+    one, and no later run adds it: the question now reads as forecast, so runs skip it.
+    The error is raised exactly as before (the question fails and the run turns red). This
+    only keeps what comment_alerts needs to tell Rob, and logs the comment's text so he can
+    add it by hand. It retries nothing itself, and nothing it adds can fail a forecast."""
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.comments_failed: dict[int, str] = {}  # post id -> error type
+
+    def post_question_comment(self, post_id: int, comment_text: str, *args, **kwargs) -> None:
+        try:
+            super().post_question_comment(post_id, comment_text, *args, **kwargs)
+        except Exception as e:
+            try:
+                self.comments_failed[post_id] = type(e).__name__
+                logger.warning(
+                    f"Comment not posted on post {post_id} ({type(e).__name__}); its forecast"
+                    f" stands. The comment's text, to add by hand:\n{comment_text}"
+                )
+            except Exception:
+                pass
+            raise
+
+
 def make_bot(
     route: str | None,
     tier: budget.Tier | None,
     publish: bool,
     skip_previous: bool = True,
     research_health: ResearchHealth | None = None,
+    metaculus_client: MetaculusClient | None = None,
 ) -> RcForecastBot:
     """One research report (two independent sources) per question. A pacing tier (on
     Metaculus's credits, or on Rob's own key once they run out) sets the forecaster and
@@ -2001,6 +2040,7 @@ def make_bot(
         llms=build_llms(route, tier),
         research_health=research_health,
         extra_forecasters=extras,
+        metaculus_client=metaculus_client,  # None: the package's own
     )
 
 
@@ -2194,6 +2234,60 @@ def topup_alert(meter: budget.SpendMeter) -> list[str]:
     return ["- Opened an issue to tell Rob that Metaculus's credits were topped up."] if opened else []
 
 
+def extras_alert(health: ResearchHealth, forecast: set[str]) -> list[str]:
+    """One issue when a question was forecast with none of its extra forecasters'
+    forecasts: every one asked of them for it failed, so it went out on the bot's own
+    model alone (a refused OpenRouter key, say). `forecast` holds the questions (by
+    question_key) whose forecast went through this run. One failed forecast beside another
+    that worked is normal and only annotated (health_warnings). Lines for the run page.
+    Telling only, after the forecasts are posted: this never raises."""
+    try:
+        alone = [
+            key
+            for key, models in health.extras_by_question.items()
+            if key in forecast and not any(tally.worked for tally in models.values())
+        ]
+        if not alone:
+            return []
+        errors: dict[str, Counter] = {}
+        for key in alone:
+            for model, tally in health.extras_by_question[key].items():
+                errors.setdefault(model, Counter()).update(tally.failures)
+        failures = [
+            f"`{model}`: " + ", ".join(f"{e} ×{n}" if n > 1 else e for e, n in found.most_common())
+            for model, found in errors.items()
+        ]
+        opened = alerts.extras_silent(alone, failures)
+        return [
+            f"- {len(alone)} question(s) forecast without the extra forecasters: every one of"
+            " their forecasts failed." + (" Opened an issue to tell Rob." if opened else "")
+        ]
+    except Exception as e:
+        logger.warning(f"Extra forecasters' alert failed ({type(e).__name__})")
+        return []
+
+
+def comment_alerts(questions: list[MetaculusQuestion], failed: dict[int, str]) -> list[str]:
+    """One issue for each forecast that posted without its comment (`failed`, from
+    CommentWatchClient: post id to error type), naming the question so Rob can add the
+    comment by hand. Lines for the run page. Telling only: the question stays failed and
+    the run red, as before, and no later run retries the comment. This never raises."""
+    notes: list[str] = []
+    try:
+        urls = {question.id_of_post: question.page_url for question in questions}
+        for post, error in failed.items():
+            url = urls.get(post) or f"https://www.metaculus.com/questions/{post}/"
+            opened = alerts.comment_missing(url, post, error)
+            notes.append(
+                f"- Forecast posted without its comment: {url} ({error}). The question is"
+                " listed as failed, but its forecast stands, and no later run adds the"
+                " comment." + (" Opened an issue to tell Rob." if opened else "")
+            )
+    except Exception as e:
+        logger.warning(f"Comment alert failed ({type(e).__name__})")
+    return notes
+
+
 def watch_research(calls: list[spend.Call], health: ResearchHealth, notes: list[str]) -> None:
     """A line on the run page for what the web tools did on Rob's key, an annotation when
     a report came back degraded, and an issue when too many of the last ones did. The run's
@@ -2357,6 +2451,7 @@ def main() -> None:
     breakdowns: list[str] = []
     own_openrouter_spent = [0.0]  # the extra forecasters' spend on Rob's OpenRouter key
     own_openrouter_raised = [0]  # and their calls that raised (OpenRouter may still bill them)
+    went_through: set[str] = set()  # questions (by question_key) forecast this run
 
     def run_pass(
         label: str,
@@ -2367,7 +2462,10 @@ def main() -> None:
         if not questions:
             logger.info(f"{label}: no new questions")
             return []
-        bot = make_bot(route, tier, publish, skip_previous, research_health=health)
+        poster = CommentWatchClient()  # the package's client, remembering a comment that fails
+        bot = make_bot(
+            route, tier, publish, skip_previous, research_health=health, metaculus_client=poster
+        )
         # Records what every model call in the pass cost, by OpenRouter's own figures:
         # failed questions, retries and questions left waiting for research included
         with spend.collecting() as ledger:
@@ -2391,6 +2489,12 @@ def main() -> None:
         if meter is not None and tier is not None:
             failed = sum(isinstance(r, BaseException) for r in results)
             meter.record(label, tier, len(results) - failed, failed, ledger.total() - extra_spent)
+        # Telling only, once the pass is over: which questions went through (for
+        # extras_alert), and one issue for a forecast whose comment could not be posted
+        went_through.update(
+            question_key(q) for q, r in zip(questions, results) if not isinstance(r, BaseException)
+        )
+        notes.extend(comment_alerts(questions, poster.comments_failed))
         return results
 
     def paused_by(tier: budget.Tier | None, has_work: bool) -> str | None:
@@ -2520,6 +2624,7 @@ def main() -> None:
             f"- Extra forecasters: {names}. Spent on your own OpenRouter key this run:"
             f" ${own_openrouter_spent[0]:.2f}.{unbilled}"
         )
+        notes += extras_alert(health, went_through)
     elif extras_without_key:
         notes.append(f"- Extra forecasters off: EXTRA_FORECASTERS is set but {OWN_OPENROUTER_KEY} isn't.")
         print(f"::warning title=Extra forecasters off::EXTRA_FORECASTERS is set but {OWN_OPENROUTER_KEY} isn't")

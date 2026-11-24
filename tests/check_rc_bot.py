@@ -73,6 +73,7 @@ KEYS = (
     "MISSED_CHECK_STRICT",
     "GITHUB_TOKEN",
     "GITHUB_REPOSITORY",
+    "GITHUB_RUN_ID",
     "GITHUB_REPOSITORY_OWNER",
 )
 
@@ -1323,6 +1324,174 @@ def check_alerts() -> None:
     print("alerts: ok")
 
 
+def check_comment_alert() -> None:
+    """A forecast that posts while its comment fails: the package's error is raised as
+    before and nothing is retried beyond the package's own tries, but one issue names the
+    question, the run page says so, and the comment's text is in the log. Also the run
+    loop's wiring of this alert and of the extra forecasters' (check_extra_forecasters has
+    that one's rule)."""
+    import time
+
+    import requests
+    from forecasting_tools.data_models.binary_report import BinaryReport
+
+    class Posted:
+        status_code, text, reason, url = 200, "", "OK", ""
+
+        def raise_for_status(self):
+            pass
+
+    posts: list[str] = []
+    comments_down = [True]
+
+    def fake_post(url, **kwargs):
+        assert kwargs["headers"]["Authorization"] == "Token metaculus-fake", kwargs
+        posts.append(url.rsplit("/api/", 1)[1])
+        if url.endswith("/comments/create/") and comments_down[0]:
+            raise requests.exceptions.ConnectionError("comments are down")
+        return Posted()
+
+    # the package's own publishing step, as it runs for a yes/no question: forecast, then comment
+    report = types.SimpleNamespace(
+        question=types.SimpleNamespace(id_of_question=7, id_of_post=70),
+        prediction=0.3,
+        explanation="# SUMMARY\nThe comment's whole text.",
+    )
+    client = main.CommentWatchClient(
+        base_url="https://www.metaculus.com/api", token="metaculus-fake",
+        sleep_seconds_between_requests=0, sleep_jitter_seconds=0,
+    )  # fmt: skip
+    waits: list[float] = []
+    real_post, real_sleep = requests.post, time.sleep
+    records: list[logging.LogRecord] = []
+    handler = logging.Handler()
+    handler.emit = records.append  # type: ignore[method-assign]
+    main.logger.addHandler(handler)
+    try:
+        requests.post, time.sleep = fake_post, waits.append  # type: ignore[assignment]
+        try:
+            asyncio.run(BinaryReport.publish_report_to_metaculus(report, metaculus_client=client))  # type: ignore[arg-type]
+        except requests.exceptions.ConnectionError as e:
+            assert "comments are down" in str(e), e
+        else:
+            raise AssertionError("the comment's error must still fail the question")
+        # the forecast first, then the comment: the package's one try and three retries, no more
+        assert posts == ["questions/forecast/"] + ["comments/create/"] * 4, posts
+        assert client.comments_failed == {70: "ConnectionError"}, client.comments_failed
+        logged = [r.getMessage() for r in records]
+        assert logged == [
+            "Comment not posted on post 70 (ConnectionError); its forecast stands. The comment's"
+            " text, to add by hand:\n# SUMMARY\nThe comment's whole text."
+        ], logged
+        # a comment that posts is not remembered
+        comments_down[0] = False
+        report.question.id_of_post = 71
+        asyncio.run(BinaryReport.publish_report_to_metaculus(report, metaculus_client=client))  # type: ignore[arg-type]
+        assert client.comments_failed == {70: "ConnectionError"} and len(records) == 1, client.comments_failed
+    finally:
+        requests.post, time.sleep = real_post, real_sleep  # type: ignore[assignment]
+        main.logger.removeHandler(handler)
+    # make_bot hands the bot that client; without one the package's own is used, as before
+    with env(ANTHROPIC_API_KEY="x", METACULUS_TOKEN="metaculus-fake"):
+        bot = main.make_bot("anthropic", budget.TIERS["opus-3"], publish=True, metaculus_client=client)
+        assert bot.metaculus_client is client
+        plain = main.make_bot("anthropic", budget.TIERS["opus-3"], publish=True).metaculus_client
+        assert type(plain).__name__ == "MetaculusClient", plain
+
+    # the issue: once per question (its title), naming the question, the run and the log line
+    opened: list[tuple] = []
+    real_alert = alerts.raise_alert
+    alerts.raise_alert = lambda title, body, **kw: opened.append((title, body, kw)) or True  # type: ignore[assignment]
+    try:
+        q70 = open_question(70, 2).model_copy(update={"id_of_post": 70})
+        with env(GITHUB_REPOSITORY="o/r", GITHUB_RUN_ID="123"):
+            notes = main.comment_alerts([open_question(1, 2), q70], {70: "ConnectionError", 99: "HTTPError"})
+        assert notes[0] == (
+            "- Forecast posted without its comment: https://example.invalid/q/70 (ConnectionError)."
+            " The question is listed as failed, but its forecast stands, and no later run adds"
+            " the comment. Opened an issue to tell Rob."
+        ), notes
+        # a post the pass can't name still alerts, by Metaculus's own address for it
+        assert "https://www.metaculus.com/questions/99/ (HTTPError)" in notes[1] and len(notes) == 2, notes
+        (title, body, kw), (other, _, _) = opened
+        assert title == "A forecast posted without its comment (question 70)" and kw == {}, (title, kw)
+        assert other == "A forecast posted without its comment (question 99)", other
+        assert body.startswith(
+            "The bot's forecast on https://example.invalid/q/70 posted, but its comment did not"
+            " (ConnectionError, after the package's own retries)."
+        ), body
+        assert "The run: https://github.com/o/r/actions/runs/123\n" in body, body
+        assert 'after the line "Comment not posted on post 70".' in body, body
+        with env():  # outside GitHub Actions: no run to link
+            assert main.comment_alerts([q70], {70: "HTTPError"}) and "The run:" not in opened[-1][1], opened[-1]
+        assert main.comment_alerts([q70], {}) == []
+        # the alert itself failing never reaches the run
+        alerts.raise_alert = lambda title, body, **kw: 1 / 0  # type: ignore[assignment]
+        assert main.comment_alerts([q70], {70: "HTTPError"}) == []
+    finally:
+        alerts.raise_alert = real_alert  # type: ignore[assignment]
+
+    # through main.main(): each pass forecasts with a watching client, and what it remembers
+    # becomes one issue and a line on the run page; the run is red as before
+    url = "https://example.invalid/q/4"
+    questions = {
+        "minibench": [open_question(4, 50).model_copy(update={"id_of_post": 4}), open_question(5, 40)]
+    }
+
+    class LostComment(main.CommentWatchClient):
+        """As if the comment on post 4 failed after its forecast posted."""
+
+        def __init__(self, *args, **kwargs) -> None:
+            super().__init__(*args, **kwargs)
+            self.comments_failed[4] = "HTTPError"
+
+    bots: list = []
+    real_client, real_make_bot = main.CommentWatchClient, main.make_bot
+    try:
+        main.CommentWatchClient = LostComment  # type: ignore[misc]
+        main.make_bot = lambda *args, **kwargs: bots.append(real_make_bot(*args, **kwargs)) or bots[-1]
+        _, summary, exited, _ = run_main(
+            "tournament", 100.0, questions, fail_urls=(url,), OPENROUTER_API_KEY="sk-fake"
+        )
+    finally:
+        main.CommentWatchClient, main.make_bot = real_client, real_make_bot  # type: ignore[misc]
+    assert len(bots) == 1 and isinstance(bots[0].metaculus_client, LostComment), bots
+    assert exited and "1 question(s) failed" in exited, exited
+    assert LAST["alerts"] == ["A forecast posted without its comment (question 4)"], LAST
+    assert f"- Forecast posted without its comment: {url} (HTTPError)." in summary, summary
+    # and an ordinary run opens nothing
+    _, summary, exited, _ = run_main("tournament", 100.0, questions, OPENROUTER_API_KEY="sk-fake")
+    assert exited is None and LAST["alerts"] == [] and "without its comment" not in summary, (exited, LAST)
+
+    # through main.main(): a question that went out with none of its extra forecasters'
+    # forecasts opens the extras' issue; with one of them back, nothing
+    sol, argon = "openrouter/openai/gpt-6.1-sol", "openrouter/google/gemini-4-argon"
+    extras = dict(EXTRA_FORECASTERS=f"{sol},{argon}", OPENROUTER_OWN_API_KEY="sk-or-own-fake")
+    real_record = main.ResearchHealth.record
+    for argon_error, alerted in (("AuthenticationError", True), (None, False)):
+
+        def record(self, source, error=None):
+            """The fake run's one search per question, plus question 4's two extra forecasts."""
+            real_record(self, source, error)
+            if url not in self.extras_by_question:
+                self.record_forecast(sol, "AuthenticationError", url)
+                self.record_forecast(argon, argon_error, url)
+
+        try:
+            main.ResearchHealth.record = record  # type: ignore[method-assign]
+            _, summary, exited, _ = run_main(
+                "tournament", 100.0, questions, OPENROUTER_API_KEY="sk-fake", **extras
+            )
+        finally:
+            main.ResearchHealth.record = real_record  # type: ignore[method-assign]
+        assert exited is None, exited
+        assert f"- Extra forecasters: {sol}, {argon}." in summary, summary
+        note = "- 1 question(s) forecast without the extra forecasters" in summary
+        assert note is alerted and len(LAST["alerts"]) == int(alerted), (summary, LAST)
+        assert all(t.startswith("The extra forecasters returned no forecasts (20") for t in LAST["alerts"]), LAST
+    print("comment alert: ok")
+
+
 def check_watchdog() -> None:
     """clock_watchdog.py: the backup clock's check that the Cloudflare clock still ticks."""
     import clock_watchdog as watchdog
@@ -1672,6 +1841,36 @@ def check_extra_forecasters() -> None:
             b = question_bot(own_replies, extras)
             [report] = asyncio.run(b.forecast_questions([q], return_exceptions=True))
             assert not isinstance(report, BaseException) and abs(report.prediction - 0.3) < 1e-9, report
+        # a question that went out with none of its extras' forecasts opens one issue, which
+        # names each model and its error type; one extra failing beside one that worked
+        # opens none, and neither does a question that failed
+        alive = FakeLlm("Probability: 60%", model=argon)
+        opened: list[tuple] = []
+        real_alert = alerts.raise_alert
+        alerts.raise_alert = lambda title, body, **kw: opened.append((title, body, kw)) or True  # type: ignore[assignment]
+        try:
+            b = question_bot(["Probability: 30%"] * 3, [dead(sol), alive])
+            [report] = asyncio.run(b.forecast_questions([q], return_exceptions=True))
+            assert not isinstance(report, BaseException), report
+            assert main.extras_alert(b.research_health, {q.page_url}) == [] and opened == [], opened
+            b = question_bot(["Probability: 30%"] * 3, [dead(sol), dead(argon)])
+            [report] = asyncio.run(b.forecast_questions([q], return_exceptions=True))
+            assert not isinstance(report, BaseException) and abs(report.prediction - 0.3) < 1e-9, report
+            assert main.extras_alert(b.research_health, set()) == [] and opened == [], opened
+            assert main.extras_alert(b.research_health, {q.page_url}) == [
+                "- 1 question(s) forecast without the extra forecasters: every one of their"
+                " forecasts failed. Opened an issue to tell Rob."
+            ]
+            [(title, body, kw)] = opened
+            assert re.fullmatch(r"The extra forecasters returned no forecasts \(20\d\d-\d\d\)", title), title
+            assert kw == {"open_only": True}, kw  # like Rob's key's: a repeat after he closes it is news
+            assert f"- `{sol}`: RuntimeError\n- `{argon}`: RuntimeError\n" in body, body
+            assert f"Questions: {q.page_url}." in body and "402" not in body, body
+            # the alert itself failing never reaches the run
+            alerts.raise_alert = lambda title, body, **kw: 1 / 0  # type: ignore[assignment]
+            assert main.extras_alert(b.research_health, {q.page_url}) == []
+        finally:
+            alerts.raise_alert = real_alert  # type: ignore[assignment]
         # the bot's own model fails (its key at its spend limit): no forecast from extras alone
         alive = FakeLlm("Probability: 60%", model=sol)
         b = question_bot([None, None, None], [alive, alive])
@@ -3537,6 +3736,7 @@ def check_spend() -> None:
 
     _spend_look_up()
     _spend_metering()
+    _spend_stop_reason()
     with env(OPENROUTER_API_KEY="x"):  # one search-backed source; no AskNews keys, no network
         _spend_through_the_bot()
     print("spend: ok")
@@ -3712,6 +3912,48 @@ def _spend_metering() -> None:
     assert getattr(general_llm.acompletion, "_spend_metered", False)
 
 
+def _spend_stop_reason() -> None:
+    """Every Spend line says why the model stopped writing, read from the reply the bot
+    already has: a forecaster's reply cut at the token cap ("length") is parsed like a whole
+    one, so the log is where it shows. Print only: the call is recorded as before."""
+
+    def reply(stop, tools=()):
+        response = FakeResponse(cost=0.01)
+        calls = [types.SimpleNamespace(function=types.SimpleNamespace(name=name)) for name in tools]
+        message = types.SimpleNamespace(content="Probability: 40%", tool_calls=calls, provider_specific_fields=None)
+        response.choices = [types.SimpleNamespace(finish_reason=stop, message=message)]
+        return response
+
+    records: list[logging.LogRecord] = []
+    handler = logging.Handler()
+    handler.emit = records.append  # type: ignore[method-assign]
+    spend.logger.addHandler(handler)
+    level = spend.logger.level
+    spend.logger.setLevel(logging.INFO)
+    try:
+        with spend.collecting() as ledger:
+            with spend.tagged(question="https://example.invalid/q/3", part="forecast 2"):
+                spend.record_response("openrouter/google/gemini-4-argon", reply("length"))
+                spend.record_response("anthropic/claude-opus-5-5", reply("stop"))
+            with spend.tagged(question="https://example.invalid/q/3", part="parsing"):
+                spend.record_response("anthropic/claude-haiku-5-5", FakeResponse(cost=0.01))
+            with spend.tagged(question="https://example.invalid/q/3", part="research: x"):
+                spend.record_response("anthropic/claude-sonnet-5-5", reply("stop", tools=("web_search",)))
+    finally:
+        spend.logger.setLevel(level)
+        spend.logger.removeHandler(handler)
+    cut, whole, bare, tools = [r.getMessage() for r in records]
+    assert cut == (
+        "Spend: 3 | forecast 2 | openrouter/google/gemini-4-argon | $0.0100 (billed)"
+        " | 1,000 in, 200 out | 0 web searches | gen-fake | stop length"
+    ), cut
+    assert whole.endswith(" | gen-fake | stop stop"), whole
+    assert bare.endswith(" | gen-fake | stop -"), bare  # a response that gives no reason
+    # a line with the tools note already carries it, once
+    assert ", stop stop, 0s" in tools and " | stop " not in tools, tools
+    assert [c.stop for c in ledger.calls] == ["length", "stop", "", "stop"], ledger.calls
+
+
 def _spend_through_the_bot() -> None:
     """One opus-3 question through forecasting-tools' real flow, with a fake litellm:
     each call lands in the right column, and the numbers add up."""
@@ -3808,6 +4050,7 @@ if __name__ == "__main__":
     check_run_loop()
     check_own_key()
     check_alerts()
+    check_comment_alert()
     check_watchdog()
     check_model_watch()
     check_model_tags()
