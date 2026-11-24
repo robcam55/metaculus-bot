@@ -1380,8 +1380,10 @@ def check_watchdog() -> None:
 
 def check_poetry_install() -> None:
     """How every job gets Poetry: with pip, from a committed file that pins Poetry and each
-    package it needs to one version and to sha256 hashes. No action or installer script
-    fetches them fresh in a job that holds the keys."""
+    package it needs to one version and to sha256 hashes. Checked here: the old install
+    action and the installer's address are gone, and the hash-checked line is each workflow's
+    only `pip install`. Not checked: other ways to fetch code in a job (another action, pip3,
+    pipx, `poetry self`)."""
     root = Path(__file__).resolve().parents[1]
     install = "python -m pip install --require-hashes --only-binary=:all: -r .github/poetry-requirements.txt"
     settings = ("virtualenvs.create true", "virtualenvs.in-project true", "installer.parallel true")
