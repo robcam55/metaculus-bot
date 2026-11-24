@@ -1464,11 +1464,16 @@ def check_comment_alert() -> None:
     assert exited is None and LAST["alerts"] == [] and "without its comment" not in summary, (exited, LAST)
 
     # through main.main(): a question that went out with none of its extra forecasters'
-    # forecasts opens the extras' issue; with one of them back, nothing
+    # forecasts opens the extras' issue; with one of them back, nothing; and nothing for a
+    # question whose forecast failed, since it did not go out at all
     sol, argon = "openrouter/openai/gpt-6.1-sol", "openrouter/google/gemini-4-argon"
     extras = dict(EXTRA_FORECASTERS=f"{sol},{argon}", OPENROUTER_OWN_API_KEY="sk-or-own-fake")
     real_record = main.ResearchHealth.record
-    for argon_error, alerted in (("AuthenticationError", True), (None, False)):
+    for argon_error, failed, alerted in (
+        ("AuthenticationError", (), True),
+        (None, (), False),
+        ("AuthenticationError", (url,), False),
+    ):
 
         def record(self, source, error=None):
             """The fake run's one search per question, plus question 4's two extra forecasts."""
@@ -1480,11 +1485,11 @@ def check_comment_alert() -> None:
         try:
             main.ResearchHealth.record = record  # type: ignore[method-assign]
             _, summary, exited, _ = run_main(
-                "tournament", 100.0, questions, OPENROUTER_API_KEY="sk-fake", **extras
+                "tournament", 100.0, questions, fail_urls=failed, OPENROUTER_API_KEY="sk-fake", **extras
             )
         finally:
             main.ResearchHealth.record = real_record  # type: ignore[method-assign]
-        assert exited is None, exited
+        assert bool(exited) is bool(failed), exited
         assert f"- Extra forecasters: {sol}, {argon}." in summary, summary
         note = "- 1 question(s) forecast without the extra forecasters" in summary
         assert note is alerted and len(LAST["alerts"]) == int(alerted), (summary, LAST)
@@ -1865,7 +1870,9 @@ def check_extra_forecasters() -> None:
             assert re.fullmatch(r"The extra forecasters returned no forecasts \(20\d\d-\d\d\)", title), title
             assert kw == {"open_only": True}, kw  # like Rob's key's: a repeat after he closes it is news
             assert f"- `{sol}`: RuntimeError\n- `{argon}`: RuntimeError\n" in body, body
-            assert f"Questions: {q.page_url}." in body and "402" not in body, body
+            # the error's type only, never its text (on GitHub the body also links the run,
+            # whose id is a number of its own, so only the part before it is searched)
+            assert f"Questions: {q.page_url}." in body and "402" not in body.split("Questions:")[0], body
             # the alert itself failing never reaches the run
             alerts.raise_alert = lambda title, body, **kw: 1 / 0  # type: ignore[assignment]
             assert main.extras_alert(b.research_health, {q.page_url}) == []
