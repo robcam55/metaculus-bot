@@ -50,7 +50,14 @@ jobs:
       # would otherwise read the same as one that found nothing
       - name: Look for missed questions
         if: ${{ !cancelled() }}
-        run: poetry run python missed_check.py >> $GITHUB_STEP_SUMMARY
+        # The page goes to the run's summary and to its log: the summary shows only to
+        # signed-in readers, and `gh run view --log` reads the log
+        run: |
+          status=0
+          poetry run python missed_check.py > missed.md || status=$?
+          cat missed.md
+          cat missed.md >> "$GITHUB_STEP_SUMMARY"
+          exit $status
         env:
           METACULUS_TOKEN: ${{ secrets.METACULUS_TOKEN }} # reads questions; forecasts nothing
           GITHUB_TOKEN: ${{ github.token }} # opens the missed-questions issue

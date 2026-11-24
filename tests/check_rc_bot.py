@@ -1187,7 +1187,7 @@ def check_missed() -> None:
     step = daily[daily.index("- name: Look for missed questions"):]
     assert "if: ${{ !cancelled() }}" in step and "continue-on-error" not in step, step
     assert 'MISSED_CHECK_STRICT: "1"' in step and "MISSED_DAYS: ${{ inputs.missed_days }}" in step, step
-    assert "run: poetry run python missed_check.py >> $GITHUB_STEP_SUMMARY" in step, step
+    assert "poetry run python missed_check.py > missed.md || status=$?" in step and "exit $status" in step, step
     assert "inputs.missed_days" not in step.split("env:")[0], step
     weekly = (workflows / "review_bot.yaml").read_text(encoding="utf-8")
     assert weekly.count("if: ${{ !cancelled() }}") == 3 and "MISSED_CHECK_STRICT" not in weekly, weekly
