@@ -1685,7 +1685,13 @@ def check_scorecard() -> None:
                   {"run_time": "2026-10-21T12:00:00Z", "forecasters": [{"prediction": "unparseable 1e"}]},
               ]}  # fmt: skip
     text = "\n".join(scorecard.scorecard({"questions": [beyond]}))
-    assert "1 forecaster ranges on 1 questions: outcome below the 10th percentile 0%, between the 10th and 90th 0%, above the 90th 100%" in text, text
+    # beyond a bound there is no bound on file to set a range against: left out, and said
+    assert "No resolved numeric forecasts with their percentiles yet. 1 more question(s) resolved beyond a bound and are left out" in text, text
+    text = "\n".join(scorecard.scorecard({"questions": [beyond, {**beyond, "resolution": "2e-05"}]}))
+    assert (
+        "1 forecaster ranges on 1 questions: outcome below the 10th percentile 0%, between the 10th and 90th 100%,"
+        " above the 90th 0% (nominally 10%, 80%, 10%). 1 more question(s) resolved beyond a bound"
+    ) in text, text
     empty = "\n".join(scorecard.scorecard({"questions": []}))
     assert "No resolved binary forecasts yet." in empty, empty
     assert "No scored questions yet." in empty and "No resolved yes/no or multiple-choice forecasts with their members yet." in empty, empty  # fmt: skip
@@ -1737,7 +1743,28 @@ def check_scorecard() -> None:
         100 * ln(0.5) - statistics.mean(100 * ln(x) for x in (0.4, 0.6)),
         100 * ln(0.4) - statistics.mean(100 * ln(x) for x in (0.5, 0.3)),
     ]
-    assert f"| Aggregate − average member | 4 | {scorecard._mean_se(gains)} |" in text, (text, gains)
+    # where another model forecast too, the aggregate's row stands apart from the questions
+    # with one model's forecasts (the untagged one here)
+    several = [gains[0], gains[1], gains[3]]
+    assert f"| Aggregate − average member, several models | 3 | {scorecard._mean_se(several)} |" in text, (text, gains)
+    assert f"| Aggregate − average member, one model's forecasts | 1 | {scorecard._mean_se(gains[2:3])} |" in text, text
+    assert f"| Aggregate − average member | 1 | {scorecard._mean_se(gains[2:3])} |" in "\n".join(scorecard.members([old]))
+    # JUDGING.md rule D's third comparison: the posted aggregate against what Opus's
+    # forecasts alone would have posted (their median; their mean per option)
+    alone = [
+        100 * ln(0.7) - 100 * ln(0.65),
+        100 * ln(0.8) - 100 * ln(0.8),
+        100 * ln(0.4) - 100 * ln(0.5),
+    ]
+    assert f"| Posted aggregate − anthropic/claude-opus-5.5-only aggregate | 3 | {scorecard._mean_se(alone)} |" in text, (text, alone)
+    assert "s4 on |" not in text, text
+    official = statistics.mean((4.0, 2.0, -10.0))
+    assert (
+        f"On the 3 scored questions with other models' forecasts, the official spot peer score averaged {official:+.1f}."
+        f" From anthropic/claude-opus-5.5's forecasts alone it would have averaged about {official - statistics.mean(alone):+.1f}:"
+    ) in text, text
+    # four forecasts of one model combine by the trimmed mean, as main.py's aggregation does
+    assert abs(scorecard._own_aggregate_points(q1, [0.1, 0.6, 0.7, 0.9]) - 100 * ln(0.65)) < 1e-9
     diffs = [
         100 * ln(0.8) - statistics.mean(100 * ln(x) for x in (0.6, 0.7)),
         100 * ln(0.8) - statistics.mean(100 * ln(x) for x in (0.9, 0.7)),
@@ -1774,6 +1801,50 @@ def check_scorecard() -> None:
     assert "- s3: No resolved binary forecasts yet." in text, text
     assert "- s2 on: 3 resolved: mean forecast 60%" in text, text
     assert "- s4 (since 2026-11-04 17:03 UTC): research tools called directly (#17)" in text, text
+    # rule A's lines: s4 and later against the frozen s1 baseline, weighted to the mix of
+    # tournaments, with the rule's minimum and its bar
+    assert "- s1 baseline, frozen 2026-11-23: FutureEval +16.0 ± 4.8 over 41, MiniBench +6.6 ± 2.1 over 118." in text, text
+    assert "- s4 on: MiniBench 1 at +8.0." in text and "- Rule A needs 40 questions: wait." in text, text
+    fe = {**q4, "project_name": "Fall 2026 FutureEval Bot Tournament", "scores": {"spot_peer_score": 0.0}}
+    rule_a = "\n".join(scorecard.rule_a([q4, fe]))
+    base = statistics.mean((16.00, 6.62))
+    error = math.sqrt(statistics.variance((8.0, 0.0)) / 2 + (4.75 / 2) ** 2 + (2.09 / 2) ** 2)
+    assert "- s4 on: FutureEval 1 at +0.0; MiniBench 1 at +8.0." in rule_a, rule_a
+    assert (
+        f"- Against s1 weighted to that mix ({base:+.1f}): {4.0 - base:+.1f} ± {error:.1f} over 2 questions."
+        " Rule A needs 40 questions: wait."
+    ) in rule_a, rule_a
+    rule_a = "\n".join(scorecard.rule_a([q4] * 20 + [fe] * 20))
+    assert "over 40 questions. Rule A calls it clearly worse below -" in rule_a and "otherwise no large harm seen." in rule_a, rule_a
+    assert "- s4 on: no scored questions yet." in "\n".join(scorecard.rule_a([q1, old])), scorecard.rule_a([q1, old])
+
+    # rule C's lines: one outcome per question, against the mean of the forecasters' 10th
+    # and 90th percentiles (25 and 46 here), for s2 on and for s4 on; an outcome beyond a
+    # bound is left out; from 20 questions the line names the count that would recommend
+    def ranged(resolution, at):
+        def entry(low, high, model):
+            return {"prediction": f"Probability distribution:\n- 10.00% chance of value below {low}\n- 90.00% chance of value below {high}\nModel: {model}"}
+        return {**numeric, "resolution": resolution, **run([entry(30.0, 41.0, opus), entry(20.0, 51.0, gpt)], at=at)}
+
+    s2_at, s4_at = "2026-10-31T18:00:00Z", "2026-11-06T10:00:00Z"
+    width = scorecard.coverage_by_setup([
+        ranged("35", s2_at), ranged("42", s4_at), ranged("48", s4_at), ranged("above_upper_bound", s4_at), numeric,
+    ])  # fmt: skip
+    assert width[0].startswith(
+        "- s2 on: outcome inside the 10th to 90th range on 2 of 3 questions (67%; 4 of 6 forecaster ranges)."
+        " 1 more question(s) resolved beyond a bound"
+    ), width
+    assert width[1].startswith(
+        "- s4 on: outcome inside the 10th to 90th range on 1 of 2 questions (50%; 2 of 4 forecaster ranges)."
+        " Rule C needs 20 questions: wait. 1 more question(s) resolved beyond a bound"
+    ), width
+    width = scorecard.coverage_by_setup([ranged("42", s4_at)] * 13 + [ranged("48", s4_at)] * 7)
+    assert "on 13 of 20 questions (65%; 20 of 40 forecaster ranges). Rule C needs 20 questions; at 20 it would recommend at 12 or fewer inside." in width[1], width
+    assert [scorecard._width_line(n) for n in (20, 30, 40, 50)] == [12, 19, 27, 34]
+    assert scorecard.coverage_by_setup([numeric]) == [
+        "- s2 on: no resolved numeric forecasts inside their bounds yet.",
+        "- s4 on: no resolved numeric forecasts inside their bounds yet.",
+    ], scorecard.coverage_by_setup([numeric])
     # the dated list itself: in order, each from a later time, the first undated; the run
     # page names the setup live now
     import setups
@@ -1786,6 +1857,18 @@ def check_scorecard() -> None:
     idle = "\n".join(main.run_report([], [], main.ResearchHealth(), []))
     assert f"- Setup: {setups.describe(setups.SETUPS[-1])}." in idle, idle
     assert "| Status on a date | s2 on |" not in text and "| Other | s2 on | 3 |" in text, text
+    # the rules the rows serve say the same: the frozen baseline, rule C's line and unit,
+    # rule D's row; and the weekly review reads the season, its input kept out of the script
+    root = Path(__file__).resolve().parents[1]
+    judging = " ".join((root / "JUDGING.md").read_text(encoding="utf-8").split())
+    frozen = ", ".join(f"{t} {m:+.1f} ± {se:.1f} over {n}" for t, (m, se, n) in scorecard.RULE_A_BASELINE.items())
+    assert "FutureEval +16.0 ± 4.8 over 41 questions, MiniBench +6.6 ± 2.1 over 118" in judging, judging
+    assert frozen == "FutureEval +16.0 ± 4.8 over 41, MiniBench +6.6 ± 2.1 over 118", frozen
+    assert "12 or fewer of 20, 19 of 30, 27 of 40, 34 of 50" in judging and "Amended on 2026-11-23, after data." in judging
+    assert 'Otherwise the verdict is "no large harm seen", not "keep"' in judging, judging
+    review = (root / ".github" / "workflows" / "review_bot.yaml").read_text(encoding="utf-8")
+    assert '--resolved-since "$DAYS"' in review and "DAYS: ${{ inputs.days || 120 }}" in review, review
+    assert "${{ inputs" not in review.split("- name: Review forecasts")[1].split("env:")[0], review
     print("scorecard: ok")
 
 

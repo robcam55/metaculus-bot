@@ -14,8 +14,11 @@ forecasts can show earlier is bias:
   was the forecast's favourite.
 - By setup: each forecast under the setup live when its run posted it, from the dated
   list in setups.py (s1 for comments without the "Model:" line that arrived with s2).
-  The tables above mix them all; JUDGING.md says which rows judge which change, with a
-  row for s4 and later (rule A) and a calibration line for s2 and later (rule B).
+  The tables above mix them all; JUDGING.md says which rows judge which change: s4 and
+  later against a frozen s1 baseline, weighted by tournament (rule A); a calibration line
+  for s2 and later (rule B); and number-question width counted once per question, for s2
+  and later and for s4 and later (rule C). An outcome beyond a bound is left out of the
+  width counts: the review holds no bounds to set a forecaster's range against.
 - By kind of question, from the title: prices and markets, status on a date, sports and
   so on, to show where the points are won and lost, before and under the 2026-10-30
   rules. Descriptive only: at a dozen questions a kind, a gap under about 12 points is
@@ -26,7 +29,9 @@ forecasts can show earlier is bias:
   noise than comparing peer scores between two setups. The model comes from the
   "Model:" line main.py adds to each forecaster's line in the posted summary; older
   comments have none and count only in the aggregate's row. One model's ids on the two
-  routes (OpenRouter's and Anthropic's) count as one.
+  routes (OpenRouter's and Anthropic's) count as one. Where other models forecast too,
+  one row sets the posted aggregate against what the most common model's forecasts alone
+  would have given (rule D), which is also the Claude-only reading of those questions.
 Read-only, standard library only: `python scorecard.py review.json`.
 """
 
@@ -223,10 +228,12 @@ def _canonical(model: str) -> str:
     return re.sub(r"^(anthropic/claude-[a-z]+-\d+)-(\d+)$", r"\1.\2", model)
 
 
-def numeric_coverage(questions: list[dict]) -> list[str]:
-    counts = {"below": 0, "inside": 0, "above": 0}
-    counted: set[int] = set()
-    for i, q in enumerate(questions):
+def _ranges(questions: list[dict]) -> list[tuple[float, list[tuple[float, float]]]]:
+    """For each resolved numeric or discrete question with readable forecasts: the outcome
+    (infinite when it resolved beyond a bound) and each forecaster's 10th and 90th
+    percentile."""
+    out = []
+    for q in questions:
         if q.get("question_type") not in ("numeric", "discrete"):
             continue
         resolution = q.get("resolution")
@@ -234,29 +241,96 @@ def numeric_coverage(questions: list[dict]) -> list[str]:
             outcome = _BEYOND.get(resolution) or float(resolution)
         except (TypeError, ValueError):
             continue  # annulled or ambiguous
+        ranges = []
         for text in _forecasters(q):
             try:
                 points = {round(float(p) / 100, 2): float(v) for p, v in _PERCENTILE.findall(text)}
             except ValueError:
                 continue  # a forecast written some other way: skipped, not fatal
-            if 0.1 not in points or 0.9 not in points:
-                continue
-            counted.add(i)
-            if outcome < points[0.1]:
+            if 0.1 in points and 0.9 in points:
+                ranges.append((points[0.1], points[0.9]))
+        if ranges:
+            out.append((outcome, ranges))
+    return out
+
+
+def _beyond_note(beyond: int) -> str:
+    """An outcome beyond a bound can't be placed against a range: the review holds no
+    bounds, so a forecast with most of its probability out there would count as a miss
+    (question 46181 scored +99.7 and counted as three). Left out and said so."""
+    if not beyond:
+        return ""
+    return f" {beyond} more question(s) resolved beyond a bound and are left out: the review holds no bounds to set a range against."
+
+
+def numeric_coverage(questions: list[dict]) -> list[str]:
+    counts = {"below": 0, "inside": 0, "above": 0}
+    found = _ranges(questions)
+    inside_bounds = [(outcome, ranges) for outcome, ranges in found if math.isfinite(outcome)]
+    for outcome, ranges in inside_bounds:
+        for low, high in ranges:
+            if outcome < low:
                 counts["below"] += 1
-            elif outcome > points[0.9]:
+            elif outcome > high:
                 counts["above"] += 1
             else:
                 counts["inside"] += 1
     total = sum(counts.values())
+    beyond = _beyond_note(len(found) - len(inside_bounds))
     if not total:
-        return ["No resolved numeric forecasts with their percentiles yet."]
+        return ["No resolved numeric forecasts with their percentiles yet." + beyond]
     return [
-        f"{total} forecaster ranges on {len(counted)} questions: outcome below the 10th percentile"
+        f"{total} forecaster ranges on {len(inside_bounds)} questions: outcome below the 10th percentile"
         f" {counts['below'] / total:.0%}, between the 10th and 90th"
         f" {counts['inside'] / total:.0%}, above the 90th {counts['above'] / total:.0%}"
-        " (nominally 10%, 80%, 10%)."
+        " (nominally 10%, 80%, 10%)." + beyond
     ]
+
+
+def _width_line(questions: int) -> int:
+    """The most questions inside at which JUDGING.md rule C recommends: so few that a true
+    80% rate would give that or fewer less than 1 time in 20 (12 of 20, 34 of 50)."""
+    cumulative, line = 0.0, -1
+    for inside in range(questions + 1):
+        cumulative += math.comb(questions, inside) * 0.8**inside * 0.2 ** (questions - inside)
+        if cumulative > 0.05:
+            break
+        line = inside
+    return line
+
+
+def coverage_by_setup(questions: list[dict]) -> list[str]:
+    """JUDGING.md rule C's rows: one outcome per question, inside when it lies between the
+    mean of the forecasters' 10th percentiles and the mean of their 90th. From s2 on (every
+    forecast under the 2026-10-30 rules) and from s4 on, which the rule judges."""
+    lines = []
+    for start in dict.fromkeys((dated.RULES_FROM, dated.COMPARED_FROM)):
+        names = set(dated.from_(start))
+        found = _ranges([q for q in questions if setup(q) in names])
+        counted = [(outcome, ranges) for outcome, ranges in found if math.isfinite(outcome)]
+        inside = sum(
+            statistics.mean(low for low, _ in ranges) <= outcome <= statistics.mean(high for _, high in ranges)
+            for outcome, ranges in counted
+        )
+        ranges_inside = sum(low <= outcome <= high for outcome, ranges in counted for low, high in ranges)
+        ranges_total = sum(len(ranges) for _, ranges in counted)
+        if not counted:
+            lines.append(f"- {start} on: no resolved numeric forecasts inside their bounds yet." + _beyond_note(len(found)))
+            continue
+        judged = ""
+        if start == dated.COMPARED_FROM:
+            judged = (
+                f" Rule C needs 20 questions; at {len(counted)} it would recommend at"
+                f" {_width_line(len(counted))} or fewer inside."
+                if len(counted) >= 20
+                else " Rule C needs 20 questions: wait."
+            )
+        lines.append(
+            f"- {start} on: outcome inside the 10th to 90th range on {inside} of {len(counted)}"
+            f" questions ({inside / len(counted):.0%}; {ranges_inside} of {ranges_total} forecaster"
+            f" ranges).{judged}" + _beyond_note(len(found) - len(counted))
+        )
+    return lines
 
 
 def multiple_choice(questions: list[dict]) -> list[str]:
@@ -311,6 +385,58 @@ def setups(questions: list[dict]) -> list[str]:
     return lines
 
 
+# JUDGING.md rule A's baseline, frozen on 2026-11-23: every s1 question on the four weekly
+# reviews saved by then (11-02, 11-09, 11-16, 11-23), by tournament, as (mean spot peer
+# score, its standard error, questions). The weekly page's own s1 row covers only the
+# review's window, so it drifts as questions leave it
+RULE_A_BASELINE = {"FutureEval": (16.00, 4.75, 41), "MiniBench": (6.62, 2.09, 118)}
+RULE_A_MINIMUM = 40
+
+
+def _tournament(q: dict) -> str | None:
+    name = _project(q).lower()
+    return next((t for t in RULE_A_BASELINE if t.lower() in name), None)
+
+
+def rule_a(questions: list[dict]) -> list[str]:
+    """JUDGING.md rule A: s4 and later against the frozen s1 baseline, weighted to the
+    tournaments the s4+ questions came from. FutureEval's s1 questions scored about 9
+    points above MiniBench's, so an unweighted comparison would move with the mix."""
+    start = f"{dated.COMPARED_FROM} on"
+    compared = set(dated.from_(dated.COMPARED_FROM))
+    groups: dict[str, list[float]] = defaultdict(list)
+    for q in _scored(questions):
+        tournament = _tournament(q)
+        if tournament and setup(q) in compared:
+            groups[tournament].append(q["scores"]["spot_peer_score"])
+    scores = [score for group in groups.values() for score in group]
+    frozen = ", ".join(f"{t} {m:+.1f} ± {se:.1f} over {n}" for t, (m, se, n) in RULE_A_BASELINE.items())
+    lines = [f"- s1 baseline, frozen 2026-11-23: {frozen}."]
+    if not scores:
+        return lines + [f"- {start}: no scored questions yet."]
+    lines.append(
+        f"- {start}: " + "; ".join(f"{t} {len(g)} at {_mean_se(g)}" for t, g in sorted(groups.items())) + "."
+    )
+    if len(scores) < 2:
+        return lines + [f"- Rule A needs {RULE_A_MINIMUM} questions: wait."]
+    weights = {t: len(g) / len(scores) for t, g in groups.items()}
+    baseline = sum(RULE_A_BASELINE[t][0] * w for t, w in weights.items())
+    error = math.sqrt(
+        statistics.variance(scores) / len(scores)
+        + sum((RULE_A_BASELINE[t][1] * w) ** 2 for t, w in weights.items())
+    )
+    verdict = (
+        f"Rule A needs {RULE_A_MINIMUM} questions: wait."
+        if len(scores) < RULE_A_MINIMUM
+        else f"Rule A calls it clearly worse below {-2 * error:+.1f}; otherwise no large harm seen."
+    )
+    lines.append(
+        f"- Against s1 weighted to that mix ({baseline:+.1f}): {statistics.mean(scores) - baseline:+.1f}"
+        f" ± {error:.1f} over {len(scores)} questions. {verdict}"
+    )
+    return lines
+
+
 def setup_legend() -> list[str]:
     return [f"- {dated.describe(s)}" for s in dated.SETUPS]
 
@@ -342,20 +468,41 @@ def _points(probability: float) -> float:
     return 100 * math.log(max(probability, LOG_FLOOR))
 
 
-def _member_points(q: dict, text: str) -> float | None:
-    """100 x ln of the probability this forecaster gave the outcome; None if unreadable."""
+def _member_probability(q: dict, text: str) -> float | None:
+    """The probability this forecaster gave the outcome; None if unreadable."""
     resolution = q.get("resolution")
     if q.get("question_type") == "binary" and resolution in ("yes", "no"):
         found = _BINARY_PROBABILITY.search(text)
         if not found:
             return None
         p = float(found.group(1)) / 100
-        return _points(p if resolution == "yes" else 1 - p)
+        return p if resolution == "yes" else 1 - p
     if q.get("question_type") == "multiple_choice":
         options = {name.strip(): float(value) / 100 for name, value in _OPTION.findall(text)}
         if resolution in options:
-            return _points(options[resolution])
+            return options[resolution]
     return None
+
+
+def _member_points(q: dict, text: str) -> float | None:
+    """100 x ln of the probability this forecaster gave the outcome; None if unreadable."""
+    probability = _member_probability(q, text)
+    return None if probability is None else _points(probability)
+
+
+def _own_aggregate_points(q: dict, probabilities: list[float]) -> float | None:
+    """What the bot would have scored from one model's forecasts alone, combined as main.py
+    combines them: yes/no by the median (the trimmed mean from four forecasts on), and
+    multiple choice by the mean. On the probability given to what happened, the median and
+    the trimmed mean are the same as on the forecast itself."""
+    if not probabilities:
+        return None
+    if q.get("question_type") == "binary":
+        values = sorted(probabilities)
+        combined = statistics.mean(values[1:-1]) if len(values) >= 4 else statistics.median(values)
+    else:
+        combined = statistics.mean(probabilities)
+    return _points(combined)
 
 
 def _aggregate_points(q: dict) -> float | None:
@@ -371,48 +518,102 @@ def _aggregate_points(q: dict) -> float | None:
 
 
 def members(questions: list[dict]) -> list[str]:
-    """Yes/no and multiple choice: the posted aggregate against the average of its own
-    members (only where the posted forecast came from the scored run), and each model
-    against the most common one on shared questions."""
-    gains: list[float] = []
+    """Yes/no and multiple choice. The posted aggregate against the average of its own
+    members (only where the posted forecast came from the scored run), apart for questions
+    with one model's forecasts and with several; the posted aggregate against what the most
+    common model's forecasts alone would have given (JUDGING.md rule D); and each model
+    against the most common one on shared questions. Rows that cover several setups come
+    again for s4 on, because s3's forecasts were made while research was failing."""
+    found: list[tuple[int, dict, list[tuple[str, float]], float | None]] = []
     by_model: dict[str, dict[int, list[float]]] = defaultdict(dict)
     for i, q in enumerate(questions):
-        scored = [(model, _member_points(q, text)) for model, text in _members(q)]
-        scored = [(model, points) for model, points in scored if points is not None]
+        scored = [(model, _member_probability(q, text)) for model, text in _members(q)]
+        scored = [(model, p) for model, p in scored if p is not None]
         if not scored:
             continue
-        aggregate = _aggregate_points(q) if _same_run(q) else None
-        if aggregate is not None and len(scored) >= 2:
-            gains.append(aggregate - statistics.mean(points for _, points in scored))
-        for model, points in scored:
-            by_model[model].setdefault(i, []).append(points)
-    if not gains and not by_model:
+        found.append((i, q, scored, _aggregate_points(q) if _same_run(q) else None))
+        for model, p in scored:
+            by_model[model].setdefault(i, []).append(_points(p))
+    if not found:
         return ["No resolved yes/no or multiple-choice forecasts with their members yet."]
+    tagged = {m: qs for m, qs in by_model.items() if m != "untagged"}
+    # The bot's own model: on the most questions and, where another model is on as many,
+    # with the most forecasts (it makes three a question, an extra one)
+    reference = (
+        max(tagged, key=lambda m: (len(tagged[m]), sum(len(v) for v in tagged[m].values())))
+        if tagged
+        else None
+    )
+    later = set(dated.from_(dated.COMPARED_FROM))  # s3's research was failing: shown apart
+    single: list[float] = []  # aggregate − average member, one model's forecasts
+    several: list[float] = []  # ... with another model's forecast among them
+    alone: list[tuple[int, float]] = []  # aggregate − the reference model's forecasts alone
+    for i, q, scored, aggregate in found:
+        mixed = any(model not in (reference, "untagged") for model, _ in scored)
+        if aggregate is None:
+            continue
+        if len(scored) >= 2:
+            gain = aggregate - statistics.mean(_points(p) for _, p in scored)
+            (several if mixed else single).append(gain)
+        own = _own_aggregate_points(q, [p for model, p in scored if model == reference])
+        if mixed and own is not None:
+            alone.append((i, aggregate - own))
     lines = [
         "| Comparison (log score, 100 x ln) | Questions | Mean difference ± SE |",
         "|---|---|---|",
     ]
-    if gains:
-        lines.append(f"| Aggregate − average member | {len(gains)} | {_mean_se(gains)} |")
-    tagged = {m: qs for m, qs in by_model.items() if m != "untagged"}
+    if single and several:
+        lines.append(f"| Aggregate − average member, one model's forecasts | {len(single)} | {_mean_se(single)} |")
+        lines.append(f"| Aggregate − average member, several models | {len(several)} | {_mean_se(several)} |")
+    elif single or several:
+        lines.append(f"| Aggregate − average member | {len(single + several)} | {_mean_se(single + several)} |")
+
+    def is_later(i: int) -> bool:
+        return setup(questions[i]) in later
+
+    def row(label: str, diffs: list[tuple[int, float]]) -> list[str]:
+        """The row over every question, then again for s4 on when that leaves some out."""
+        out = [f"| {label} | {len(diffs)} | {_mean_se([d for _, d in diffs])} |"]
+        recent = [d for i, d in diffs if is_later(i)]
+        if recent and len(recent) < len(diffs):
+            out.append(f"| {label}, {dated.COMPARED_FROM} on | {len(recent)} | {_mean_se(recent)} |")
+        return out
+
+    if alone:
+        # JUDGING.md rule D's third comparison, and the Claude-only reading of these questions
+        lines += row(f"Posted aggregate − {reference}-only aggregate", alone)
     if len(tagged) >= 2:
-        reference = max(tagged, key=lambda m: len(tagged[m]))
         compared = 0
         for model, per_question in sorted(tagged.items()):
             if model == reference:
                 continue
             shared = sorted(set(per_question) & set(tagged[reference]))
             diffs = [
-                statistics.mean(per_question[i]) - statistics.mean(tagged[reference][i])
+                (i, statistics.mean(per_question[i]) - statistics.mean(tagged[reference][i]))
                 for i in shared
             ]
             if diffs:
                 compared += 1
-                lines.append(f"| {model} − {reference} | {len(diffs)} | {_mean_se(diffs)} |")
+                lines += row(f"{model} − {reference}", diffs)
         if not compared:
             lines.append(f"| Models so far ({', '.join(sorted(tagged))}): no questions in common | – | – |")
     elif tagged:
         lines.append(f"| One model so far ({', '.join(sorted(tagged))}) | – | – |")
+    scores = [
+        (questions[i]["scores"]["spot_peer_score"], diff)
+        for i, diff in alone
+        if (questions[i].get("scores") or {}).get("spot_peer_score") is not None
+    ]
+    if scores:
+        official = statistics.mean(score for score, _ in scores)
+        own_only = official - statistics.mean(diff for _, diff in scores)
+        lines += [
+            "",
+            f"On the {len(scores)} scored questions with other models' forecasts, the official spot"
+            f" peer score averaged {official:+.1f}. From {reference}'s forecasts alone it would have"
+            f" averaged about {own_only:+.1f}: between two forecasts of one question the peer"
+            " score differs by this log-score difference. Yes/no and multiple choice only.",
+        ]
     return lines
 
 
@@ -444,7 +645,17 @@ def scorecard(review: dict[str, Any]) -> list[str]:
         "",
         *setups(questions),
         "",
+        "Rule A, the 2026-10-30 rules: s4 and later against s1, by tournament.",
+        "",
+        *rule_a(questions),
+        "",
+        "Rule B, yes/no calibration.",
+        "",
         *binary_by_setup(questions),
+        "",
+        "Rule C, number-question width: one outcome per question.",
+        "",
+        *coverage_by_setup(questions),
         "",
         "**By kind of question** (descriptive; at a dozen questions a kind, gaps under about 12 points are noise)",
         "",

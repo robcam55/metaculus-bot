@@ -5,7 +5,7 @@ on:
     inputs:
       days:
         description: "How many days back to look for resolved questions"
-        default: "30"
+        default: "120"
   schedule:
     - cron: "0 6 * * 1" # weekly, Monday morning
 
@@ -42,14 +42,18 @@ jobs:
           installer-parallel: true
       - name: Install dependencies
         run: poetry install --no-interaction --no-root --with integrations
+      # 120 days back, which covers a season: at 30 the by-setup rows lost each question a
+      # month after it resolved, and the s1 row drifted as its questions left. The input is
+      # read from the environment, so its text never becomes part of the script
       - name: Review forecasts
         run: |
           poetry run bot-review review \
-            --resolved-since ${{ inputs.days || 30 }} \
+            --resolved-since "$DAYS" \
             --output review.json \
             --summary review.md
         env:
           METACULUS_TOKEN: ${{ secrets.METACULUS_TOKEN }}
+          DAYS: ${{ inputs.days || 120 }}
       - name: Add the calibration scorecard
         continue-on-error: true # never at the cost of bot-review's summary or the artifact
         run: |
