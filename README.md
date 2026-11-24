@@ -239,7 +239,10 @@ newer local litellm once hid a call that crashes on the pinned one.
    Without it, `ANTHROPIC_API_KEY` (your own key, billed to you) runs FutureEval and
    MiniBench as it does after the credits (step 9): the pinned tier, `opus-3` without a
    pin, with its key check. With both, your key only takes over when the credits run out,
-   or when a run can't read their balance.
+   or when a run can't read their balance. With neither, a tournament or Test Bot run
+   stops at start-up: a red run, with one line naming the missing secret or secrets:
+   `ANTHROPIC_API_KEY` where `PAY_WITH` is `own-key`, as the tournament workflow sets it,
+   and, since 2026-11-24, both otherwise.
 4. **Research (optional but recommended).** Get free AskNews access: make an AskNews account
    with the bot's email, then contact AskNews. Add `ASKNEWS_CLIENT_ID` and `ASKNEWS_SECRET`,
    or `ASKNEWS_API_KEY`.
@@ -495,6 +498,11 @@ The main architectural choices and the reasons behind them. Each links to where 
 
   — Claude's 2026-10-28 health review; Rob's go-ahead that day, built in [#13](https://github.com/robcam55/metaculus-bot/pull/13).
 - **Rob's key also when the credits' balance can't be read, or there's no OpenRouter key.** Once the credits ran out (2026-10-25), an unreadable balance sent a run back onto them, uncapped, where every question would fail. Paying with Rob's key for that run costs at most one run's questions while credits remain. Without any OpenRouter key, FutureEval and MiniBench used to fall through to the Metaculus Cup's unpaced Sonnet 5 × 5, ignoring `BUDGET_TIER=pause`.
+- **No model key stops the run at start-up (2026-11-24).** The bot has two model keys: `OPENROUTER_API_KEY` (Metaculus's credits) and `ANTHROPIC_API_KEY` (Rob's own). With neither set, a tournament or Test Bot run used to go on with the default models of the `forecasting-tools` package: GPT-4o through Metaculus's own model proxy, or on an `OPENAI_API_KEY` if one was set, five forecasts a question, with no pacing and no key check. Whether that proxy would serve this account was never established, so either every question failed or forecasts were posted from a model nobody chose. It was never seen in the records: it needs both secrets empty at once, which is likeliest while keys are being moved or rotated. Now such a run stops before it reads a question, with one line naming the two variables, and the run is red.
+  - **Which runs stop.** Only a tournament or Test Bot run with both keys missing or empty. An `OPENAI_API_KEY` alone doesn't count, because no route of the bot uses it. One missing key is as before: without the OpenRouter key Rob's key pays, and without Rob's key the credits pay. The two stops that already existed keep their own messages: the Cup without Rob's key, and `PAY_WITH=own-key` without it. The tournament workflow sets `PAY_WITH: own-key`, so its runs already stopped there. The new stop covers a Test Bot run on `credits`, a local run, and the tournament runs if that line ever goes back to the credits.
+  - **Why red, with no issue.** A green run that forecast nothing would hide the fault. The other start-up stops (a mistyped setting, `PAY_WITH=own-key` without the key) are red with no issue as well. The cost is the one the alerts entry gives: a red run emails Rob each time until a key is back.
+
+  — Card 5 ("Small defects, none seen on record") of the [design review](https://claude.ai/artifact/S74Ts4ARAnva1rCqqYopcZ) of 2026-11-12, which listed a run with no model key going on with the package's default models, and a short stop at start-up as the fix. Rob's go-ahead of 2026-11-24 in chat ("Yes, fix them") to fixing that card's defects. Not counting an OpenAI key, leaving the one-key cases and the two earlier stops as they were, the red run with no issue, the message's wording, and taking the sentence "The bot will fall back to the Metaculus LLM proxy" out of the start-up warning were Claude's choices; not otherwise ratified.
 - **A second model family on Rob's own OpenRouter key (2026-10-30, off until set up).** Rob asked whether models outside the Claude family, Gemini 4 Argon in particular, could help.
   - **Evidence.** In Metaculus's same-setup house bots, OpenAI's reasoning models led most seasons and no Claude model ever did: GPT-5.1-high scored 11.3 against Claude Sonnet 4.5-high's 8.9 in Spring 2026, with overlapping intervals. In the Spring 2026 survey, using GPT-5.4 as the final model was the strongest single marker of score (r=+0.42), and Opus about zero; that is correlational. On ForecastBench today, GPT-6.1 Sol and Opus 5.5 are level (62.3 and 62.5). nostreambot found no gain from mixing vendors at three members. Gemini 4 Argon has no forecasting record yet; Metaculus added a house bot for it on Oct 15.
   - **Choice.** Extra members beside the three Opus forecasts, not a switch: a hedge on the model choice and less alike errors, worth perhaps +1 a question, not a step change. With five members the yes/no aggregate is the trimmed mean; a three-member mix was avoided, because the median mutes the odd member out. Each forecast names its model, so the scorecard can compare members paired on the same questions.
@@ -572,7 +580,7 @@ The easiest way to use this repo is to fork it, paste in two API keys, and click
 1) **Fork the repository** — go to the [repository](https://github.com/Metaculus/metac-bot-template) and click **Fork** in the top right.
 2) **Add your two API keys as repository secrets** — in your fork, go to `Settings → Secrets and variables → Actions → New repository secret`. Add these two (names must match exactly, all caps):
    - **`METACULUS_TOKEN`** — create one at https://www.metaculus.com/futureeval/participate/ (see the [resources page](https://www.metaculus.com/notebooks/38928/ai-benchmark-resources/#creating-your-bot-account-and-metaculus-token) if you get stuck).
-   - **`OPENROUTER_API_KEY`** — get free credits via [this form](https://forms.gle/aQdYMq9Pisrf1v7d8), or make your own key on [OpenRouter](https://openrouter.ai/). You can also use `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `PERPLEXITY_API_KEY`, `ASKNEWS_SECRET`, etc. — these all work out of the box if you set them.
+   - **`OPENROUTER_API_KEY`** — get free credits via [this form](https://forms.gle/aQdYMq9Pisrf1v7d8), or make your own key on [OpenRouter](https://openrouter.ai/). You can also use `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `PERPLEXITY_API_KEY`, `ASKNEWS_SECRET`, etc. — these all work out of the box if you set them. (In this bot, `main.py` forecasts only with `OPENROUTER_API_KEY` or `ANTHROPIC_API_KEY`; with neither it stops at start-up.)
 3) **Enable Actions** — click the `Actions` tab, then click `I understand my workflows, go ahead and enable them`.
 4) **Run the test workflow to confirm everything works** — go to `Actions → Test Bot → Run workflow → Run workflow` (green button). This forecasts on whatever's currently open in the [bot-testing-area tournament](https://www.metaculus.com/tournament/bot-testing-area/) so you can verify your setup posts forecasts to Metaculus end-to-end. Once the run finishes (~3–5 min), check your bot's profile on Metaculus to confirm the forecasts landed.
 5) **You're done!** The `Forecast on new AI tournament questions` workflow is already enabled and will run every 20 minutes, picking up any new tournament questions and skipping ones it has already forecast on.
@@ -640,7 +648,7 @@ Copy the template and fill in your real keys:
 ```bash
 cp .env.template .env
 ```
-Then open `.env` in any text editor and replace each `REPLACE_ME` with your real key. At minimum you need `METACULUS_TOKEN` and one LLM key (`OPENROUTER_API_KEY` is recommended). See the comments inside `.env.template` for where to get each one.
+Then open `.env` in any text editor and replace each `REPLACE_ME` with your real key. At minimum you need `METACULUS_TOKEN` and one LLM key: `OPENROUTER_API_KEY` (recommended) or `ANTHROPIC_API_KEY`. With both missing or empty, `main.py` stops at start-up; a line left as `REPLACE_ME` counts as set, so that stop doesn't fire for it. See the comments inside `.env.template` for where to get each one.
 
 ### 5. Run the bot
 **First run — smoke-test against the [bot-testing-area tournament](https://www.metaculus.com/tournament/bot-testing-area/):**
