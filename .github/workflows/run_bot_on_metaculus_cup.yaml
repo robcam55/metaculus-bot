@@ -15,10 +15,10 @@ concurrency:
 jobs:
   forecast_job:
     runs-on: ubuntu-latest # determines the machine that will run the job - keep as is
-    # A read-only token: no step here writes to GitHub. No step is handed GITHUB_TOKEN,
-    # so an alert in a Cup run is only written to the log (alerts.py), as it always was.
-    # To have these runs open issues, pass the token to the bot step and add
-    # issues: write here, both together
+    # A read-only token: no step here writes to GitHub. No step's environment holds
+    # GITHUB_TOKEN, so an alert in a Cup run is only written to the log (alerts.py), as
+    # it always was. To have these runs open issues, pass the token to the bot step and
+    # add issues: write here, both together
     permissions:
       contents: read
     steps: # sets up the steps that will be run in order

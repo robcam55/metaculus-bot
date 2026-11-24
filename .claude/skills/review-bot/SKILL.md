@@ -37,8 +37,10 @@ Read the summary first, then `review.json` for per-question detail.
 In `review.json` (bot-review 0.1.2) each question has a `traces` list: one entry per comment
 the bot posted, with its `comment_id`, `run_time`, `forecasters` and `truncated`. There is no
 single `trace` field. Below, a question's **scored trace** means the entry of `traces` with
-the latest `run_time` at or before the question's `spot_scoring_time`, the same choice
-`scorecard.py` makes. A question forecast once has one entry.
+the latest `run_time` at or before the question's `spot_scoring_time`. A question forecast
+once has one entry. `scorecard.py` picks the same entry whenever that entry lists
+forecasters; it passes over entries with no forecasters, and when no entry is early enough
+it uses the latest run instead.
 
 ## 2. Pick questions to investigate
 

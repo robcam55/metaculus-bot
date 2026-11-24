@@ -2568,10 +2568,30 @@ def workflow_scripts(text: str) -> list[str]:
 
 def workflow_permissions(text: str) -> set[str] | None:
     """What a workflow file's `permissions:` blocks grant its token, comments dropped. None
-    when a job is left without a block, which gives its token the repository's default."""
-    jobs = re.split(r"^  (?=[\w-]+:\s*$)", text.split("\njobs:\n", 1)[1], flags=re.MULTILINE)[1:]
-    whole_file = re.search(r"^permissions:", text, re.MULTILINE)
-    if not whole_file and not all(re.search(r"^    permissions:", job, re.MULTILINE) for job in jobs):
+    when a job is left without a block, which gives its token the repository's default, and
+    None when no job is found: a file this reader cannot follow is not passed. Jobs are
+    found by indentation (every line as deep as the first line under `jobs:` starts one),
+    so a comment after a job's name, a quoted name or a deeper indent hides nothing."""
+
+    def depth(line: str) -> int:
+        return len(line) - len(line.lstrip())
+
+    kept = [line for line in text.splitlines() if line.strip() and not line.lstrip().startswith("#")]
+    starts = [i for i, line in enumerate(kept) if re.match(r"jobs:\s*(#.*)?$", line)]
+    jobs: list[list[str]] = []
+    for line in kept[starts[0] + 1:] if starts else []:
+        if depth(line) == 0:
+            break
+        if not jobs or depth(line) <= depth(kept[starts[0] + 1]):
+            jobs.append([])  # a job's name line; the lines under it follow
+        else:
+            jobs[-1].append(line)
+    whole_file = any(line.startswith("permissions:") for line in kept)
+    declared = [
+        any(depth(line) == depth(job[0]) and line.lstrip().startswith("permissions:") for line in job)
+        for job in jobs
+    ]
+    if not jobs or not (whole_file or all(declared)):
         return None
     lines = text.splitlines()
     granted: set[str] = set()
@@ -2614,8 +2634,22 @@ def check_workflows() -> None:
     assert len(scripts) == 2 and "inputs.one" in scripts[0] and "inputs.two" in scripts[1], scripts
     assert not any(word in "".join(scripts) for word in ("title", "commented", "safe", "days")), scripts
     assert workflow_permissions(sample) is None
-    assert workflow_permissions(sample.replace("    steps:", "    permissions:\n      contents: read # code\n    steps:")) == {"contents: read"}
+    block = "    permissions:\n      contents: read # code\n"
+    with_block = sample.replace("    steps:", block + "    steps:")
+    assert workflow_permissions(with_block) == {"contents: read"}
     assert workflow_permissions("permissions:\n  issues: write\n" + sample) == {"issues: write"}
+    # a job with no block is seen however its name line is written, and is not hidden
+    # behind another job's block; a file with no job at all is not passed either
+    commented = "  job: # the only job"
+    assert workflow_permissions(with_block.replace("  job:", commented)) == {"contents: read"}
+    for written in (commented, '  "job":'):
+        assert workflow_permissions(sample.replace("  job:", written)) is None, written
+    assert workflow_permissions(sample.replace("\n  ", "\n    ")) is None
+    assert workflow_permissions(with_block.replace("\n  ", "\n    ")) == {"contents: read"}
+    assert workflow_permissions(with_block + "  second: # no block\n    steps: []\n") is None
+    assert workflow_permissions(with_block + "  second:\n" + block + "    steps: []\n") == {"contents: read"}
+    assert workflow_permissions(sample.replace("    steps:", "    with:\n      permissions: all\n    steps:")) is None
+    assert workflow_permissions("on: push\njobs:\n") is None
 
     workflows = Path(__file__).resolve().parents[1] / ".github" / "workflows"
     files = {file.name: file.read_text(encoding="utf-8") for file in sorted(workflows.glob("*.y*ml"))}
@@ -2629,13 +2663,15 @@ def check_workflows() -> None:
         granted = workflow_permissions(text)
         assert granted is not None, f"{name}: a job declares no permissions"
         assert "write-all" not in granted, (name, granted)
-        # a step gets the token only by being handed it (GITHUB_TOKEN, or the gh tool's
-        # GH_TOKEN), and every workflow that hands it over opens alert issues with it:
-        # handed over without issues: write, an alert would fail with only a log line
+        # a step's environment has the token only when the workflow puts it there
+        # (GITHUB_TOKEN, or the gh tool's GH_TOKEN), and every workflow that does so opens
+        # alert issues with it: put there without issues: write, an alert would fail with
+        # only a log line
         hands_token = "github.token" in text.split("\njobs:\n", 1)[1] or "secrets.GITHUB_TOKEN" in text
         assert hands_token == ("issues: write" in granted), (name, granted)
-    # the two hand-started forecasting workflows read the code and nothing more: no step
-    # gets the token, so an alert there is logged, not opened (check_alerts, "only logged")
+    # the two hand-started forecasting workflows read the code and nothing more: no step's
+    # environment has the token, so an alert there is logged, not opened (check_alerts,
+    # "only logged")
     for name in ("test_bot.yaml", "run_bot_on_metaculus_cup.yaml"):
         assert workflow_permissions(files[name]) == {"contents: read"}, (name, workflow_permissions(files[name]))
     assert workflow_permissions(files["run_bot_on_tournament.yaml"]) == {"contents: read", "issues: write"}
@@ -2644,8 +2680,8 @@ def check_workflows() -> None:
 
 def check_review_skill() -> None:
     """The hand review's instructions (.claude/skills/review-bot/SKILL.md) name the fields
-    bot-review 0.1.2 writes, pick the scored run as the scorecard does, and give the weekly
-    workflow's window."""
+    bot-review 0.1.2 writes, say truly where their scored run and the scorecard's are the
+    same and where they part, and give the weekly workflow's window."""
     import scorecard
 
     root = Path(__file__).resolve().parents[1]
@@ -2662,6 +2698,17 @@ def check_review_skill() -> None:
     ]
     question = {"spot_scoring_time": "2026-11-01T11:00:00Z", "traces": runs[::-1]}
     assert scorecard._scored_trace(question)["comment_id"] == 1
+    # the two part in two cases, and the skill file says so: with no run early enough it
+    # has no scored trace (its "never counted" test) where the scorecard takes the latest
+    # run, and it keeps a run with no forecasters where the scorecard passes over it
+    assert (
+        "`scorecard.py` picks the same entry whenever that entry lists forecasters; it passes over entries"
+        " with no forecasters, and when no entry is early enough it uses the latest run instead"
+    ) in skill, skill
+    assert scorecard._scored_trace({**question, "spot_scoring_time": "2026-11-01T09:00:00Z"})["comment_id"] == 2
+    assert scorecard._scored_trace({**question, "spot_scoring_time": None})["comment_id"] == 2
+    late = {"spot_scoring_time": "2026-11-01T13:00:00Z", "traces": [{**runs[1], "forecasters": []}, runs[0]]}
+    assert scorecard._scored_trace(late)["comment_id"] == 1
     review = (root / ".github" / "workflows" / "review_bot.yaml").read_text(encoding="utf-8")
     days = re.search(r"DAYS: \$\{\{ inputs\.days \|\| (\d+) \}\}", review)
     assert days and f"the weekly workflow, `review_bot.yaml`, reads {days.group(1)}" in skill, skill
