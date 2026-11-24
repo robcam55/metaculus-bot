@@ -28,23 +28,32 @@ poetry run bot-review review --tournament <slug-or-id> \
 ```
 
 Also `--post <POST_ID> ...` for specific questions, `--resolved-since <DAYS>` for anything
-that resolved recently, `--from-json review.json` to re-render without refetching. Roughly one
+that resolved in the last DAYS days (the weekly workflow, `review_bot.yaml`, reads 120, which
+covers a season), `--from-json review.json` to re-render without refetching. Roughly one
 request per post.
 
 Read the summary first, then `review.json` for per-question detail.
+
+In `review.json` (bot-review 0.1.2) each question has a `traces` list: one entry per comment
+the bot posted, with its `comment_id`, `run_time`, `forecasters` and `truncated`. There is no
+single `trace` field. Below, a question's **scored trace** means the entry of `traces` with
+the latest `run_time` at or before the question's `spot_scoring_time`. A question forecast
+once has one entry. `scorecard.py` picks the same entry whenever that entry lists
+forecasters; it passes over entries with no forecasters, and when no entry is early enough
+it uses the latest run instead.
 
 ## 2. Pick questions to investigate
 
 Around ten, fewer once findings repeat. Most of the budget goes on the worst scores. Also:
 
 - **Forecasted but unscored while resolved** — annulled, or something odder.
-- **`traces` non-empty but `trace` null** — every run came after `spot_scoring_time`, so the
-  forecast was never counted.
-- **Fewer forecasters than the bot's usual** — compare `len(trace.forecasters)` across the
-  table.
-- **`trace.truncated` true** — the comment hit Metaculus's size cap and only its opening
-  survives. Report it as a lost trace; there is nothing to diagnose.
-- **No trace at all** — the bot never forecast, or never published a comment.
+- **`traces` non-empty but no scored trace** — every entry's `run_time` is after
+  `spot_scoring_time`, so the forecast was never counted.
+- **Fewer forecasters than the bot's usual** — compare the length of the scored trace's
+  `forecasters` across the table.
+- **The scored trace's `truncated` is true** — the comment hit Metaculus's size cap and only
+  its opening survives. Report it as a lost trace; there is nothing to diagnose.
+- **`traces` empty** — the bot never forecast, or never published a comment.
 
 Those four are mechanical: no reading needed. When one of them matches many questions, that is
 a single finding with a count, not a dozen questions to read.
@@ -87,11 +96,12 @@ poetry run bot-review show <POST_ID> --comment <COMMENT_ID> --forecaster R1:F3
 to know what the bot actually had. A research section dwarfs a rationale, so these are the
 reads to ration.
 
-Take `<COMMENT_ID>` from the question's `trace.comment_id`: on a question forecast more than
-once it names the run that was standing when the question was scored, which is the run whose
-reasoning affected the score. Without it you get the latest run. Forecaster keys
-(`R<report>:F<forecaster>`) and their predictions are in `trace.forecasters`; a key identifies
-a forecaster across questions, so it is what to use when naming a repeat outlier.
+Take `<COMMENT_ID>` from the `comment_id` of the question's scored trace: on a question
+forecast more than once it names the run that was standing when the question was scored,
+which is the run whose reasoning affected the score. Without it you get the latest run.
+Forecaster keys (`R<report>:F<forecaster>`) and their predictions are in that trace's
+`forecasters`; a key identifies a forecaster across questions, so it is what to use when
+naming a repeat outlier.
 
 Also worth asking: did the final prediction match where the reasoning pointed, and did the bot
 answer the question the resolution criteria actually asked?
