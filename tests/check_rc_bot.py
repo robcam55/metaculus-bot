@@ -2434,6 +2434,193 @@ def check_guards() -> None:
     print("guards: ok")
 
 
+def check_short_answers() -> None:
+    """A number or date answer whose stated percentiles stop short of the 10th or the 90th
+    (the 2026-11-12 design review's "short number answers"): one warning line in the run
+    log reports it, and nothing is left out for being short, so the question's forecast is
+    what it was before. Rob chose the warning alone on 2026-11-24 ("Warn only"). None had
+    been seen in 328 number forecasts on record."""
+    import forecast_guards as fg
+    from forecasting_tools import NumericDistribution, Percentile
+
+    url = "https://example.invalid/q/6"
+    q = timed_question("numeric").model_copy(
+        update={"page_url": url, "upper_bound": 1000, "open_lower_bound": True}
+    )
+    full = {0.1: 400, 0.2: 440, 0.4: 480, 0.6: 520, 0.8: 560, 0.9: 600}
+
+    def dist(answer: dict, question=q, shift: float = 0):
+        stated = [Percentile(percentile=level, value=value + shift) for level, value in answer.items()]
+        return NumericDistribution.from_question(stated, question)
+
+    def without(*levels: float) -> dict:
+        return {level: value for level, value in full.items() if level not in levels}
+
+    # the rule: the lowest stated level is 10 or less and the highest 90 or more. Other
+    # levels in between are fine, and so is a parser's rounding
+    assert fg.short_answer(dist(full)) is None
+    assert fg.short_answer(dist({0.05: 380, 0.25: 450, 0.5: 500, 0.75: 550, 0.95: 620})) is None
+    assert fg.short_answer(dist({0.1: 400, 0.9: 600})) is None
+    assert fg.short_answer(dist({0.1 + 1e-12: 400, 0.5: 500, 0.9 - 1e-12: 600})) is None
+    why = "The forecast's percentiles run from {} to {}, not from 10 to 90"
+    assert fg.short_answer(dist(without(0.9))) == why.format(10, 80)
+    assert fg.short_answer(dist(without(0.1))) == why.format(20, 90)
+    assert fg.short_answer(dist(without(0.6, 0.8, 0.9))) == why.format(10, 40)
+    assert fg.short_answer(dist({0.25: 450, 0.5: 500, 0.75: 550})) == why.format(25, 75)
+    assert fg.short_answer(dist({0.15: 420, 0.5: 500, 0.85: 580})) == why.format(15, 85)
+    assert fg.short_answer(dist({0.1: 400, 0.5: 500, 0.85: 580})) == why.format(10, 85)
+    assert fg.short_answer(dist({0.15: 420, 0.5: 500, 0.9: 600})) == why.format(15, 90)
+
+    def heights(d) -> list[float]:
+        return [p.percentile for p in d.get_cdf()]
+
+    def mean_of(*members) -> list[float]:
+        return [sum(column) / len(members) for column in zip(*(heights(m) for m in members))]
+
+    def same(mixed, expected: list[float]) -> bool:
+        return all(abs(m.percentile - x) < 1e-9 for m, x in zip(mixed.declared_percentiles, expected))
+
+    # what the package makes of an answer that stops at the 40th percentile: 30% beyond the
+    # open upper bound, where a complete answer puts 5%; one that stops at the 80th, 10%
+    a, b, c, d = (dist(full, shift=s) for s in (0, 10, 20, 30))
+    cut = dist(without(0.6, 0.8, 0.9))
+    assert abs((1 - heights(cut)[-1]) - 0.30) < 0.01 and abs((1 - heights(a)[-1]) - 0.05) < 0.01
+    assert abs((1 - heights(dist(without(0.9)))[-1]) - 0.10) < 0.01
+
+    with env(ANTHROPIC_API_KEY="x"):
+        bot = main.RcForecastBot(publish_reports_to_metaculus=False)
+    records: list[logging.LogRecord] = []
+    handler = logging.Handler()
+    handler.emit = records.append  # type: ignore[method-assign]
+    fg.logger.addHandler(handler)
+
+    def mix(*members, question=q):
+        records.clear()
+        return asyncio.run(bot._aggregate_predictions(list(members), question))
+
+    try:
+        def warnings() -> list[str]:
+            return [r.getMessage() for r in records if r.levelno == logging.WARNING]
+
+        # one short answer of five: still combined with the others, exactly as before,
+        # and the log gives its lowest and highest stated level
+        assert same(mix(a, b, cut, c, d), mean_of(a, b, cut, c, d))
+        assert warnings() == [
+            f"Numeric mixture: 1 short forecast(s) for {url}, handled as before:"
+            f' ["{why.format(10, 40)}"]'
+        ], warnings()
+        # the same in the last place of five (where an extra forecaster's answer sits),
+        # and with two short of five
+        assert same(mix(a, b, c, d, cut), mean_of(a, b, c, d, cut))
+        assert len(warnings()) == 1 and "1 short forecast(s)" in warnings()[0], warnings()
+        also_cut = dist(without(0.9), shift=15)
+        assert same(mix(a, cut, b, c, also_cut), mean_of(a, cut, b, c, also_cut))
+        assert len(warnings()) == 1 and "2 short forecast(s)" in warnings()[0], warnings()
+        # one of three, with a missing 10th: the same
+        no_10th = dist(without(0.1), shift=5)
+        assert same(mix(a, no_10th, b), mean_of(a, no_10th, b))
+        assert len(warnings()) == 1 and "from 20 to 90" in warnings()[0], warnings()
+        # complete answers, whatever their levels: nothing is logged
+        other = dist({0.05: 380, 0.25: 450, 0.5: 500, 0.75: 550, 0.95: 620})
+        assert same(mix(a, b, other), mean_of(a, b, other)) and not records
+        assert same(mix(a, b, c, d), mean_of(a, b, c, d)) and not records
+        # any number of short answers: all combined as before, one line naming each
+        short = dist(without(0.9), shift=5)
+        for members, count in (((a, cut), 1), ((a, cut, short), 2), ((cut, short), 2)):
+            assert same(mix(*members), mean_of(*members)), len(members)
+            assert len(warnings()) == 1 and f"{count} short forecast(s)" in warnings()[0], warnings()
+        # a question with a single forecast never reaches the mixture, so a short answer
+        # there gets no line: that case is not covered
+        assert same(mix(cut), heights(cut)) and not warnings()
+        # the far-from-the-others step decides as it always has, short answers or not: the
+        # two far answers leave, and the short one among the rest stays
+        far_1 = dist({0.1: 850, 0.2: 870, 0.4: 890, 0.6: 910, 0.8: 930, 0.9: 950})
+        far_2 = dist({0.1: 860, 0.2: 880, 0.4: 900, 0.6: 920, 0.8: 940, 0.9: 960})
+        assert same(mix(a, no_10th, b, far_1, far_2), mean_of(a, no_10th, b))
+        assert len(warnings()) == 1 and "1 short forecast(s)" in warnings()[0], warnings()
+        assert same(mix(a, b, c, far_1), mean_of(a, b, c)) and not warnings()
+        # an answer both short and far: that step leaves it out for being far, as it
+        # would have before, and the line still reports that it was short
+        far_cut = dist({0.1: 850, 0.2: 870, 0.4: 890})
+        assert same(mix(a, b, c, far_cut), mean_of(a, b, c))
+        assert len(warnings()) == 1 and "from 10 to 40" in warnings()[0], warnings()
+        # the report can't fail a forecast: if reading the levels raises, the mixture is
+        # the same and the log says the levels could not be read
+        real_short_answer = fg.short_answer
+
+        def broken(prediction):
+            raise ValueError("no levels")
+
+        try:
+            fg.short_answer = broken
+            assert same(mix(a, b, cut), mean_of(a, b, cut))
+            assert warnings() == ["Numeric mixture: could not read a forecast's levels (ValueError)"]
+        finally:
+            fg.short_answer = real_short_answer
+        # dates run through the same mixture
+        when = timed_question("date")
+        days = {0.1: 2, 0.2: 5, 0.4: 9, 0.6: 14, 0.8: 20, 0.9: 27}
+
+        def date_dist(answer: dict, shift: int = 0):
+            stamps = {
+                level: datetime(2026, 11, day + shift, tzinfo=timezone.utc).timestamp()
+                for level, day in answer.items()
+            }
+            return dist(stamps, when)
+
+        e, f = date_dist(days), date_dist(days, shift=1)
+        late = date_dist({level: day for level, day in days.items() if level >= 0.4})
+        assert same(mix(e, late, f, question=when), mean_of(e, late, f))
+        assert len(warnings()) == 1 and "from 40 to 90" in warnings()[0], warnings()
+    finally:
+        fg.logger.removeHandler(handler)
+
+    # whole questions: with one short answer of three, and with two, the question posts
+    # the mean of all three, as it did before, and every forecaster is in the comment
+    answers = {"full": full, "higher": {level: value + 10 for level, value in full.items()},
+               "cut": without(0.6, 0.8, 0.9), "low": without(0.1)}  # fmt: skip
+
+    async def fake_parse(text, *args, **kwargs):
+        return [Percentile(percentile=level, value=value) for level, value in answers[text].items()]
+
+    async def research(question):
+        return "notes"
+
+    async def summary(question, research):
+        return "summary"
+
+    real_parse = main.parse
+    try:
+        main.parse = fake_parse
+        for replies in (["full", "cut", "higher"], ["cut", "full", "low"]):
+            with env(ANTHROPIC_API_KEY="x"):
+                bot = main.RcForecastBot(
+                    publish_reports_to_metaculus=False, skip_previously_forecasted_questions=False,
+                    predictions_per_research_report=3,
+                )  # fmt: skip
+            said = iter(replies)
+
+            def llm(name, kind="llm", said=said):
+                forecaster = FakeLlm(model="anthropic/claude-opus-5-5")
+
+                async def answer(prompt, system_prompt=None):
+                    return next(said)
+
+                forecaster.invoke = answer  # type: ignore[method-assign]
+                return forecaster
+
+            bot.get_llm = llm  # type: ignore[method-assign]
+            bot.run_research = research  # type: ignore[method-assign]
+            bot.summarize_research = summary  # type: ignore[method-assign]
+            [report] = asyncio.run(bot.forecast_questions([q], return_exceptions=True))
+            assert not isinstance(report, BaseException), report
+            assert same(report.prediction, mean_of(*(dist(answers[name]) for name in replies))), replies
+            assert report.explanation.count("*Forecaster") == 3 and not report.errors, report.explanation
+    finally:
+        main.parse = real_parse
+    print("short answers: ok")
+
+
 def anthropic_search_reply(stop_reason: str = "end_turn") -> dict:
     """A web-search reply as Anthropic's API sends it: narration, a search, cited text."""
     url = "https://www.reuters.com/world/example-2026-10-27/"
@@ -4345,6 +4532,7 @@ if __name__ == "__main__":
     check_scorecard()
     check_aggregation()
     check_guards()
+    check_short_answers()
     check_research_survives_one_failure()
     check_prompts()
     check_research_policy()
