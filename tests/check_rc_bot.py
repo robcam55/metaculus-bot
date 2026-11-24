@@ -906,6 +906,14 @@ def check_own_key() -> None:
     calls, summary, _, _ = run_main("test_questions", 80.0, testing, PAY_WITH="own-key", **keys)
     assert calls == [(opus_own, 3, ["1", "3"], False)], calls
     assert "(PAY_WITH=own-key)" in summary, summary
+    # ... and since a top-up no longer moves the bot by itself, one issue says credits are
+    # there; not while they are still low. On the credits themselves nothing is said
+    assert sum("credits were topped up" in t for t in LAST["alerts"]) == 1, LAST
+    assert "- Opened an issue to tell Rob that Metaculus's credits were topped up." in summary, summary
+    run_main("test_questions", 10.0, testing, PAY_WITH="own-key", **keys)
+    assert not any("topped up" in t for t in LAST["alerts"]), LAST
+    run_main("test_questions", 80.0, testing, **keys)
+    assert not any("topped up" in t for t in LAST["alerts"]), LAST
     # ... and stops the run before anything is read without a key, or when mistyped
     for bad, needle in (
         (dict(PAY_WITH="own-key", OPENROUTER_API_KEY="sk-fake"), "ANTHROPIC_API_KEY"),
@@ -2355,6 +2363,10 @@ def check_research_tools() -> None:
     for name in ("RESEARCH_WATCH_FILE", "actions/cache/restore", "actions/cache/save"):
         assert name in tournament and name not in test_bot and name not in cup, name
     assert tournament.count("continue-on-error: true") == 2
+    # the tournament runs are pinned to Rob's key (2026-11-23), so a Metaculus top-up can't
+    # change the route unasked; the Test Bot chooses per run, and the Cup never had credits
+    assert "          PAY_WITH: own-key\n" in tournament
+    assert "PAY_WITH: ${{ inputs.pay_with }}" in test_bot and "PAY_WITH" not in cup
     # the window survives a run only if the file the bot writes is the one both steps carry,
     # the save sees its marker, and the restore finds an earlier run's key
     assert "RESEARCH_WATCH_FILE: research_watch.json\n" in tournament

@@ -116,7 +116,24 @@ def credits_out(left: float, limit: float | None, own_key: bool) -> bool:
         f"Metaculus's credits ran out{_limit(limit)}",
         f"Metaculus's OpenRouter credits ({budget.dollars(left)} left) can't pay for another"
         f" question above the ${budget.FLOOR:.0f} reserve. {now} A top-up from Metaculus"
-        " moves the bot back onto the credits at the next run.",
+        " shows in the next run; with `PAY_WITH: own-key` set, as the tournament workflow"
+        " has it, the bot stays on your key and one issue says the top-up arrived.",
+    )
+
+
+def credits_topped_up(left: float, limit: float | None) -> bool:
+    """With the tournament runs pinned to Rob's key (PAY_WITH=own-key), a top-up no longer
+    moves the bot by itself, so this tells him one arrived. Once per credit limit."""
+    return raise_alert(
+        f"Metaculus's credits were topped up{_limit(limit)}",
+        f"Metaculus's OpenRouter credits now stand at {budget.dollars(left)}. The bot is still"
+        " forecasting on your Anthropic key, because the tournament workflow sets"
+        " `PAY_WITH: own-key`. The credits route researches and forecasts differently"
+        " (README, \"Why it's built this way\"), so going back to it is your call: try it"
+        " first with a Test Bot run with `pay_with` set to `credits`, then change that line"
+        " by pull request and add a setup to `setups.py`. Credits you leave unused cost"
+        " nothing, but your key keeps paying. This issue opens once per credit limit; close"
+        " it whenever.",
     )
 
 
