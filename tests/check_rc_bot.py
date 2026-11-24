@@ -2119,9 +2119,9 @@ def check_guards() -> None:
 
 def check_short_answers() -> None:
     """A number or date answer whose stated percentiles stop short of the 10th or the 90th
-    (the 2026-11-12 design review's "short number answers"): left out of the question's
-    forecast while more than half of the answers are complete, and otherwise kept, so the
-    guard never costs a question its forecast."""
+    (the 2026-11-12 design review's "short number answers"): one warning line in the run
+    log names it, and the question's forecast is combined exactly as before. Rob chose the
+    warning alone on 2026-11-24: none had been seen in 328 number forecasts on record."""
     import forecast_guards as fg
     from forecasting_tools import NumericDistribution, Percentile
 
@@ -2178,36 +2178,52 @@ def check_short_answers() -> None:
         return asyncio.run(bot._aggregate_predictions(list(members), question))
 
     try:
-        # one short answer of five: left out, and the log says which levels it had
-        assert same(mix(a, b, cut, c, d), mean_of(a, b, c, d))
-        assert [r.getMessage() for r in records] == [
-            f'Numeric mixture: left out 1 short forecast(s) for {url}: ["{why.format(10, 40)}"]'
-        ], [r.getMessage() for r in records]
-        # one of three, and a missing 10th: left out too
-        assert same(mix(a, dist(without(0.1)), b), mean_of(a, b))
-        # complete answers are untouched, whatever their levels, and nothing is logged
+        def warnings() -> list[str]:
+            return [r.getMessage() for r in records if r.levelno == logging.WARNING]
+
+        # one short answer of five: still combined with the others, exactly as before,
+        # and the log says which levels it had
+        assert same(mix(a, b, cut, c, d), mean_of(a, b, cut, c, d))
+        assert warnings() == [
+            f"Numeric mixture: 1 short forecast(s) for {url}, combined as before:"
+            f' ["{why.format(10, 40)}"]'
+        ], warnings()
+        # one of three, with a missing 10th: the same
+        no_10th = dist(without(0.1), shift=5)
+        assert same(mix(a, no_10th, b), mean_of(a, no_10th, b))
+        assert len(warnings()) == 1 and "from 20 to 90" in warnings()[0], warnings()
+        # complete answers, whatever their levels: nothing is logged
         other = dist({0.05: 380, 0.25: 450, 0.5: 500, 0.75: 550, 0.95: 620})
         assert same(mix(a, b, other), mean_of(a, b, other)) and not records
         assert same(mix(a, b, c, d), mean_of(a, b, c, d)) and not records
-        # half or more short: nothing says which answers to trust, so all are kept, as
-        # before the guard, and the log says so
+        # any number of short answers: all combined as before, one line naming each
         short = dist(without(0.9), shift=5)
-        for members in ((a, cut), (a, cut, short), (a, b, cut, short)):
+        for members, count in (((a, cut), 1), ((a, cut, short), 2), ((cut, short), 2)):
             assert same(mix(*members), mean_of(*members)), len(members)
-            assert len(records) == 1 and "kept" in records[0].getMessage(), records
-            assert "too few complete ones to leave them out" in records[0].getMessage()
-        # the far-from-the-others step decides first, on every answer, as it did before
-        # the guard: taking the short answer out first would leave two answers against
-        # two (or two in all), no majority, and the misread ones would stay in
-        no_10th = dist(without(0.1), shift=5)
+            assert len(warnings()) == 1 and f"{count} short forecast(s)" in warnings()[0], warnings()
+        # a question with a single forecast never reaches the mixture, so a short answer
+        # there gets no line: that case is not covered
+        assert same(mix(cut), heights(cut)) and not warnings()
+        # the far-from-the-others step decides as it always has, short answers or not: the
+        # two far answers leave, and the short one among the rest stays
         far_1 = dist({0.1: 850, 0.2: 870, 0.4: 890, 0.6: 910, 0.8: 930, 0.9: 950})
         far_2 = dist({0.1: 860, 0.2: 880, 0.4: 900, 0.6: 920, 0.8: 940, 0.9: 960})
-        assert same(mix(a, no_10th, b, far_1, far_2), mean_of(a, b))
-        assert any("left out 1 short forecast(s)" in r.getMessage() for r in records), records
-        # and the short answer leaves only while more than half of what that step kept
-        # is complete: one of the two kept here is short, so both stay
-        assert same(mix(a, no_10th, far_1), mean_of(a, no_10th))
-        assert any("kept 1 short forecast(s)" in r.getMessage() for r in records), records
+        assert same(mix(a, no_10th, b, far_1, far_2), mean_of(a, no_10th, b))
+        assert len(warnings()) == 1 and "1 short forecast(s)" in warnings()[0], warnings()
+        assert same(mix(a, b, c, far_1), mean_of(a, b, c)) and not warnings()
+        # the telling can't fail a forecast: if reading the levels raises, the mixture is
+        # the same and the log says the levels could not be read
+        real_short_answer = fg.short_answer
+
+        def broken(prediction):
+            raise ValueError("no levels")
+
+        try:
+            fg.short_answer = broken
+            assert same(mix(a, b, cut), mean_of(a, b, cut))
+            assert warnings() == ["Numeric mixture: could not read a forecast's levels (ValueError)"]
+        finally:
+            fg.short_answer = real_short_answer
         # dates run through the same mixture
         when = timed_question("date")
         days = {0.1: 2, 0.2: 5, 0.4: 9, 0.6: 14, 0.8: 20, 0.9: 27}
@@ -2221,13 +2237,13 @@ def check_short_answers() -> None:
 
         e, f = date_dist(days), date_dist(days, shift=1)
         late = date_dist({level: day for level, day in days.items() if level >= 0.4})
-        assert same(mix(e, late, f, question=when), mean_of(e, f))
-        assert "from 40 to 90" in records[0].getMessage(), records
+        assert same(mix(e, late, f, question=when), mean_of(e, late, f))
+        assert len(warnings()) == 1 and "from 40 to 90" in warnings()[0], warnings()
     finally:
         fg.logger.removeHandler(handler)
 
-    # whole questions: a short answer never costs the question its forecast. Its text stays
-    # in the comment, and with two of three short the question posts as it did before
+    # whole questions: with one short answer of three, and with two, the question posts
+    # the mean of all three, as it did before, and every forecaster is in the comment
     answers = {"full": full, "higher": {level: value + 10 for level, value in full.items()},
                "cut": without(0.6, 0.8, 0.9), "low": without(0.1)}  # fmt: skip
 
@@ -2243,7 +2259,7 @@ def check_short_answers() -> None:
     real_parse = main.parse
     try:
         main.parse = fake_parse
-        for replies, counted in ((["full", "cut", "higher"], ["full", "higher"]), (["cut", "full", "low"], ["cut", "full", "low"])):  # fmt: skip
+        for replies in (["full", "cut", "higher"], ["cut", "full", "low"]):
             with env(ANTHROPIC_API_KEY="x"):
                 bot = main.RcForecastBot(
                     publish_reports_to_metaculus=False, skip_previously_forecasted_questions=False,
@@ -2265,7 +2281,7 @@ def check_short_answers() -> None:
             bot.summarize_research = summary  # type: ignore[method-assign]
             [report] = asyncio.run(bot.forecast_questions([q], return_exceptions=True))
             assert not isinstance(report, BaseException), report
-            assert same(report.prediction, mean_of(*(dist(answers[name]) for name in counted))), replies
+            assert same(report.prediction, mean_of(*(dist(answers[name]) for name in replies))), replies
             assert report.explanation.count("*Forecaster") == 3 and not report.errors, report.explanation
     finally:
         main.parse = real_parse

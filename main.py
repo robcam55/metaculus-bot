@@ -1434,9 +1434,8 @@ class RcForecastBot(ForecastBot):
     ) -> PredictionTypes:
         """Binary: trimmed mean (drop the single highest and lowest) once there are at
         least four predictions; it beat the median in Halawi et al. (2024). Numeric,
-        discrete and date: the mixture of the forecasts (their mean CDF), less any short
-        of the 10th-to-90th percentiles or far from the others, in place of the package's
-        pointwise median (forecast_guards.py).
+        discrete and date: the mixture of the forecasts (their mean CDF), less any far
+        from the others, in place of the package's pointwise median (forecast_guards.py).
         Multiple choice keeps forecasting-tools' mean per option."""
         if isinstance(question, BinaryQuestion) and len(predictions) >= 4:
             values = sorted(float(p) for p in predictions)  # type: ignore[arg-type]
