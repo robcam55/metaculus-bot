@@ -4,10 +4,11 @@ Alerts that reach Rob as GitHub issues.
 The workflow runs every 20 minutes, so a run that fails to get attention would email Rob
 every 20 minutes for as long as the cause lasts. An alert instead opens one issue the first
 time its event happens, mentioning the repository's owner. Later runs find an issue with
-the same title, open or closed (for Rob's own key and the Cloudflare clock, open), and
-open nothing. Each title
+the same title, open or closed (for Rob's own key, the extra forecasters and the
+Cloudflare clock, open), and open nothing. Each title
 names what makes the event new: a new credit limit after a Metaculus top-up, a new
-month for Rob's own key, or a new week for research that keeps coming back degraded.
+month for Rob's own key or the extra forecasters, a new week for research that keeps
+coming back degraded, or the question whose forecast posted without its comment.
 
 No forecasting-tools import here, so the offline checks can exercise it directly.
 """
@@ -164,6 +165,54 @@ def own_key_rejected(error: str) -> bool:
         f"Anthropic rejected `ANTHROPIC_API_KEY` ({error}), so the bot is paused. Replace"
         " the repository secret with a working key from the Claude Console." + REOPEN_NOTE,
         open_only=True,
+    )
+
+
+def _run_link() -> str:
+    """A sentence linking this run's page on GitHub, or "" outside GitHub Actions."""
+    repo, run = os.getenv("GITHUB_REPOSITORY"), os.getenv("GITHUB_RUN_ID")
+    return f" The run: https://github.com/{repo}/actions/runs/{run}" if repo and run else ""
+
+
+def extras_silent(questions: list[str], failures: list[str]) -> bool:
+    """Questions forecast on the bot's own model alone: every forecast asked of the extra
+    forecasters (EXTRA_FORECASTERS, on Rob's own OpenRouter key) failed for them. `failures`
+    names each model with its error types, never a key. Like Rob's own key's alerts it
+    counts only while open: the cause is his to fix, and a repeat after that is news."""
+    return raise_alert(
+        f"The extra forecasters returned no forecasts ({_month()})",
+        f"{len(questions)} question(s) in one run were forecast on the Claude forecasts alone:"
+        " every forecast asked of the extra forecasters (`EXTRA_FORECASTERS`, on your own"
+        " OpenRouter key) failed.\n\n"
+        + "\n".join(f"- {line}" for line in failures) + "\n\n"
+        f"Questions: {', '.join(questions)}.{_run_link()}\n\n"
+        "The forecasts still posted, and the run stays green on purpose. While this lasts,"
+        " questions go out on the Claude forecasts only, and the scorecard's paired rows for"
+        " the other models (rule D in JUDGING.md) stop growing. The usual causes: OpenRouter"
+        " refuses the key or it is out of credit (`OPENROUTER_OWN_API_KEY`), or a model id is"
+        " no longer served. The run's log and the \"Extra forecaster\" table on its page show"
+        " each failure. Leave this issue open until the extra forecasters answer again, then"
+        " close it: if they stop again, a new issue opens.",
+        open_only=True,
+    )
+
+
+def comment_missing(url: str, post: int, error: str) -> bool:
+    """A forecast that posted while its comment did not (main.CommentWatchClient). No later
+    run adds the comment, so the issue names the question for Rob to add it by hand. Once
+    per question."""
+    return raise_alert(
+        f"A forecast posted without its comment (question {post})",
+        f"The bot's forecast on {url} posted, but its comment did not ({error}, after the"
+        " package's own retries). No later run adds it: the question now counts as forecast,"
+        " so runs skip it. The run that posted it is red and lists the question as failed,"
+        f" though the forecast stands.{_run_link()}\n\n"
+        "Metaculus requires comments for prizes (how it treats one missing comment isn't"
+        " known), and the weekly review reads each forecaster's numbers from the comment. To"
+        " add it by hand: the comment's full text is in that run's log, after the line"
+        f" \"Comment not posted on post {post}\". Post it on the question as a private"
+        " comment from the bot's account. This issue opens once per question; close it"
+        " when done.",
     )
 
 

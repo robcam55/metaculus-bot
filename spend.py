@@ -392,12 +392,21 @@ def _tools_note(call: Call) -> str:
     )
 
 
+def _stop_note(call: Call) -> str:
+    """Why the model stopped writing, as litellm reports it ("stop": it finished; "length":
+    it hit the token cap), on every line whose tools note doesn't already say it. A
+    forecaster's reply cut at the cap is parsed like a whole one, so this line is where a
+    cut reply shows. "-" when the response gave no reason."""
+    return "" if _tools_note(call) else f" | stop {call.stop or '-'}"
+
+
 def _log(call: Call) -> None:
     cost = "no figure yet" if call.cost is None else f"${call.cost:.4f} ({call.basis})"
     logger.info(
         f"Spend: {label(call.question)} | {call.part} | {call.model} | {cost}"
         f" | {call.prompt_tokens:,} in{_cache_note(call)}, {call.completion_tokens:,} out"
         f" | {call.searches} web searches | {call.generation or '-'}{_tools_note(call)}"
+        f"{_stop_note(call)}"
     )
 
 
